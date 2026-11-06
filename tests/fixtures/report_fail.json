@@ -1,0 +1,518 @@
+{
+  "schema_version": "2.1",
+  "run_id": "run_20261106_071900_ab12",
+  "scenario_id": "last-ticket-rush",
+  "verdict": "FAIL",
+  "verdict_reason": "2 proven invariant violations",
+  "completeness": {
+    "status": "complete",
+    "trials_planned": 3,
+    "trials_completed": 3,
+    "trials_incomplete": 0,
+    "trials_skipped": 0,
+    "serial_control": "completed"
+  },
+  "budget": {
+    "max_requests_total": 2000,
+    "requests_planned": 80,
+    "requests_sent": 80,
+    "max_wall_s_total": 60,
+    "wall_s_used": 7.9,
+    "clamped": []
+  },
+  "target": {
+    "origin": "http://127.0.0.1:8000",
+    "build": {
+      "build_id": "c0de1a2b",
+      "instance_id": "7f3e1c52",
+      "instance_started_at": "2026-11-06T07:15:00Z",
+      "stale_source": false
+    },
+    "build_stable_during_run": true
+  },
+  "config": {
+    "load": {
+      "vus": 20,
+      "iterations": 20,
+      "max_duration_s": 10,
+      "min_peak_in_flight": 10
+    },
+    "trials": 3,
+    "serial_control": true,
+    "config_hash": "sha256:abababababababababababababababababababababababababababababababab",
+    "engine": {
+      "name": "k6",
+      "version": "2.3.0"
+    },
+    "mutates_data": true,
+    "user_confirmed": true
+  },
+  "trials": [
+    {
+      "trial": 1,
+      "kind": "concurrent",
+      "status": "completed",
+      "incomplete_reason": null,
+      "planned_requests": 20,
+      "completed_requests": 20,
+      "peak_in_flight": 20,
+      "client": {
+        "accepted": 14,
+        "rejected": 6,
+        "unexpected": 0,
+        "transport_error": 0
+      },
+      "state_before": {
+        "stock": 1,
+        "orders_confirmed": 0,
+        "payments_unattached": 0,
+        "orders_without_payment": 0
+      },
+      "state_after": {
+        "stock": 0,
+        "orders_confirmed": 14,
+        "payments_unattached": 0,
+        "orders_without_payment": 0
+      },
+      "invariants": [
+        {
+          "name": "No more tickets confirmed than were in stock",
+          "result": "fail",
+          "values": {
+            "client.accepted": 14,
+            "before.stock": 1
+          }
+        },
+        {
+          "name": "Stock accounting balances",
+          "result": "fail",
+          "values": {
+            "before.stock": 1,
+            "after.stock": 0,
+            "after.orders_confirmed": 14,
+            "before.orders_confirmed": 0
+          }
+        },
+        {
+          "name": "Every confirmation is recorded",
+          "result": "pass",
+          "values": {
+            "client.accepted": 14,
+            "after.orders_confirmed": 14,
+            "before.orders_confirmed": 0
+          }
+        },
+        {
+          "name": "No customer holds a payment authorization without a ticket",
+          "result": "pass",
+          "values": {
+            "after.payments_unattached": 0
+          }
+        },
+        {
+          "name": "Every order has a payment authorization",
+          "result": "pass",
+          "values": {
+            "after.orders_without_payment": 0
+          }
+        },
+        {
+          "name": "Available stock can actually be sold",
+          "result": "pass",
+          "values": {
+            "client.accepted": 14,
+            "before.stock": 1
+          }
+        },
+        {
+          "name": "Stock never negative",
+          "result": "pass",
+          "values": {
+            "after.stock": 0
+          }
+        }
+      ]
+    },
+    {
+      "trial": 2,
+      "kind": "concurrent",
+      "status": "completed",
+      "incomplete_reason": null,
+      "planned_requests": 20,
+      "completed_requests": 20,
+      "peak_in_flight": 20,
+      "client": {
+        "accepted": 15,
+        "rejected": 5,
+        "unexpected": 0,
+        "transport_error": 0
+      },
+      "state_before": {
+        "stock": 1,
+        "orders_confirmed": 0,
+        "payments_unattached": 0,
+        "orders_without_payment": 0
+      },
+      "state_after": {
+        "stock": 0,
+        "orders_confirmed": 15,
+        "payments_unattached": 0,
+        "orders_without_payment": 0
+      },
+      "invariants": [
+        {
+          "name": "No more tickets confirmed than were in stock",
+          "result": "fail",
+          "values": {
+            "client.accepted": 15,
+            "before.stock": 1
+          }
+        },
+        {
+          "name": "Stock accounting balances",
+          "result": "fail",
+          "values": {
+            "before.stock": 1,
+            "after.stock": 0,
+            "after.orders_confirmed": 15,
+            "before.orders_confirmed": 0
+          }
+        },
+        {
+          "name": "Every confirmation is recorded",
+          "result": "pass",
+          "values": {
+            "client.accepted": 15,
+            "after.orders_confirmed": 15,
+            "before.orders_confirmed": 0
+          }
+        },
+        {
+          "name": "No customer holds a payment authorization without a ticket",
+          "result": "pass",
+          "values": {
+            "after.payments_unattached": 0
+          }
+        },
+        {
+          "name": "Every order has a payment authorization",
+          "result": "pass",
+          "values": {
+            "after.orders_without_payment": 0
+          }
+        },
+        {
+          "name": "Available stock can actually be sold",
+          "result": "pass",
+          "values": {
+            "client.accepted": 15,
+            "before.stock": 1
+          }
+        },
+        {
+          "name": "Stock never negative",
+          "result": "pass",
+          "values": {
+            "after.stock": 0
+          }
+        }
+      ]
+    },
+    {
+      "trial": 3,
+      "kind": "concurrent",
+      "status": "completed",
+      "incomplete_reason": null,
+      "planned_requests": 20,
+      "completed_requests": 20,
+      "peak_in_flight": 20,
+      "client": {
+        "accepted": 15,
+        "rejected": 5,
+        "unexpected": 0,
+        "transport_error": 0
+      },
+      "state_before": {
+        "stock": 1,
+        "orders_confirmed": 0,
+        "payments_unattached": 0,
+        "orders_without_payment": 0
+      },
+      "state_after": {
+        "stock": 0,
+        "orders_confirmed": 15,
+        "payments_unattached": 0,
+        "orders_without_payment": 0
+      },
+      "invariants": [
+        {
+          "name": "No more tickets confirmed than were in stock",
+          "result": "fail",
+          "values": {
+            "client.accepted": 15,
+            "before.stock": 1
+          }
+        },
+        {
+          "name": "Stock accounting balances",
+          "result": "fail",
+          "values": {
+            "before.stock": 1,
+            "after.stock": 0,
+            "after.orders_confirmed": 15,
+            "before.orders_confirmed": 0
+          }
+        },
+        {
+          "name": "Every confirmation is recorded",
+          "result": "pass",
+          "values": {
+            "client.accepted": 15,
+            "after.orders_confirmed": 15,
+            "before.orders_confirmed": 0
+          }
+        },
+        {
+          "name": "No customer holds a payment authorization without a ticket",
+          "result": "pass",
+          "values": {
+            "after.payments_unattached": 0
+          }
+        },
+        {
+          "name": "Every order has a payment authorization",
+          "result": "pass",
+          "values": {
+            "after.orders_without_payment": 0
+          }
+        },
+        {
+          "name": "Available stock can actually be sold",
+          "result": "pass",
+          "values": {
+            "client.accepted": 15,
+            "before.stock": 1
+          }
+        },
+        {
+          "name": "Stock never negative",
+          "result": "pass",
+          "values": {
+            "after.stock": 0
+          }
+        }
+      ]
+    },
+    {
+      "trial": 4,
+      "kind": "serial_control",
+      "status": "completed",
+      "incomplete_reason": null,
+      "planned_requests": 20,
+      "completed_requests": 20,
+      "peak_in_flight": 1,
+      "client": {
+        "accepted": 1,
+        "rejected": 19,
+        "unexpected": 0,
+        "transport_error": 0
+      },
+      "state_before": {
+        "stock": 1,
+        "orders_confirmed": 0,
+        "payments_unattached": 0,
+        "orders_without_payment": 0
+      },
+      "state_after": {
+        "stock": 0,
+        "orders_confirmed": 1,
+        "payments_unattached": 0,
+        "orders_without_payment": 0
+      },
+      "invariants": [
+        {
+          "name": "No more tickets confirmed than were in stock",
+          "result": "pass",
+          "values": {
+            "client.accepted": 1,
+            "before.stock": 1
+          }
+        },
+        {
+          "name": "Stock accounting balances",
+          "result": "pass",
+          "values": {
+            "before.stock": 1,
+            "after.stock": 0,
+            "after.orders_confirmed": 1,
+            "before.orders_confirmed": 0
+          }
+        },
+        {
+          "name": "Every confirmation is recorded",
+          "result": "pass",
+          "values": {
+            "client.accepted": 1,
+            "after.orders_confirmed": 1,
+            "before.orders_confirmed": 0
+          }
+        },
+        {
+          "name": "No customer holds a payment authorization without a ticket",
+          "result": "pass",
+          "values": {
+            "after.payments_unattached": 0
+          }
+        },
+        {
+          "name": "Every order has a payment authorization",
+          "result": "pass",
+          "values": {
+            "after.orders_without_payment": 0
+          }
+        },
+        {
+          "name": "Available stock can actually be sold",
+          "result": "pass",
+          "values": {
+            "client.accepted": 1,
+            "before.stock": 1
+          }
+        },
+        {
+          "name": "Stock never negative",
+          "result": "pass",
+          "values": {
+            "after.stock": 0
+          }
+        }
+      ]
+    }
+  ],
+  "violations": [
+    {
+      "id": "V1",
+      "type": "invariant.capacity_exceeded",
+      "proven": true,
+      "invariant": "No more tickets confirmed than were in stock",
+      "trials_violated": "3/3",
+      "observed": {
+        "max_client.accepted": 15,
+        "before.stock": 1
+      },
+      "facts": {
+        "accepted_overlap": true,
+        "overlap_window_ms": 47
+      },
+      "evidence": {
+        "file": "requests.jsonl",
+        "filter": {
+          "outcome": "accepted"
+        },
+        "sample": [
+          {
+            "trial": 1,
+            "request_id": "req-0007",
+            "vu": 7,
+            "iter": 0,
+            "t_start": 1794035940120.0,
+            "t_end": 1794035940178.0,
+            "latency_ms": 58.0,
+            "status": 200,
+            "outcome": "accepted",
+            "captured": "ord-3"
+          }
+        ]
+      }
+    },
+    {
+      "id": "V2",
+      "type": "invariant.accounting_mismatch",
+      "proven": true,
+      "invariant": "Stock accounting balances",
+      "trials_violated": "3/3",
+      "observed": {
+        "stock_decrement": 1,
+        "max_orders_written": 15
+      },
+      "facts": {},
+      "evidence": null
+    }
+  ],
+  "hypotheses": [
+    {
+      "id": "H1",
+      "suspected_cause": "check_then_act_race",
+      "status": "supported",
+      "explains": [
+        "V1"
+      ],
+      "basis": [
+        "capacity_exceeded",
+        "accepted_overlap",
+        "serial control: invariants held"
+      ],
+      "how_to_confirm": "Look for a read of availability followed by an await or I/O before the write."
+    },
+    {
+      "id": "H2",
+      "suspected_cause": "lost_update",
+      "status": "supported",
+      "explains": [
+        "V2"
+      ],
+      "basis": [
+        "accounting_mismatch",
+        "serial control: invariants held"
+      ],
+      "how_to_confirm": "Look for stock written from a value read earlier instead of an atomic decrement."
+    }
+  ],
+  "performance": {
+    "scope": "completed requests of concurrent trials",
+    "latency_ms": {
+      "p50": 58,
+      "p95": 72,
+      "p99": 75,
+      "max": 81
+    },
+    "latency_ms_by_outcome": {
+      "accepted": {
+        "p50": 60,
+        "p95": 73
+      },
+      "rejected": {
+        "p50": 3,
+        "p95": 5
+      }
+    },
+    "throughput_rps_per_trial": [
+      240.0,
+      251.5,
+      247.2
+    ],
+    "error_rate": 0.0,
+    "rejection_rate": 0.27,
+    "status_counts": {
+      "200": 44,
+      "409": 16
+    }
+  },
+  "evidence": {
+    "requests": {
+      "path": "requests.jsonl",
+      "count": 80,
+      "sha256": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+    }
+  },
+  "comparison": null,
+  "reproduce": {
+    "cli": "faultforge run last-ticket-rush --trials 3 --serial-control",
+    "k6": "k6 run --no-usage-report scripts/burst_request.js"
+  },
+  "disclosures": [
+    "Illustrative fixture, not a measured result.",
+    "Scenario mutates data; state reset before each trial.",
+    "Payment provider is an in-process stub with a fixed 50 ms delay."
+  ]
+}

@@ -1,0 +1,10 @@
+.venv/
+.tools/
+.faultforge/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+
+# Clanker local config
+.claude/clanker.local.md

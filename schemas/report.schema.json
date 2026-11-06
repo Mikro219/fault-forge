@@ -1,0 +1,1203 @@
+{
+  "$defs": {
+    "Budget": {
+      "additionalProperties": false,
+      "properties": {
+        "clamped": {
+          "items": {
+            "$ref": "#/$defs/Clamp"
+          },
+          "title": "Clamped",
+          "type": "array"
+        },
+        "max_requests_total": {
+          "minimum": 1,
+          "title": "Max Requests Total",
+          "type": "integer"
+        },
+        "max_wall_s_total": {
+          "exclusiveMinimum": 0,
+          "title": "Max Wall S Total",
+          "type": "number"
+        },
+        "requests_planned": {
+          "minimum": 0,
+          "title": "Requests Planned",
+          "type": "integer"
+        },
+        "requests_sent": {
+          "minimum": 0,
+          "title": "Requests Sent",
+          "type": "integer"
+        },
+        "wall_s_used": {
+          "minimum": 0,
+          "title": "Wall S Used",
+          "type": "number"
+        }
+      },
+      "required": [
+        "max_requests_total",
+        "requests_planned",
+        "requests_sent",
+        "max_wall_s_total",
+        "wall_s_used"
+      ],
+      "title": "Budget",
+      "type": "object"
+    },
+    "Build": {
+      "additionalProperties": false,
+      "properties": {
+        "build_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Build Id"
+        },
+        "instance_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Instance Id"
+        },
+        "instance_started_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Instance Started At"
+        },
+        "stale_source": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Stale Source"
+        }
+      },
+      "required": [
+        "build_id",
+        "instance_id",
+        "instance_started_at",
+        "stale_source"
+      ],
+      "title": "Build",
+      "type": "object"
+    },
+    "Clamp": {
+      "additionalProperties": false,
+      "properties": {
+        "effective": {
+          "title": "Effective",
+          "type": "integer"
+        },
+        "field": {
+          "enum": [
+            "vus",
+            "iterations",
+            "max_duration_s"
+          ],
+          "title": "Field",
+          "type": "string"
+        },
+        "requested": {
+          "title": "Requested",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "field",
+        "requested",
+        "effective"
+      ],
+      "title": "Clamp",
+      "type": "object"
+    },
+    "ClientCounts": {
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "minimum": 0,
+          "title": "Accepted",
+          "type": "integer"
+        },
+        "rejected": {
+          "minimum": 0,
+          "title": "Rejected",
+          "type": "integer"
+        },
+        "transport_error": {
+          "minimum": 0,
+          "title": "Transport Error",
+          "type": "integer"
+        },
+        "unexpected": {
+          "minimum": 0,
+          "title": "Unexpected",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "accepted",
+        "rejected",
+        "unexpected",
+        "transport_error"
+      ],
+      "title": "ClientCounts",
+      "type": "object"
+    },
+    "Comparison": {
+      "additionalProperties": false,
+      "properties": {
+        "baseline_build_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Baseline Build Id"
+        },
+        "baseline_run_id": {
+          "title": "Baseline Run Id",
+          "type": "string"
+        },
+        "candidate_build_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Candidate Build Id"
+        },
+        "invariants": {
+          "items": {
+            "$ref": "#/$defs/InvariantComparison"
+          },
+          "title": "Invariants",
+          "type": "array"
+        },
+        "not_comparable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Not Comparable Reason"
+        },
+        "performance_delta": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Performance Delta",
+          "type": "object"
+        },
+        "status": {
+          "enum": [
+            "COMPARABLE",
+            "NOT_COMPARABLE"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "baseline_run_id",
+        "status"
+      ],
+      "title": "Comparison",
+      "type": "object"
+    },
+    "Completeness": {
+      "additionalProperties": false,
+      "properties": {
+        "serial_control": {
+          "enum": [
+            "completed",
+            "incomplete",
+            "skipped",
+            "not_requested"
+          ],
+          "title": "Serial Control",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "complete",
+            "incomplete"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "trials_completed": {
+          "minimum": 0,
+          "title": "Trials Completed",
+          "type": "integer"
+        },
+        "trials_incomplete": {
+          "minimum": 0,
+          "title": "Trials Incomplete",
+          "type": "integer"
+        },
+        "trials_planned": {
+          "description": "Concurrent trials; excludes the serial control",
+          "minimum": 0,
+          "title": "Trials Planned",
+          "type": "integer"
+        },
+        "trials_skipped": {
+          "minimum": 0,
+          "title": "Trials Skipped",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "status",
+        "trials_planned",
+        "trials_completed",
+        "trials_incomplete",
+        "trials_skipped",
+        "serial_control"
+      ],
+      "title": "Completeness",
+      "type": "object"
+    },
+    "Engine": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "version": {
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "title": "Engine",
+      "type": "object"
+    },
+    "Evidence": {
+      "additionalProperties": false,
+      "properties": {
+        "requests": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EvidenceFile"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "Evidence",
+      "type": "object"
+    },
+    "EvidenceFile": {
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "minimum": 0,
+          "title": "Count",
+          "type": "integer"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "count",
+        "sha256"
+      ],
+      "title": "EvidenceFile",
+      "type": "object"
+    },
+    "Hypothesis": {
+      "additionalProperties": false,
+      "description": "A suspected cause. Rule-generated, never proven, and never affects the verdict.",
+      "properties": {
+        "basis": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Basis",
+          "type": "array"
+        },
+        "explains": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Explains",
+          "type": "array"
+        },
+        "how_to_confirm": {
+          "title": "How To Confirm",
+          "type": "string"
+        },
+        "id": {
+          "pattern": "^H\\d+$",
+          "title": "Id",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "suspected",
+            "supported"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "suspected_cause": {
+          "enum": [
+            "check_then_act_race",
+            "lost_update",
+            "missing_compensation",
+            "required_step_bypassed",
+            "over_rejection",
+            "concurrency_fault"
+          ],
+          "title": "Suspected Cause",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "suspected_cause",
+        "status",
+        "explains",
+        "basis",
+        "how_to_confirm"
+      ],
+      "title": "Hypothesis",
+      "type": "object"
+    },
+    "InvariantComparison": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "trials_incomplete",
+                "build_unchanged",
+                "build_unknown",
+                "stale_source",
+                "not_evaluable"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "result": {
+          "enum": [
+            "FIXED",
+            "NOT_VERIFIED",
+            "REGRESSED",
+            "STILL_FAILING",
+            "STILL_PASSING"
+          ],
+          "title": "Result",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "result"
+      ],
+      "title": "InvariantComparison",
+      "type": "object"
+    },
+    "InvariantResult": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "result": {
+          "enum": [
+            "pass",
+            "fail",
+            "not_evaluable"
+          ],
+          "title": "Result",
+          "type": "string"
+        },
+        "values": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Values",
+          "type": "object"
+        }
+      },
+      "required": [
+        "name",
+        "result"
+      ],
+      "title": "InvariantResult",
+      "type": "object"
+    },
+    "Latency": {
+      "additionalProperties": false,
+      "properties": {
+        "max": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max"
+        },
+        "p50": {
+          "minimum": 0,
+          "title": "P50",
+          "type": "number"
+        },
+        "p95": {
+          "minimum": 0,
+          "title": "P95",
+          "type": "number"
+        },
+        "p99": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "P99"
+        }
+      },
+      "required": [
+        "p50",
+        "p95"
+      ],
+      "title": "Latency",
+      "type": "object"
+    },
+    "LoadConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "iterations": {
+          "minimum": 1,
+          "title": "Iterations",
+          "type": "integer"
+        },
+        "max_duration_s": {
+          "minimum": 1,
+          "title": "Max Duration S",
+          "type": "integer"
+        },
+        "min_peak_in_flight": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Min Peak In Flight"
+        },
+        "vus": {
+          "minimum": 1,
+          "title": "Vus",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "vus",
+        "iterations",
+        "max_duration_s"
+      ],
+      "title": "LoadConfig",
+      "type": "object"
+    },
+    "Performance": {
+      "additionalProperties": false,
+      "description": "Aggregates only. No value here affects the verdict.",
+      "properties": {
+        "error_rate": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Error Rate",
+          "type": "number"
+        },
+        "latency_ms": {
+          "$ref": "#/$defs/Latency"
+        },
+        "latency_ms_by_outcome": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Latency"
+          },
+          "propertyNames": {
+            "enum": [
+              "accepted",
+              "rejected",
+              "unexpected",
+              "transport_error"
+            ]
+          },
+          "title": "Latency Ms By Outcome",
+          "type": "object"
+        },
+        "rejection_rate": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Rejection Rate",
+          "type": "number"
+        },
+        "scope": {
+          "title": "Scope",
+          "type": "string"
+        },
+        "status_counts": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Status Counts",
+          "type": "object"
+        },
+        "throughput_rps_per_trial": {
+          "items": {
+            "type": "number"
+          },
+          "title": "Throughput Rps Per Trial",
+          "type": "array"
+        }
+      },
+      "required": [
+        "scope",
+        "latency_ms",
+        "error_rate",
+        "rejection_rate"
+      ],
+      "title": "Performance",
+      "type": "object"
+    },
+    "Reproduce": {
+      "additionalProperties": false,
+      "properties": {
+        "cli": {
+          "title": "Cli",
+          "type": "string"
+        },
+        "k6": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "K6"
+        }
+      },
+      "required": [
+        "cli"
+      ],
+      "title": "Reproduce",
+      "type": "object"
+    },
+    "RequestRecord": {
+      "additionalProperties": false,
+      "properties": {
+        "captured": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Captured"
+        },
+        "iter": {
+          "minimum": 0,
+          "title": "Iter",
+          "type": "integer"
+        },
+        "latency_ms": {
+          "minimum": 0,
+          "title": "Latency Ms",
+          "type": "number"
+        },
+        "outcome": {
+          "enum": [
+            "accepted",
+            "rejected",
+            "unexpected",
+            "transport_error"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "status": {
+          "description": "0 when the request failed in transport",
+          "minimum": 0,
+          "title": "Status",
+          "type": "integer"
+        },
+        "t_end": {
+          "description": "Epoch milliseconds",
+          "title": "T End",
+          "type": "number"
+        },
+        "t_start": {
+          "description": "Epoch milliseconds",
+          "title": "T Start",
+          "type": "number"
+        },
+        "trial": {
+          "minimum": 1,
+          "title": "Trial",
+          "type": "integer"
+        },
+        "vu": {
+          "minimum": 1,
+          "title": "Vu",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "trial",
+        "request_id",
+        "vu",
+        "iter",
+        "t_start",
+        "t_end",
+        "latency_ms",
+        "status",
+        "outcome"
+      ],
+      "title": "RequestRecord",
+      "type": "object"
+    },
+    "RunConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "config_hash": {
+          "pattern": "^sha256:[a-f0-9]{64}$",
+          "title": "Config Hash",
+          "type": "string"
+        },
+        "engine": {
+          "$ref": "#/$defs/Engine"
+        },
+        "load": {
+          "$ref": "#/$defs/LoadConfig"
+        },
+        "mutates_data": {
+          "title": "Mutates Data",
+          "type": "boolean"
+        },
+        "serial_control": {
+          "title": "Serial Control",
+          "type": "boolean"
+        },
+        "trials": {
+          "minimum": 0,
+          "title": "Trials",
+          "type": "integer"
+        },
+        "user_confirmed": {
+          "title": "User Confirmed",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "load",
+        "trials",
+        "serial_control",
+        "config_hash",
+        "engine",
+        "mutates_data",
+        "user_confirmed"
+      ],
+      "title": "RunConfig",
+      "type": "object"
+    },
+    "TargetInfo": {
+      "additionalProperties": false,
+      "properties": {
+        "build": {
+          "$ref": "#/$defs/Build"
+        },
+        "build_stable_during_run": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Build Stable During Run"
+        },
+        "origin": {
+          "title": "Origin",
+          "type": "string"
+        }
+      },
+      "required": [
+        "origin",
+        "build",
+        "build_stable_during_run"
+      ],
+      "title": "TargetInfo",
+      "type": "object"
+    },
+    "TrialResult": {
+      "additionalProperties": false,
+      "properties": {
+        "client": {
+          "$ref": "#/$defs/ClientCounts"
+        },
+        "completed_requests": {
+          "minimum": 0,
+          "title": "Completed Requests",
+          "type": "integer"
+        },
+        "incomplete_reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "timeout",
+                "iterations_short",
+                "engine_exit_nonzero",
+                "target_restarted",
+                "reset_failed",
+                "state_snapshot_failed",
+                "insufficient_contention",
+                "request_count_mismatch"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "budget_exhausted",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Incomplete Reason"
+        },
+        "invariants": {
+          "items": {
+            "$ref": "#/$defs/InvariantResult"
+          },
+          "title": "Invariants",
+          "type": "array"
+        },
+        "kind": {
+          "enum": [
+            "concurrent",
+            "serial_control"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "peak_in_flight": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Peak In Flight",
+          "type": "integer"
+        },
+        "planned_requests": {
+          "minimum": 0,
+          "title": "Planned Requests",
+          "type": "integer"
+        },
+        "state_after": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "State After"
+        },
+        "state_before": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "State Before"
+        },
+        "status": {
+          "enum": [
+            "completed",
+            "incomplete",
+            "skipped"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "trial": {
+          "minimum": 1,
+          "title": "Trial",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "trial",
+        "kind",
+        "status",
+        "planned_requests",
+        "completed_requests",
+        "client"
+      ],
+      "title": "TrialResult",
+      "type": "object"
+    },
+    "Violation": {
+      "additionalProperties": false,
+      "description": "A proven fact, derived deterministically from responses and state.",
+      "properties": {
+        "evidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ViolationEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "facts": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          },
+          "title": "Facts",
+          "type": "object"
+        },
+        "id": {
+          "pattern": "^V\\d+$",
+          "title": "Id",
+          "type": "string"
+        },
+        "invariant": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Invariant"
+        },
+        "observed": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              }
+            ]
+          },
+          "title": "Observed",
+          "type": "object"
+        },
+        "proven": {
+          "const": true,
+          "default": true,
+          "title": "Proven",
+          "type": "boolean"
+        },
+        "trials_violated": {
+          "pattern": "^\\d+/\\d+$",
+          "title": "Trials Violated",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "invariant.capacity_exceeded",
+            "invariant.accounting_mismatch",
+            "invariant.inconsistent_state",
+            "invariant.orphaned_resource",
+            "invariant.integrity_violated",
+            "invariant.liveness_failed",
+            "invariant.bound_violated",
+            "invariant.custom_failed",
+            "response.unexpected_status",
+            "transport.errors"
+          ],
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "trials_violated"
+      ],
+      "title": "Violation",
+      "type": "object"
+    },
+    "ViolationEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "file": {
+          "title": "File",
+          "type": "string"
+        },
+        "filter": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              }
+            ]
+          },
+          "title": "Filter",
+          "type": "object"
+        },
+        "sample": {
+          "items": {
+            "$ref": "#/$defs/RequestRecord"
+          },
+          "maxItems": 10,
+          "title": "Sample",
+          "type": "array"
+        }
+      },
+      "required": [
+        "file"
+      ],
+      "title": "ViolationEvidence",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The report.json contract: a RunResult plus the oracle's conclusions.",
+  "properties": {
+    "budget": {
+      "$ref": "#/$defs/Budget"
+    },
+    "comparison": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Comparison"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "completeness": {
+      "$ref": "#/$defs/Completeness"
+    },
+    "config": {
+      "$ref": "#/$defs/RunConfig"
+    },
+    "disclosures": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Disclosures",
+      "type": "array"
+    },
+    "evidence": {
+      "$ref": "#/$defs/Evidence"
+    },
+    "hypotheses": {
+      "items": {
+        "$ref": "#/$defs/Hypothesis"
+      },
+      "title": "Hypotheses",
+      "type": "array"
+    },
+    "performance": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Performance"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "reproduce": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Reproduce"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "run_id": {
+      "pattern": "^run_\\d{8}_\\d{6}_[a-f0-9]{4}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "scenario_id": {
+      "title": "Scenario Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "2.1",
+      "default": "2.1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "target": {
+      "$ref": "#/$defs/TargetInfo"
+    },
+    "trials": {
+      "items": {
+        "$ref": "#/$defs/TrialResult"
+      },
+      "title": "Trials",
+      "type": "array"
+    },
+    "verdict": {
+      "enum": [
+        "PASS",
+        "FAIL",
+        "INCONCLUSIVE",
+        "ERROR"
+      ],
+      "title": "Verdict",
+      "type": "string"
+    },
+    "verdict_reason": {
+      "title": "Verdict Reason",
+      "type": "string"
+    },
+    "violations": {
+      "items": {
+        "$ref": "#/$defs/Violation"
+      },
+      "title": "Violations",
+      "type": "array"
+    }
+  },
+  "required": [
+    "run_id",
+    "scenario_id",
+    "completeness",
+    "budget",
+    "target",
+    "config",
+    "verdict",
+    "verdict_reason"
+  ],
+  "title": "Report",
+  "type": "object"
+}
