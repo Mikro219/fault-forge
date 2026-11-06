@@ -103,6 +103,17 @@ The internal target is **submission-ready by the end of 7 November UTC**, which 
 - `Comparison.fix_verified` is what the agent loop in M6 must use, not per-invariant `FIXED`. An invariant can be `FIXED` in a retest that still has unexpected 500s. `fix_verified` is true only when the candidate's verdict is `PASS`, at least one invariant is `FIXED`, and none is `NOT_VERIFIED`, `STILL_FAILING` or `REGRESSED`.
 - M4 must bound k6's memory, because k6 buffers response bodies when `capture_field` is set, and must prove that a memory kill yields a report or a structured failure.
 
+### M4 decisions
+
+AI-written `app.py` shares a process with the hooks, so the state and `build_id` it reports could be forged. `report.json` is unchanged; these checks sit in `SandboxResult` and the fix gate.
+
+- **Deployed code.** The host hashes the files it wrote for the target (`deployed_code_sha256`: sorted relative paths and bytes). A candidate must differ from the baseline. This doesn't rely on the target's `build_id`.
+- **Target state is checked against the database directly for the final trial only.** After the runner finishes and before removal, `docker exec` runs `python -I` with stdlib `sqlite3`, opened read-only. The result is compared with that trial's `state-after.json`, giving `matched`, `mismatch` or `unavailable`.
+- **Fix gate.** Success needs all of: `fix_verified`, `state_verification` of `matched`, and a changed hash. Each attempt records which failed.
+- **AST policy.** Generated code is parsed on the host and never executed before a sandbox. It may not mention the hooks, may import only an allowlist, and may not use dynamic builtins or dunders, assign to attributes, or add routes or middleware. It must define `POST /reserve`, and code that touches the database must call `payments.authorize`, so a file that never sells anything is left to the verdict. A rejection is a failed attempt, and the model gets the broken rule on the retry.
+- **Reaper.** Each container carries `faultforge.expires`, and is reaped only past it. One with a missing or malformed value falls back to its age.
+- **Honest limit.** The policy is defence in depth, not a proof. A hostile process can still lie in earlier trials, and it could edit its own database, which the check would then agree with. The check catches forged hooks, not every fake.
+
 ## V3.8 Demo video (about 2 minutes)
 
 | Time | Scene |

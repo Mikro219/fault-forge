@@ -33,6 +33,10 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--iterations", type=int)
     run.add_argument("--max-duration-s", type=int)
     run.add_argument("--compare-to")
+    run.add_argument(
+        "--wait-for-target-s", type=float,
+        help="poll target health for up to this long first (at most 30 s, outside the run budget)",
+    )
     run.add_argument("--json", action="store_true", help="print report.json instead of the summary")
 
     show = commands.add_parser("show", help="show a stored run")
@@ -71,6 +75,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                 compare_to=args.compare_to,
             ),
             roots=[project_dir],
+            wait_for_target_s=args.wait_for_target_s,
         )
         _print_report(report, args.json)
         return EXIT_CODES[report.verdict]

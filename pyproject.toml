@@ -30,3 +30,4 @@ packages = ["src/faultforge"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = ["docker: starts real containers; needs Docker and builds the sandbox images"]

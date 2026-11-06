@@ -1,0 +1,34 @@
+version: 1
+target:
+  origin: http://127.0.0.1:8000
+  health: /health
+  reset: { method: POST, path: /__ff/reset, json: { stock: 1 } }
+  state: /__ff/state
+
+scenarios:
+  - id: hostile-build
+    description: A build that tries to misbehave, to show the sandbox containing it
+    mutates_data: true
+    user_confirmed: true
+    script: burst_request
+    request:
+      method: POST
+      path: /reserve
+      json: { item_id: 1, buyer: "buyer-${VU}-${ITER}" }
+    outcomes:
+      accepted_status: [200, 201]
+      rejected_status: [409]
+    load: { vus: 5, iterations: 5, max_duration_s: 6 }
+    invariants:
+      - name: No more tickets confirmed than were in stock
+        type: capacity
+        check: client.accepted <= before.stock
+      - name: Every confirmation is recorded
+        type: consistency
+        check: client.accepted == after.orders_confirmed - before.orders_confirmed
+      - name: Stock never negative
+        type: bound
+        check: after.stock >= 0
+    disclosures:
+      - This target is an intentionally hostile test fixture. /reserve never responds and instead attempts egress, secret scans, writes and resource exhaustion, so the expected verdict is INCONCLUSIVE, never PASS.
+      - Its state hook is hard-coded, so its invariants say nothing about business correctness. The result that matters is containment.

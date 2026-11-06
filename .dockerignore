@@ -1,0 +1,9 @@
+# Allowlist: nothing reaches an image build unless it's named here.
+*
+!pyproject.toml
+!README.md
+!src
+!docker
+!.tools/bin/k6
+**/__pycache__
+**/*.pyc

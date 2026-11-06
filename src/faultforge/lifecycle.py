@@ -34,12 +34,15 @@ from faultforge.models import (
     Reproduce,
     RunConfig,
     ScenarioConfig,
+    TargetConfig,
     TargetInfo,
     TrialResult,
 )
 
 MIN_TRIAL_TIME_S = 1
 SETTLE_POLL_S = 0.05
+MAX_WAIT_FOR_TARGET_S = 30.0
+HEALTH_POLL_S = 0.1
 EMPTY_COUNTS = ClientCounts(accepted=0, rejected=0, unexpected=0, transport_error=0)
 
 
@@ -195,6 +198,21 @@ def config_hash(
     }
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
     return f"sha256:{hashlib.sha256(encoded.encode()).hexdigest()}"
+
+
+def wait_for_target(target: TargetConfig, wait_s: float, limits: Limits) -> None:
+    """Polls health until it answers or the wait ends. Giving up isn't reported here: the
+    preflight that follows raises the usual target_unreachable."""
+    deadline = time.monotonic() + min(wait_s, MAX_WAIT_FOR_TARGET_S)
+    while True:
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            return
+        try:
+            TargetHooks(target, min(limits.hook_timeout_s, remaining_s)).health()
+            return
+        except HookError:
+            time.sleep(min(HEALTH_POLL_S, remaining_s))
 
 
 def _preflight(hooks: TargetHooks, scenario: ScenarioConfig, origin: str) -> Snapshot:
@@ -527,9 +545,16 @@ def run_scenario(
     roots: Iterable[Path] | None = None,
     limits: Limits = LIMITS,
     k6: Path | None = None,
+    wait_for_target_s: float | None = None,
 ) -> Report:
-    """Raises FaultForgeError or NotComparable before any load is sent."""
+    """Raises FaultForgeError or NotComparable before any load is sent.
+
+    wait_for_target_s is capped at MAX_WAIT_FOR_TARGET_S and isn't counted in the run's wall
+    budget, so a slow start can't cost a trial its time."""
     started = time.monotonic()
+    # Written this way so that NaN, which compares false with everything, is refused too.
+    if wait_for_target_s is not None and not wait_for_target_s >= 0:
+        raise FaultForgeError("config_invalid", "wait_for_target_s must not be negative")
     project_dir = safety.resolve_project_dir(project_dir, safety.allowed_roots(roots))
     project = config_module.load_config(project_dir)
     scenario = config_module.find_scenario(project, scenario_id)
@@ -557,6 +582,9 @@ def run_scenario(
     hooks = TargetHooks(project.target, limits.hook_timeout_s)
     try:
         with report_module.run_lock(project_dir):
+            if wait_for_target_s is not None:
+                wait_for_target(project.target, wait_for_target_s, limits)
+                started = time.monotonic()
             _preflight(hooks, scenario, project.target.origin)
             return _execute(
                 plan, project, scenario, hooks, k6, version, hash_value, baseline, project_dir, limits, started

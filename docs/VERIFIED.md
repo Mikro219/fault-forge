@@ -28,7 +28,46 @@ Python validates a `.pyc` by source size and whole-second modification time. A s
 
 `test_reference_fix_holds_across_worker_processes` failed once with `httpx.ReadError` during the full suite on 2026-11-06. It was a reset, not a wrong sale. It didn't reproduce in 65 fresh 4-worker startups with 3 races each, 25 of them with all CPUs saturated, so the cause is unknown. The demo target and the sandbox run a single worker, so this doesn't affect the product path. The test allows one retry and prints the server log on a second reset.
 
+## Behaviour inside the sandbox
+
+Tested on 2026-11-06 with Docker Desktop 29.7.2 on WSL2 (cgroup v2), using `tests/test_sandbox.py` and the default `SandboxPolicy`: target 256 MB, 1 CPU, 128 pids; runner 512 MB, 2 CPUs, 512 pids. A real deployment on a VM uses a different Docker setup, so run these tests there too.
+
+| Question | Result | Consequence |
+|---|---|---|
+| Does a memory kill yield a report or a structured failure? | Both occur, and neither is a traceback or a `PASS`. With 20 buffered 64 MB responses and nothing sampling the runner, k6 was OOM-killed and FaultForge survived in 20 of 20 runs: `engine_exit_nonzero`, `INCONCLUSIVE`, about 3.5 to 5.5 s. With `docker exec` sampling the cgroup every 0.1 s, the whole runner was killed in 3 of 6 runs with 4 trials (exit 137, no stdout), which gives `failed` with `runner_oom`. | Callers must handle both. Which one happens isn't controlled. The sampling probably changes the odds, but that wasn't isolated. |
+| Does the runner stay within its memory limit? | Almost. `memory.peak` reached 514 to 521 MiB against a 512 MiB limit, with swap equal to memory. | It's an overshoot, not a breach of the limit's purpose: it's bounded in every run seen. The likely cause is the kernel force-charging tasks that are dying, which wasn't confirmed. The test allows 32 MiB. |
+| What does `State.OOMKilled` mean? | It's true when any process in the container is OOM-killed, including when the main process survives and exits 2 or keeps running. | It doesn't mean the container died. `ContainerFacts` also reports `running_when_inspected` and `exit_code`, which is `None` while it's running. |
+| Do the limits starve a run? | No. The buggy and fixed demo each take 4 to 5 s in total for 3 trials plus the serial control, and still race and pass as they do outside Docker. The runner peaked at 49 MiB on the demo, and at 62 to 64 MiB and 15 pids with 50 VUs and 500 requests. The peaks are sampled, so they're lower bounds. | The defaults stand. |
+| Does `--read-only` break k6 or FaultForge? | No. k6's scratch directory is inside `/out`, `HOME` is `/tmp`, and SQLite's WAL works on the tmpfs. | No extra writable paths are needed. |
+| Is `--read-only` enough to stop writes outside `/tmp`? | No. It leaves `/dev/shm` writable. | Both containers also use `--ipc none`, which removes it. Nothing needs it. |
+| What happens when `--pids-limit` is hit? | Target: fork gets `BlockingIOError` after 125 children, and the hooks keep answering. Runner, 8 runs at each limit: 2 to 4 pids gave `failed` with `runner_error` (exit 3); 6 gave `INCONCLUSIVE` with `engine_exit_nonzero`; 8 gave 5 `INCONCLUSIVE` and 3 `PASS`. | A shortage that stops k6 can't produce `PASS`. A `PASS` at 8 means k6 fit and every request completed. The default of 512 is far above the 15 seen. |
+| Does `--cpus` stop a spin? | No. It throttles to the limit (`nr_throttled` rises) and the spin ends by itself. The hostile build reports `cpu_spin` as `not_blocked`, which is accurate. | Only the host's wall limit bounds CPU use over time. Present this as limited, not blocked. |
+| Can an image's environment be an allowlist? | Not with `FROM python:3.12-slim` alone, which adds `GPG_KEY` and others, and an image can't unset them. | The images copy their files into `FROM scratch`, so `docker inspect` shows only `PATH` and the names set per run. |
+| Is `build_id` stable across sandboxes? | Yes, for identical source: 2 runs matched, with different `instance_id`s. A same-size edit changed it. | A retest of unchanged code reads as `build_unchanged`. This relies on the fixed `/app` mount path. |
+| Does the host wall limit hold? | Yes, tested with a 4 s limit: the run was killed, `wall_limit_exceeded`, no containers left. | |
+
+**Bridge gateway on Docker Desktop.** `172.17.0.1` exists inside Docker's VM rather than on this machine, so this machine can't bind it (`EADDRNOTAVAIL`). The egress test therefore uses a labelled helper container on Docker's host network to listen on the gateway, with loopback and primary-address listeners on this machine. A normal bridge container did reach the gateway listener, so the control is real. From both sandbox containers: gateway, primary address and `1.1.1.1` gave `ENETUNREACH`, DNS failed, and loopback was refused because it's the container's own. All listeners stayed at 0 hits.
+
+## Model test on Vultr Serverless Inference (2026-11-06)
+
+Each try sent the buggy `app.py`, the support code, the business rules and a real `FAIL` report, then ran the generated fix in a new sandbox. Success needs `fix_verified`, a matching direct database check and new code. One attempt per try, 10 tries per setting, $0.12 in total by the script's accounting.
+
+| Model and reasoning setting | Passed | Median model seconds | Failures |
+|---|---|---|---|
+| `glm-5.3@low` | 10/10 | 23.4 | none |
+| `mimo-v2.6-pro@none` | 8/10 | 1.7 | 2 code policy |
+| `deepseek-v4.1-flash-1017@none` | 8/10 | 1.3 | 1 code policy, 1 unexpected 500 |
+| `glm-5.3-flash@low` | 7/10 | 5.0 | 3 malformed replies (syntax, multiple blocks, truncated) |
+| `qwen3.8-flash-next@none` | 6/10 | 3.0 | 4 malformed replies (3 multiple blocks, 1 truncated) |
+| `qwen3.8-27b@none` | 5/10 | 2.2 | 4 multiple blocks, 1 still oversold |
+
+- Without a reasoning setting, every model tried spent its 8,000-token allowance on reasoning and returned no content.
+- Settings are model-specific. `glm-5.3` and `glm-5.3-flash` kept reasoning to the limit at `none` in a single test call, and `mimo-v2.6-pro` did at `low`.
+- The verdict doesn't judge design quality: some passing fixes from other models used an in-process lock, which wouldn't hold across workers. All 10 `glm-5.3` fixes used the atomic claim.
+- The demo default is `glm-5.3@low`, for reliability over speed. A first-attempt failure is unlikely with it, so a retry can't be scripted.
+
 ## Still to verify
 
 - `MCP_TOOL_TIMEOUT`: not relevant while MCP is cut from the MVP.
-- Behaviour inside the sandbox, including with `--read-only` and `--pids-limit`: M4.
+- All of the above on the Vultr VM, which won't have Docker Desktop's VM between the host and the bridge (M5).
+- `docker-default` AppArmor confinement: AppArmor is absent under WSL2 (`docker info` lists only seccomp and cgroupns), so it must be checked on the VM in M5.
