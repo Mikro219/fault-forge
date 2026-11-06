@@ -10,7 +10,12 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8,<9"]
+dev = [
+    "fastapi>=0.162.0",
+    "httpx>=0.28.1",
+    "pytest>=8,<9",
+    "uvicorn>=0.54.0",
+]
 
 [build-system]
 requires = ["hatchling"]
