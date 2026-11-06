@@ -49,6 +49,8 @@ class Server:
             "PYTHONPATH": str(self.support_dir),
             "FF_DB_PATH": str(self.db_path),
             "FF_TEST_HOOKS": "1",
+            # A same-size edit within one second would otherwise run stale bytecode.
+            "PYTHONDONTWRITEBYTECODE": "1",
         }
         self.process = subprocess.Popen(
             [

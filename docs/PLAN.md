@@ -40,6 +40,7 @@ Applied to both containers:
 | Privileges | Non-root user, `--cap-drop ALL`, `--security-opt no-new-privileges` |
 | Resources | `--memory`, `--cpus`, `--pids-limit` |
 | Secrets | Allowlisted environment only; no keys and no Docker socket |
+| Code freshness | `PYTHONDONTWRITEBYTECODE=1` and a fresh code directory with no `__pycache__`, so a retest can't run stale bytecode (`docs/VERIFIED.md`) |
 | Lifetime | Wall-clock kill at the §4.6 budget; always removed afterwards |
 | Leftovers | Containers are labelled; a reaper removes strays at startup and on a timer |
 
@@ -349,8 +350,8 @@ Invariant `type` is an enum: `capacity | accounting | consistency | orphan | int
 |---|---|
 | `accepted` | status in `accepted_status` |
 | `rejected` | status in `rejected_status` |
-| `unexpected` | any other status, including any 3xx |
-| `transport_error` | status 0 or k6 `error_code` set |
+| `unexpected` | any other non-zero status, including any 3xx |
+| `transport_error` | status 0 only; k6 also sets `error_code` on HTTP 4xx and 5xx (see `docs/VERIFIED.md`) |
 
 **Evidence metric:** one custom Trend, `ff_req`. Its value is the request duration in ms, with tags `{outcome, status, request_id, vu, iter, trial, captured}`.
 - High-cardinality tags appear **only** on this metric.
@@ -373,7 +374,7 @@ Invariant `type` is an enum: `capacity | accounting | consistency | orphan | int
 ```
 
 - Raw `--out json` output is streamed to a temp file and **filtered to `ff_req` samples** into `requests.jsonl`. The raw file is then deleted.
-- Each `requests.jsonl` line is `{trial, request_id, vu, iter, t_start, t_end, latency_ms, status, outcome, captured}`, where `t_start = sample_time − duration`.
+- Each `requests.jsonl` line is `{trial, request_id, vu, iter, t_start, t_end, latency_ms, status, outcome, captured}`. `t_start` and `t_end` are `Date.now()` taken around each request.
 - `report.json` references the file as `{path, count, sha256}`. It never inlines more than 10 samples per violation.
 - **Aggregates are computed by FaultForge** from `requests.jsonl`: percentiles across trials and by outcome. Percentiles can't be averaged across trials, so they are computed this way rather than taken from k6. Throughput and iteration counts come from each trial's `k6-summary.json`.
 - For a single trial, FaultForge's p95 must match k6's p95 within 1 ms (M3 cross-check).
