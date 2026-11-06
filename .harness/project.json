@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "project": "fault-forge",
+  "profile": "standard",
+  "modules": [
+    "exact-patch"
+  ],
+  "passive_improvement_capture": false,
+  "authority_sources": [
+    "The user's explicit directions",
+    "CLAUDE.md"
+  ],
+  "risk_sources": [
+    "docs/PLAN.md V3.3: sandbox policy, including isolation, resource limits, secrets and cleanup",
+    "docs/PLAN.md \u00a74.9: target, path and filesystem safety, and k6 environment hardening",
+    "docs/PLAN.md \u00a74.6, \u00a74.7 and \u00a74.10: budgets and the rules deciding PASS, FAIL, INCONCLUSIVE and FIXED",
+    "docs/PLAN.md V3.4: applying AI-generated code, and treating target output as untrusted",
+    "docs/PLAN.md V3.5: public URL safeguards and inference spending limits",
+    "Handling of the Vultr inference key and any other credential",
+    "Creating Vultr resources or spending credits"
+  ],
+  "retained_gates": [
+    "uv run pytest must pass before a commit",
+    "Report model validators reject a verdict its evidence doesn't support",
+    "One milestone at a time, then stop for the owner's review"
+  ],
+  "commands": {
+    "setup": "uv sync && bash scripts/install_k6.sh",
+    "test": "uv run pytest",
+    "regenerate_schema": "uv run python -m faultforge.schema",
+    "exact_patch_tests": "bash .harness/modules/exact-patch/tests/test_fixpatch.sh"
+  },
+  "notes": "Vultr Agent Rush entry on a short deadline. The full test suite takes about 60 seconds, so don't run it under a tight timeout. Harness updates come from a local copy of the package outside this repo; see .harness/harness.lock.json for the installed release. Owner's review decision (2026-11-06): instead of full strict review, run one time-boxed independent Codex review each for the verdict logic (M3), the sandbox (M4) and the public app (M5-M6). Only serious findings block; list what stays open. If time is tight, fall back to the implementing agent's own review and say so."
+}

@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "harness_version": "0.1.0",
+  "layout": "1",
+  "source": "agent-harness",
+  "profile": "standard",
+  "modules": [
+    "exact-patch"
+  ],
+  "managed": {
+    ".harness/core/CORE.md": "e3200c84dfc9121d470fdeea82599e3d1f61affb3bf5c795fb3651b6470726e2",
+    ".harness/profiles/light.md": "ea7960556f3f6379b6ce81c9a16ee6d35e956365a8de9a9a25c80f8030a42cfe",
+    ".harness/profiles/standard.md": "f97e0ed0e6b2dd86cdcd2806d4eab1d939dc02853df3f8e799400301c941f394",
+    ".harness/profiles/strict.md": "39536b1e727b0f2653037095e5704b638dc28f6006e3c48f04b4be0c0355dd05",
+    ".harness/modules/exact-patch/MODULE.md": "21c621226807f1ea5afabcad005e95b76873a86bf1781ac6308a14e5c397c783",
+    ".harness/modules/exact-patch/scripts/fixpatch.sh": "56662b264f8c12517e83b281a571859bd0faa0e37ec6227d4f7084a944c74d9d",
+    ".harness/modules/exact-patch/tests/test_fixpatch.sh": "1af8f3e63047a9a84c5c1735c4e2193c6cd2aa97c6d6f7054c5c45e9272b892d"
+  },
+  "instruction_blocks": {
+    "CLAUDE.md": "fbd861fab0c2273d58f12b74d11fa7f3d4a81dbeab0398d59a97e4a5306541a2",
+    "AGENTS.md": "fbd861fab0c2273d58f12b74d11fa7f3d4a81dbeab0398d59a97e4a5306541a2"
+  }
+}
