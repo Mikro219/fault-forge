@@ -1,6 +1,120 @@
+# FaultForge — Plan v3 (Vultr Agent Rush: Blast Radius Zero)
+
+Status: **M0 done. v3 milestones awaiting approval.** Team: one person plus Claude Code.
+
+This section **overrides** the v2.1 plan below wherever they conflict. The contracts (§4), verdict rules, budgets, comparison rules and demo target (M1) still apply. Claude Code and MCP are no longer the product interface.
+
+## V3.1 Product
+
+FaultForge is a public web agent that finds a concurrency bug by running real load, fixes it, and proves the fix. Every target, every load run and every line of AI-written code runs in a disposable sandbox on Vultr.
+
+## V3.2 Architecture
+
+```
+Browser ──HTTPS──▶ Control plane on a Vultr VM (FastAPI + static page)
+                    │  holds the inference key; never enters a sandbox
+                    ├─▶ Agent ──▶ Vultr Serverless Inference (all LLM calls)
+                    │     input: report.json + app source; output: one validated file
+                    └─▶ Sandbox manager (docker CLI, argv only)
+                          │  a new pair of containers for every run, then removed
+                          ▼
+                 ┌───────────────── shared network namespace, no external network ─┐
+                 │ target container (untrusted)       runner container (trusted)   │
+                 │ FastAPI app + hooks        ◀─127.0.0.1─  k6 + FaultForge core   │
+                 │ no artifacts mount, no secrets           writes /out only       │
+                 └─────────────────────────────────────────────────────────────────┘
+```
+
+- The target runs with `--network none`. The runner joins it with `--network container:<target>`, so it reaches the target on `127.0.0.1` and has no route anywhere else. The loopback rules in §4.9 stay unchanged.
+- The target can't touch the artifacts directory, so it can't edit its own report. It can still lie through `/__ff/state`, which is disclosed; client counts are measured by the runner.
+- The control plane validates `report.json` against the pydantic models before showing it, and treats its strings as untrusted.
+
+## V3.3 Sandbox policy
+
+Applied to both containers:
+
+| Control | Setting |
+|---|---|
+| Network | No external network |
+| Filesystem | `--read-only`, with a small `--tmpfs` for working data |
+| Privileges | Non-root user, `--cap-drop ALL`, `--security-opt no-new-privileges` |
+| Resources | `--memory`, `--cpus`, `--pids-limit` |
+| Secrets | Allowlisted environment only; no keys and no Docker socket |
+| Lifetime | Wall-clock kill at the §4.6 budget; always removed afterwards |
+| Leftovers | Containers are labelled; a reaper removes strays at startup and on a timer |
+
+**Should have:** gVisor (`--runtime=runsc`) if it installs cleanly on the VM. Without it, containers share the VM's kernel, and the README says so.
+
+## V3.4 The agent
+
+Deliberately narrow, so that it is reliable:
+
+1. Run the scenario on the buggy target and get a verified `FAIL`.
+2. Send the report and `app.py` to Vultr Serverless Inference, marked as untrusted data, with the business rules. The model has no tools.
+3. Accept one complete replacement for `app.py`, within a size limit. Other files can't change.
+4. Run it in a **new sandbox** with `compare_to` set to the first run.
+5. If the verdict isn't `FIXED`, send the new report back. Stop after **3 attempts** and report failure honestly.
+
+FaultForge's verdict decides success, never the model. This gives a real retry moment: a fix that forgets to void payments fails the `orphan` invariant and the agent has to correct it.
+
+## V3.5 Public URL safeguards
+
+- **No uploads and no free-text prompts.** Users choose from fixed targets. Bring-your-own-code is FUTURE.
+- One run at a time, with a queue limit and per-IP cooldown.
+- Limits on tokens per attempt and tokens per day. The page keeps working for replays when the limit is hit.
+- A stored run from a real execution is shown as a labelled replay when the system is busy. It is never presented as live.
+
+## V3.6 Containment moment
+
+A second fixed target, `hostile-build`, is real code that tries to:
+- call an external server
+- read environment variables looking for keys
+- write outside its temporary directory
+- exhaust memory and processes, and spin forever
+
+The sandbox records each attempt and result: network unreachable, no secrets found, read-only filesystem, limit hit, killed at the deadline. The report is `INCONCLUSIVE`, never `PASS`, and the page shows the VM still healthy with no containers left behind.
+
+## V3.7 Milestones
+
+The internal target is **submission-ready by the end of 7 November UTC**, which leaves 8 November as a buffer until the organisers confirm the deadline. Stop for review after each milestone.
+
+| # | Milestone | Acceptance | Vultr credits |
+|---|---|---|---|
+| M1 | `ticket-api`: buggy code, reference fix, sloppy and false fixes | §7 M1 checks. Failure-path tests limited to losing the claim, rollback and decline. | No |
+| M2 | Hardened k6 runner, starting with the k6 2.3.0 option check | §7 M2 checks | No |
+| M3 | Core loop and CLI: config, safety, budgets, oracle, report, compare | §7 M3a and M3b checks, excluding reload-based stale checks | No |
+| M4 | Sandbox manager and hostile target | Buggy `FAIL`, fixed `PASS` and `FIXED` in sandboxes. Hostile target contained. Egress test fails to connect. No containers left after a timeout. Inference key absent from sandbox environment. | No |
+| M5 | Web app, deployed to the VM | Public URL runs a real scenario end to end and shows the verdict and evidence. | **VM** |
+| M6 | Agent on Vultr inference | From the public URL: `FAIL`, generated fix, `FIXED` with a new `build_id`. A bad fix is rejected and retried. Token limits enforced. | **Inference** |
+| M7 | Submission | Timed rehearsal, video with containment moment, slides, cover image, README covering Vultr services and architecture, lablab entry. | Small |
+
+**Deploy early:** M5 ships a working vertical slice before the agent exists, so a late problem can't leave us with nothing deployable.
+
+**Cuts for this timeline:**
+- Cut: the MCP server (a thin wrapper later if time remains), scenario generation (M7 of v2.1), reload-based fingerprint flows, `doctor`, the Makefile, and full evidence paging.
+- First to cut if behind: gVisor, hypotheses beyond the demo's rules, then the serial control.
+- Never cut: sandbox policy, budgets, verdict rules, real execution, and the containment moment (it's required for submission).
+
+## V3.8 Demo video (about 2 minutes)
+
+| Time | Scene |
+|---|---|
+| 0:00 | Unit tests pass and the API looks healthy |
+| 0:15 | Run load from the public URL: `FAIL`, many tickets sold for 1 in stock, all 200s and low latency |
+| 0:45 | Agent reads the evidence and proposes a fix through Vultr inference |
+| 1:05 | New sandbox, same workload: `PASS`, `FIXED`, new `build_id` |
+| 1:25 | **Containment:** run `hostile-build`, and each attack is blocked and shown |
+| 1:50 | Close on the architecture and the Vultr services used |
+
+## V3.9 Costs
+
+Nothing is created without the owner's approval, with the current price shown first. One VM with roughly 2–4 vCPU and 4–8 GB should be well within the $200. Vultr's docs were reported at $0.55 / $2.75 per million input / output tokens for inference, which is unverified against the console. Confirm both prices in the console before use.
+
+---
+
 # FaultForge — Architecture & Hackathon MVP Plan (v2.1)
 
-Status: **v2.1 approved; M0 in progress.** Deployment for the hackathon is unresolved (§11).
+Status: **superseded in part by v3 above.** The track decision in §11 is resolved: Blast Radius Zero.
 Audience: the team, and the Claude Code session that will implement it.
 
 ---
