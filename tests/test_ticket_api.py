@@ -52,17 +52,21 @@ class Server:
             # A same-size edit within one second would otherwise run stale bytecode.
             "PYTHONDONTWRITEBYTECODE": "1",
         }
-        self.process = subprocess.Popen(
-            [
-                sys.executable, "-m", "uvicorn", "app:app",
-                "--app-dir", str(self.app_dir),
-                "--port", str(self.port),
-                "--log-level", "critical",
-                "--workers", str(self.workers),
-            ],
-            env=env,
-            start_new_session=True,
-        )
+        self.log_path = self.db_path.with_suffix(".log")
+        with self.log_path.open("ab") as log:
+            self.process = subprocess.Popen(
+                [
+                    sys.executable, "-m", "uvicorn", "app:app",
+                    "--app-dir", str(self.app_dir),
+                    "--port", str(self.port),
+                    "--log-level", "warning",
+                    "--workers", str(self.workers),
+                ],
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             with contextlib.suppress(httpx.TransportError):
@@ -83,6 +87,9 @@ class Server:
             os.killpg(self.process.pid, signal.SIGKILL)
             self.process.wait()
         self.process = None
+
+    def log_tail(self) -> str:
+        return self.log_path.read_text(errors="replace")[-2000:]
 
     def reset(self, stock: int) -> None:
         httpx.post(f"{self.url}/__ff/reset", json={"stock": stock}, timeout=5).raise_for_status()
@@ -164,9 +171,21 @@ def test_reference_fix_holds_under_concurrency(serve):
 
 
 def test_reference_fix_holds_across_worker_processes(serve):
+    # A connection reset was seen once across 4 workers and couldn't be reproduced (docs/VERIFIED.md).
+    # It isn't a sale outcome and each attempt re-seeds state, so one retry is allowed. Every
+    # attempt that completes is still checked, and a second reset fails with the server's log.
     server = serve(REFERENCE_FIX, workers=4)
-    for _ in range(ATTEMPTS):
-        assert_exactly_one_sale(race(server))
+    resets = 0
+    completed = 0
+    while completed < ATTEMPTS:
+        try:
+            result = race(server)
+        except httpx.TransportError as error:
+            resets += 1
+            assert resets <= 1, f"repeated connection resets: {error!r}\n{server.log_tail()}"
+            continue
+        assert_exactly_one_sale(result)
+        completed += 1
 
 
 # Failure paths on the reference fix

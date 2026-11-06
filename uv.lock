@@ -82,6 +82,7 @@ name = "faultforge"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "pydantic" },
     { name = "pyyaml" },
 ]
@@ -89,13 +90,13 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "fastapi" },
-    { name = "httpx" },
     { name = "pytest" },
     { name = "uvicorn" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.28.1,<1" },
     { name = "pydantic", specifier = ">=2.7,<3" },
     { name = "pyyaml", specifier = ">=6,<7" },
 ]
@@ -103,7 +104,6 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "fastapi", specifier = ">=0.162.0" },
-    { name = "httpx", specifier = ">=0.28.1" },
     { name = "pytest", specifier = ">=8,<9" },
     { name = "uvicorn", specifier = ">=0.54.0" },
 ]

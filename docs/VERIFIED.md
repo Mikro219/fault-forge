@@ -24,6 +24,10 @@ Python validates a `.pyc` by source size and whole-second modification time. A s
 
 `build_id` was correct in these failures, because it reports what is actually executing. Target processes must set `PYTHONDONTWRITEBYTECODE=1` and start from a directory with no `__pycache__`, or a retest could run the code from before a fix.
 
+## Unexplained: one connection reset across 4 workers
+
+`test_reference_fix_holds_across_worker_processes` failed once with `httpx.ReadError` during the full suite on 2026-11-06. It was a reset, not a wrong sale. It didn't reproduce in 65 fresh 4-worker startups with 3 races each, 25 of them with all CPUs saturated, so the cause is unknown. The demo target and the sandbox run a single worker, so this doesn't affect the product path. The test allows one retry and prints the server log on a second reset.
+
 ## Still to verify
 
 - `MCP_TOOL_TIMEOUT`: not relevant while MCP is cut from the MVP.

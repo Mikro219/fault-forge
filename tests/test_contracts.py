@@ -94,6 +94,34 @@ def test_pass_rejects_proven_violations():
     assert_rejected(data, "can't include proven violations")
 
 
+@pytest.mark.parametrize(("planned", "completed"), [(20, 19), (0, 0)])
+def test_pass_requires_every_planned_request_to_complete(planned, completed):
+    data = load_report("pass")
+    data["trials"][0]["planned_requests"] = planned
+    data["trials"][0]["completed_requests"] = completed
+    assert_rejected(data, "every planned request")
+
+
+def test_pass_requires_every_planned_concurrent_trial():
+    data = load_report("pass")
+    data["trials"][0]["kind"] = "serial_control"
+    assert_rejected(data, "as many concurrent trials")
+
+
+def test_fix_verified_requires_a_passing_candidate():
+    data = load_report("inconclusive")
+    data["comparison"] = load_report("pass")["comparison"]
+    assert_rejected(data, "verdict to be PASS")
+
+
+@pytest.mark.parametrize("change", ["NOT_VERIFIED", "REGRESSED", "STILL_FAILING", "STILL_PASSING"])
+def test_fix_verified_requires_fixed_and_nothing_unresolved(change):
+    data = load_report("pass")
+    reason = "not_evaluable" if change == "NOT_VERIFIED" else None
+    data["comparison"]["invariants"] = [{"name": "x", "result": change, "reason": reason}]
+    assert_rejected(data, "fix_verified requires a FIXED")
+
+
 def test_fail_requires_a_violation():
     data = load_report("fail")
     data["violations"] = []
@@ -224,6 +252,11 @@ def test_status_cannot_be_both_accepted_and_rejected():
 def test_default_min_peak_in_flight(vus, expected):
     load = LoadConfig(vus=vus, iterations=vus, max_duration_s=5)
     assert load.effective_min_peak_in_flight == expected
+
+
+def test_min_peak_in_flight_requires_real_overlap():
+    with pytest.raises(ValidationError, match="greater than or equal to 2"):
+        LoadConfig(vus=5, iterations=5, max_duration_s=5, min_peak_in_flight=1)
 
 
 def test_iterations_must_cover_vus():

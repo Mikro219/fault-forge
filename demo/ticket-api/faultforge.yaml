@@ -1,0 +1,46 @@
+version: 1
+target:
+  origin: http://127.0.0.1:8000
+  health: /health
+  reset: { method: POST, path: /__ff/reset, json: { stock: 1 } }
+  state: /__ff/state
+
+scenarios:
+  - id: last-ticket-rush
+    description: 20 buyers race for the last ticket
+    mutates_data: true
+    user_confirmed: true
+    script: burst_request
+    request:
+      method: POST
+      path: /reserve
+      json: { item_id: 1, buyer: "buyer-${VU}-${ITER}" }
+    outcomes:
+      accepted_status: [200, 201]
+      rejected_status: [409]
+      capture_field: order_id
+    load: { vus: 20, iterations: 20, max_duration_s: 10, min_peak_in_flight: 10 }
+    invariants:
+      - name: No more tickets confirmed than were in stock
+        type: capacity
+        check: client.accepted <= before.stock
+      - name: Stock accounting balances
+        type: accounting
+        check: before.stock - after.stock == after.orders_confirmed - before.orders_confirmed
+      - name: Every confirmation is recorded
+        type: consistency
+        check: client.accepted == after.orders_confirmed - before.orders_confirmed
+      - name: No customer holds a payment authorization without a ticket
+        type: orphan
+        check: after.payments_unattached == 0
+      - name: Every order has a payment authorization
+        type: integrity
+        check: after.orders_without_payment == 0
+      - name: Available stock can actually be sold
+        type: liveness
+        check: client.accepted >= before.stock
+      - name: Stock never negative
+        type: bound
+        check: after.stock >= 0
+    disclosures:
+      - Payment provider is an in-process stub with a fixed 50 ms delay, which widens the race window.

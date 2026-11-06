@@ -79,6 +79,7 @@ class EngineResult:
     records: tuple[RequestRecord, ...]
     peak_in_flight: int
     incomplete_reason: IncompleteReason | None
+    throughput_rps: float = 0.0
 
 
 def find_k6() -> Path:
@@ -186,7 +187,7 @@ def read_records(raw_path: Path) -> list[RequestRecord]:
     records = []
     if not raw_path.exists():
         return records
-    with raw_path.open(encoding="utf-8") as raw:
+    with raw_path.open(encoding="utf-8", errors="replace") as raw:
         for line in raw:
             try:
                 sample = json.loads(line)
@@ -297,5 +298,8 @@ def run_trial(
         peak_in_flight=peak,
         incomplete_reason=classify(
             spec, process.returncode, killed, completed, dropped, len(records), peak
+        ),
+        throughput_rps=float(
+            summary.get("metrics", {}).get("iterations", {}).get("values", {}).get("rate", 0.0)
         ),
     )

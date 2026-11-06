@@ -430,6 +430,7 @@
   },
   "comparison": {
     "baseline_run_id": "run_20261106_071900_ab12",
+    "fix_verified": true,
     "status": "COMPARABLE",
     "not_comparable_reason": null,
     "baseline_build_id": "c0de1a2b",

@@ -196,6 +196,12 @@
           "default": null,
           "title": "Candidate Build Id"
         },
+        "fix_verified": {
+          "default": false,
+          "description": "The run-level answer: candidate PASS, an invariant FIXED, and none left unresolved",
+          "title": "Fix Verified",
+          "type": "boolean"
+        },
         "invariants": {
           "items": {
             "$ref": "#/$defs/InvariantComparison"
@@ -555,7 +561,7 @@
         "min_peak_in_flight": {
           "anyOf": [
             {
-              "minimum": 1,
+              "minimum": 2,
               "type": "integer"
             },
             {

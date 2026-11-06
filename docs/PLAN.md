@@ -96,6 +96,13 @@ The internal target is **submission-ready by the end of 7 November UTC**, which 
 - First to cut if behind: gVisor, hypotheses beyond the demo's rules, then the serial control.
 - Never cut: sandbox policy, budgets, verdict rules, real execution, and the containment moment (it's required for submission).
 
+### M3 decisions
+
+- Transport and unexpected-status violations only count from completed trials, because a restart or kill also breaks connections.
+- `capacity` checks run on incomplete trials, so they must be client-observed upper bounds: `client.<counter> <= <expr>` or `<`, where the right side uses only `before.*` and integers. Other forms are `config_invalid`.
+- `Comparison.fix_verified` is what the agent loop in M6 must use, not per-invariant `FIXED`. An invariant can be `FIXED` in a retest that still has unexpected 500s. `fix_verified` is true only when the candidate's verdict is `PASS`, at least one invariant is `FIXED`, and none is `NOT_VERIFIED`, `STILL_FAILING` or `REGRESSED`.
+- M4 must bound k6's memory, because k6 buffers response bodies when `capture_field` is set, and must prove that a memory kill yields a report or a structured failure.
+
 ## V3.8 Demo video (about 2 minutes)
 
 | Time | Scene |

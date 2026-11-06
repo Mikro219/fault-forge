@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SCHEMA_VERSION = "2.1"
 MAX_SAMPLES_PER_VIOLATION = 10
+MAX_STATUSES = 32
 
 Verdict = Literal["PASS", "FAIL", "INCONCLUSIVE", "ERROR"]
 Outcome = Literal["accepted", "rejected", "unexpected", "transport_error"]
@@ -52,6 +53,7 @@ SuspectedCause = Literal[
     "concurrency_fault",
 ]
 InvariantChange = Literal["FIXED", "NOT_VERIFIED", "REGRESSED", "STILL_FAILING", "STILL_PASSING"]
+UNRESOLVED_CHANGES = {"NOT_VERIFIED", "REGRESSED", "STILL_FAILING"}
 NotVerifiedReason = Literal[
     "trials_incomplete", "build_unchanged", "build_unknown", "stale_source", "not_evaluable"
 ]
@@ -84,8 +86,8 @@ class RequestTemplate(Contract):
 
 
 class OutcomeConfig(Contract):
-    accepted_status: list[int] = Field(min_length=1)
-    rejected_status: list[int] = Field(default_factory=list)
+    accepted_status: list[int] = Field(min_length=1, max_length=MAX_STATUSES)
+    rejected_status: list[int] = Field(default_factory=list, max_length=MAX_STATUSES)
     capture_field: str | None = None
 
     @model_validator(mode="after")
@@ -99,7 +101,7 @@ class LoadConfig(Contract):
     vus: int = Field(ge=1)
     iterations: int = Field(ge=1)
     max_duration_s: int = Field(ge=1)
-    min_peak_in_flight: int | None = Field(default=None, ge=1)
+    min_peak_in_flight: int | None = Field(default=None, ge=2)
 
     @model_validator(mode="after")
     def every_vu_has_an_iteration(self) -> Self:
@@ -130,6 +132,14 @@ class ScenarioConfig(Contract):
     outcomes: OutcomeConfig
     load: LoadConfig
     invariants: list[InvariantConfig] = Field(min_length=1)
+    disclosures: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def invariant_names_are_unique(self) -> Self:
+        names = [invariant.name for invariant in self.invariants]
+        if len(names) != len(set(names)):
+            raise ValueError("invariant names must be unique within a scenario")
+        return self
 
 
 class ProjectConfig(Contract):
@@ -349,12 +359,23 @@ class Comparison(Contract):
     baseline_build_id: str | None = None
     candidate_build_id: str | None = None
     invariants: list[InvariantComparison] = Field(default_factory=list)
+    fix_verified: bool = Field(
+        default=False,
+        description="The run-level answer: candidate PASS, an invariant FIXED, and none left unresolved",
+    )
     performance_delta: dict[str, float] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def not_comparable_has_no_results(self) -> Self:
         if self.status == "NOT_COMPARABLE" and (self.invariants or not self.not_comparable_reason):
             raise ValueError("NOT_COMPARABLE needs a reason and no invariant results")
+        return self
+
+    @model_validator(mode="after")
+    def fix_verified_matches_results(self) -> Self:
+        results = {item.result for item in self.invariants}
+        if self.fix_verified and ("FIXED" not in results or results & UNRESOLVED_CHANGES):
+            raise ValueError("fix_verified requires a FIXED invariant and none unresolved")
         return self
 
 
@@ -432,6 +453,8 @@ class Report(RunResult):
         if self.verdict == "INCONCLUSIVE":
             if self.completeness.status == "complete" and "not_evaluable" not in results:
                 raise ValueError("INCONCLUSIVE needs an incomplete trial or a not_evaluable invariant")
+        if self.comparison is not None and self.comparison.fix_verified and self.verdict != "PASS":
+            raise ValueError("fix_verified requires the candidate's verdict to be PASS")
         return self
 
     def _require_pass_evidence(self, results: list[InvariantOutcome]) -> None:
@@ -439,6 +462,10 @@ class Report(RunResult):
             raise ValueError("PASS requires every planned trial to complete")
         if not self.trials or any(trial.status != "completed" for trial in self.trials):
             raise ValueError("PASS requires every planned trial to complete")
+        if any(t.planned_requests == 0 or t.completed_requests != t.planned_requests for t in self.trials):
+            raise ValueError("PASS requires every planned request to complete in every trial")
+        if sum(trial.kind == "concurrent" for trial in self.trials) != self.completeness.trials_planned:
+            raise ValueError("PASS requires as many concurrent trials as were planned")
         if any(not trial.invariants for trial in self.trials):
             raise ValueError("PASS requires invariants evaluated in every trial")
         if any(result != "pass" for result in results):
