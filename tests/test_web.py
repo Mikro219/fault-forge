@@ -4,6 +4,7 @@ import dataclasses
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -20,7 +21,7 @@ from faultforge import fix_agent, lifecycle
 from faultforge.fix_agent import ApiKey, AttemptRecord, LoopResult, ModelPrice, Proposal
 from faultforge.lifecycle import RunOptions
 from faultforge.models import Comparison, InvariantComparison, RequestRecord, ViolationEvidence
-from faultforge.sandbox import ContainerFacts, ContainmentFacts, SandboxResult, StateVerification, TargetSpec
+from faultforge.sandbox import ContainerFacts, ContainmentFacts, MountFact, SandboxResult, StateVerification, TargetSpec
 from faultforge.web import viewmodel
 from faultforge.web.app import SECURITY_HEADERS, create_app
 from faultforge.web.budget import BudgetLedger, LedgerBudget
@@ -42,6 +43,8 @@ KEY = "sk-test-not-a-real-key"
 LOOPBACK = ("127.0.0.1", 50000)
 TARGETS = load_targets()
 TICKET_INVARIANT = "No more tickets confirmed than were in stock"
+STATIC = ROOT / "src" / "faultforge" / "web" / "static"
+ALLOWED_URLS = {"https://github.com/Mikro219/fault-forge", "http://www.w3.org/2000/svg"}
 
 
 def healthy_vm(_: Path) -> VmView:
@@ -183,15 +186,83 @@ def test_healthz_and_the_page(harness) -> None:
     page = client.get("/")
     assert page.status_code == 200 and page.headers["content-type"].startswith("text/html")
     assert client.get("/static/app.js").status_code == 200
-    assert client.get("/static/style.css").status_code == 200
+    assert client.get("/static/app.css").status_code == 200
 
 
-def test_the_placeholder_builds_no_html_from_strings() -> None:
-    source = (ROOT / "src/faultforge/web/static/app.js").read_text()
-    for forbidden in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("):
+def test_every_static_asset_is_served(harness) -> None:
+    client = harness().client
+    files = [path for path in STATIC.rglob("*") if path.is_file()]
+    assert {path.name for path in files} >= {"index.html", "app.css", "app.js", "favicon.svg"}
+    for path in files:
+        response = client.get(f"/static/{path.relative_to(STATIC).as_posix()}")
+        assert response.status_code == 200, path
+        assert response.headers["Content-Security-Policy"] == SECURITY_HEADERS["Content-Security-Policy"]
+    page = STATIC.joinpath("index.html").read_text()
+    for reference in re.findall(r'(?:src|href)="(/static/[^"]+)"', page):
+        assert client.get(reference).status_code == 200, reference
+    for font in re.findall(r'url\("([^"]+)"\)', STATIC.joinpath("app.css").read_text()):
+        assert client.get(f"/static/{font}").status_code == 200, font
+
+
+def test_fonts_are_self_hosted_with_their_licences() -> None:
+    fonts = STATIC / "fonts"
+    assert {path.suffix for path in fonts.iterdir()} == {".woff2", ".txt"}
+    assert len(list(fonts.glob("*.woff2"))) == 2
+    for name in ("Archivo-OFL.txt", "JetBrainsMono-OFL.txt"):
+        assert "SIL OPEN FONT LICENSE" in fonts.joinpath(name).read_text().upper()
+
+
+def test_static_files_load_nothing_from_elsewhere() -> None:
+    for name in ("index.html", "app.css", "app.js", "favicon.svg"):
+        text = STATIC.joinpath(name).read_text()
+        for url in re.findall(r"https?://[^\s\"'`)]+", text):
+            assert url in ALLOWED_URLS, f"{name}: {url}"
+        assert "googleapis" not in text and "gstatic" not in text
+    # The repo link is a plain link, and nothing else in the page may leave the origin.
+    page = STATIC.joinpath("index.html").read_text()
+    assert "http://" not in page and "https://" not in page
+
+
+def test_index_has_no_inline_script_or_style() -> None:
+    page = STATIC.joinpath("index.html").read_text()
+    assert re.search(r"<script(?![^>]*\bsrc=)", page) is None
+    assert "<style" not in page and "style=" not in page
+    assert re.search(r"\son[a-z]+=", page) is None
+
+
+def test_the_page_builds_markup_through_one_escaping_path() -> None:
+    source = STATIC.joinpath("app.js").read_text()
+    for forbidden in ("outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function", "style=", "onerror"):
         assert forbidden not in source
-    page = (ROOT / "src/faultforge/web/static/index.html").read_text()
-    assert "<script>" not in page and "style=" not in page
+    assert source.count("innerHTML") == 1 and "function mount(id, safe) { document.getElementById(id).innerHTML = part(safe); }" in source
+
+
+def test_no_sample_data_or_state_switcher_ships() -> None:
+    for name in ("index.html", "app.css", "app.js"):
+        text = STATIC.joinpath(name).read_text()
+        for forbidden in ("SAMPLE_DATA", "switcher", "sw-btn", "ff-0142", "glm-5", "sbx-", "simulat", "/admin/reset"):
+            assert forbidden not in text, f"{name}: {forbidden}"
+
+
+def page_states() -> dict:
+    spec = importlib.util.spec_from_file_location("web_states_fixture", ROOT / "tests" / "fixtures" / "web_states.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.states()
+
+
+def test_the_page_fixtures_match_the_real_view_models() -> None:
+    """So that the browser checks exercise shapes the API can really return."""
+    states = page_states()
+    assert len(states) >= 15
+    for name, state in states.items():
+        viewmodel.StatusView.model_validate(state["status"])
+        for item in state["replays"]:
+            viewmodel.ReplaySummaryView.model_validate(item)
+        if state.get("run"):
+            viewmodel.RunStateView.model_validate(state["run"])
+        if state.get("replay"):
+            viewmodel.ReplayView.model_validate(state["replay"])
 
 
 def test_run_goes_from_accepted_to_a_final_view(harness) -> None:
@@ -620,6 +691,42 @@ def test_hostile_view_separates_self_reports_from_host_facts(tmp_path: Path) -> 
     assert host.target.network == "none" and host.runner.network == "target_namespace_only"
     assert host.target.read_only_rootfs and host.target.all_caps_dropped and host.target.limits_applied
     assert host.target.oom_killed is True and host.target.non_root is True
+
+
+def test_the_view_has_the_workload_fingerprint_and_only_a_well_formed_one(tmp_path: Path) -> None:
+    result = poisoned_result(project_dir=tmp_path)
+    good = "sha256:" + "e" * 64
+    result.report.config.config_hash = good
+    assert viewmodel.build_run_view(result, TARGETS["ticket-api"], tmp_path).config_hash == good
+    result.report.config.__dict__["config_hash"] = EVIL
+    assert viewmodel.build_run_view(result, TARGETS["ticket-api"], tmp_path).config_hash is None
+    assert viewmodel.internal_failure_view(TARGETS["ticket-api"], "internal_error").config_hash is None
+
+
+def test_the_host_counts_key_like_names_without_showing_them(tmp_path: Path) -> None:
+    result = poisoned_result(project_dir=tmp_path)
+    assert viewmodel.build_run_view(result, TARGETS["hostile-build"], tmp_path).host_verified.target.secret_env_names == 0
+    facts = container_facts().model_copy(update={
+        "env_names": ["PATH", "VULTR_INFERENCE_API_KEY"], "mounts": [MountFact(destination="/var/run/docker.sock", read_only=False)],
+    })
+    result = result.model_copy(update={"containment": result.containment.model_copy(update={"target": facts})})
+    view = viewmodel.build_run_view(result, TARGETS["hostile-build"], tmp_path)
+    assert view.host_verified.target.secret_env_names == 1
+    assert view.host_verified.target.docker_socket_mounted is True
+    assert "VULTR_INFERENCE_API_KEY" not in view.model_dump_json()
+
+
+def test_a_replay_stored_before_the_new_fields_still_loads(tmp_path: Path) -> None:
+    view = viewmodel.build_run_view(poisoned_result(project_dir=tmp_path), TARGETS["hostile-build"], tmp_path)
+    stored = ReplayView(id="r_" + "2" * 16, recorded_at="2026-01-01T00:00:00+00:00", target="hostile-build", result=view).model_dump(mode="json")
+    del stored["result"]["config_hash"]
+    del stored["result"]["host_verified"]["target"]["secret_env_names"]
+    del stored["result"]["host_verified"]["target"]["docker_socket_mounted"]
+    store = ReplayStore(tmp_path / "replays", 5)
+    (tmp_path / "replays").mkdir()
+    (tmp_path / "replays" / f"{stored['id']}.json").write_text(json.dumps(stored))
+    store.load()
+    assert store.get(stored["id"]).result.config_hash is None
 
 
 def test_ticket_view_has_no_probes(tmp_path: Path) -> None:

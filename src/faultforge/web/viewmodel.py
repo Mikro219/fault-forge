@@ -52,6 +52,8 @@ SAFE_VIOLATION_ID = re.compile(r"[VH]\d{1,6}")
 SAFE_CODE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")
 SAFE_BUILD_ID = re.compile(r"[a-f0-9]{8,64}")
 SAFE_SHA256 = re.compile(r"[a-f0-9]{64}")
+SAFE_CONFIG_HASH = re.compile(r"sha256:[a-f0-9]{64}")
+SECRET_ENV_NAME = re.compile(r"key|token|secret|passw|credential", re.IGNORECASE)
 SAFE_RUN_ID = re.compile(r"run_\d{8}_\d{6}_[a-f0-9]{4}")
 SAFE_MODEL = re.compile(r"[a-z0-9][a-z0-9.\-]{0,63}")
 SAFE_STATUS_CODE = re.compile(r"\d{1,3}")
@@ -311,6 +313,9 @@ class ContainerView(View):
     oom_killed: bool
     running_when_inspected: bool
     exit_code: int | None
+    # Defaulted so that replays stored before these fields still load.
+    secret_env_names: int | None = Field(default=None, description="How many environment names look like keys. Names and values aren't shown.")
+    docker_socket_mounted: bool | None = None
 
 
 class HostVerifiedView(View):
@@ -350,6 +355,7 @@ class RunView(View):
     fix_verified: bool
     state_verification: StateVerificationView
     deployed_code_sha256: str | None
+    config_hash: str | None = Field(default=None, description="The workload fingerprint. A retest must match its baseline's.")
     target_build_id: str | None = Field(description="Reported by the target, and shown only if it looks like a hash")
     requests_sent: int | None
     probes: list[ProbeView] | None
@@ -720,6 +726,8 @@ def _container_view(facts: ContainerFacts | None, role: Literal["target", "runne
         oom_killed=facts.oom_killed,
         running_when_inspected=facts.running_when_inspected,
         exit_code=_int(facts.exit_code),
+        secret_env_names=sum(1 for name in facts.env_names if SECRET_ENV_NAME.search(name)),
+        docker_socket_mounted=any("docker.sock" in mount.destination for mount in facts.mounts),
     )
 
 
@@ -777,6 +785,7 @@ def build_run_view(result: SandboxResult, target: FixedTarget, project_dir: Path
         fix_verified=bool(report and report.comparison and report.comparison.fix_verified),
         state_verification=_state_verification_view(result.containment),
         deployed_code_sha256=_matching(result.deployed_code_sha256, SAFE_SHA256),
+        config_hash=_matching(report.config.config_hash, SAFE_CONFIG_HASH) if report else None,
         target_build_id=_matching(report.target.build.build_id, SAFE_BUILD_ID) if report else None,
         requests_sent=report.budget.requests_sent if report else None,
         probes=probes,
