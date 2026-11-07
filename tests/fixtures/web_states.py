@@ -270,6 +270,10 @@ def states() -> dict:
         "start": {**base},
         "no-replays": {"status": status(replays_available=0), "replays": []},
         "busy": {**base, "status": status(busy=True, queue_length=2)},
+        "fix-limit": {
+            **base, "status": status(agent_enabled=False, agent_disabled_reason="fix_ip_limit"),
+            "run": run_state(result=run_view()),
+        },
         "queue-full": {**base, "status": status(busy=True, queue_length=3)},
         "cooldown": {**base, "post": {"code": 429, "retry_after": 25, "body": {"reason": "cooldown", "message": "Please wait before starting another run."}}},
         "budget": {**base, "status": budget},

@@ -120,9 +120,9 @@ body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset
 pre{margin:0;font:12.5px/1.6 var(--f-mono);white-space:pre-wrap;word-break:break-word}
 
 /* ---------- start ---------- */
-.hero{padding:28px 26px;display:grid;gap:14px}
-.hero h1{font:800 clamp(26px,4vw,40px)/1.08 var(--f-ui);font-stretch:112%;letter-spacing:-.01em;max-width:24ch}
-.hero .lead{font-size:16px;color:var(--fg-2);max-width:70ch}
+.hero{padding:22px 26px;display:grid;gap:12px}
+.hero h1{font:800 clamp(26px,4vw,40px)/1.08 var(--f-ui);font-stretch:112%;letter-spacing:-.01em;max-width:32ch}
+.hero .lead{font-size:15px;color:var(--fg-2);max-width:96ch}
 .targets{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;border:0;padding:0;margin:0;min-width:0}
 .target{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 12px;text-align:left;background:var(--panel-2);border:1px solid var(--line);padding:16px;align-items:start;cursor:pointer}
 .target:hover{border-color:var(--line-2)}
@@ -228,11 +228,11 @@ details.evidence>.stack{margin-top:16px}
 .legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12.5px;color:var(--fg-2);align-items:center}
 .lg{display:inline-flex;align-items:center;gap:6px}
 .sw{width:14px;height:8px;display:inline-block}
-.sw.acc{background:var(--accent)} .sw.rej{background:var(--info);opacity:.6} .sw.unx{background:var(--fail)}
+.sw.acc{background:var(--pass)} .sw.over{background:var(--fail)} .sw.rej{background:var(--info);opacity:.6} .sw.unx{background:var(--accent)}
 .sw.win{background:var(--accent-soft);border-left:2px dashed var(--accent)}
 svg .t-grid{stroke:var(--line);stroke-width:1}
 svg .t-lbl{fill:var(--muted);font:10.5px var(--f-mono)}
-svg .t-acc{fill:var(--accent)} svg .t-rej{fill:var(--info);fill-opacity:.55} svg .t-unx{fill:var(--fail)}
+svg .t-acc{fill:var(--pass)} svg .t-over{fill:var(--fail)} svg .t-rej{fill:var(--info);fill-opacity:.55} svg .t-unx{fill:var(--accent)}
 svg .t-win{fill:var(--accent-soft)}
 svg .t-commit{stroke:var(--accent);stroke-width:1.5;stroke-dasharray:4 3}
 svg .t-commit-l{fill:var(--accent);font:11.5px var(--f-mono)}
@@ -408,3 +408,41 @@ details.attempt:not([open])>summary{border-bottom:0}
 .disclosures{margin:0;padding-left:18px;display:grid;gap:4px;font-size:12.5px;color:var(--muted);max-width:90ch}
 .top-right .status{white-space:nowrap}
 .target .meta .chip{white-space:normal}
+
+/* ---------- the start page's proof ---------- */
+.proofs{display:grid;gap:10px}
+.proof-title{display:flex;gap:6px 12px;flex-wrap:wrap;align-items:baseline}
+.proof-grid{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:12px}
+.proof{display:grid;gap:12px;align-content:space-between;background:var(--sunk);border:1px solid var(--line);padding:14px 16px;min-width:0}
+.proof-h,.proof-f{display:flex;align-items:center;gap:8px 10px;flex-wrap:wrap}
+.proof-h .sp,.proof-f .sp{margin-left:auto}
+.proof-flow{display:flex;align-items:center;gap:14px}
+.proof-step{display:grid;gap:5px;justify-items:start;flex:1;min-width:0}
+.proof-big{font:800 clamp(19px,2.3vw,25px)/1.12 var(--f-ui)}
+.proof-big.bad{color:var(--fail)}
+.proof-arrow{color:var(--muted);flex:none;display:flex}
+
+/* ---------- trials, side by side ---------- */
+.ticks{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:var(--line);border-top:1px solid var(--line)}
+.tick{display:grid;gap:3px;padding:12px 16px;background:var(--panel)}
+.tick b{font:700 18px var(--f-ui)}
+.tick-h{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--fg-2)}
+.tick.bad .tick-h svg,.tick.bad b{color:var(--fail)}
+.tick.ok .tick-h svg{color:var(--pass)}
+.tick.serial{background:var(--panel-2)}
+
+/* ---------- what to do next ---------- */
+.next{display:flex;gap:14px 20px;align-items:center;flex-wrap:wrap;justify-content:space-between;padding:18px 20px;border-color:var(--accent)}
+.next-b{display:grid;gap:3px;flex:1 1 320px}
+.next-b b{font:700 17px var(--f-ui)}
+.tl-next{margin-top:10px}
+
+.top-facts{color:var(--muted);font-size:12.5px;white-space:nowrap}
+@media (max-width:900px){
+  .top-facts{display:none}
+  .proof-grid{grid-template-columns:minmax(0,1fr)}
+}
+@media (max-width:520px){
+  .proof-flow{flex-direction:column;align-items:stretch}
+  .proof-arrow{transform:rotate(90deg);align-self:flex-start}
+}

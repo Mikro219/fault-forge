@@ -88,6 +88,11 @@ function when(iso) {
   return d.toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" });
 }
 function usd(v) { return "$" + num(v).toFixed(4); }
+function elapsed(fromIso) {
+  const ms = Date.now() - new Date(fromIso).getTime();
+  return Number.isFinite(ms) && ms >= 0 ? `${Math.round(ms / 1000)} s` : "";
+}
+const USUAL_RUN = { "ticket-api": "This usually takes a few seconds.", "hostile-build": "This usually takes about 30 s." };
 function seconds(fromIso, toIso) {
   const ms = new Date(toIso).getTime() - new Date(fromIso).getTime();
   if (!Number.isFinite(ms) || ms < 0) return "";
@@ -103,7 +108,7 @@ const targetName = id => (S.status && list(S.status.targets).find(t => t.id === 
 
 /* ---------- state ---------- */
 const S = {
-  status: null, statusFailed: false, replays: [], target: null,
+  status: null, statusFailed: false, replays: [], proofs: { ticket: null, hostile: null }, target: null,
   view: "start", current: null, replayMode: false,
   notice: null, cooldownUntil: 0, fixNotice: null, pollNote: null,
 };
@@ -129,6 +134,11 @@ function budgetNotice(status) {
   const title = reason === "total_usd_cap" || reason === "ledger_unavailable" ? "The live agent is off; replays still work" : "The live agent is off for today; replays still work";
   return h`<div class="notice info" role="status" id="budget-notice"><b>${title}</b><span class="fg2">${AGENT_OFF[reason] || "The AI budget is used up."} Spent today: ${usd(b.daily_usd_spent)} of ${usd(b.daily_usd_cap)}. Load tests still run, and the recorded runs below show the full flow.</span></div>`;
 }
+function limitNotice(status) {
+  const reason = String(status.agent_disabled_reason);
+  if (status.agent_enabled || !reason.startsWith("fix_")) return "";
+  return h`<div class="notice info" role="status" id="limit-notice"><b>${AGENT_OFF[reason] || "The limit on fixes was reached."}</b><span class="fg2">Load tests still run. The fix agent comes back when the limit resets, and the recorded runs show the full flow.</span></div>`;
+}
 function startNotices(status) {
   const out = [];
   if (S.notice) out.push(h`<div class="notice warn" role="alert" id="refusal"><b>${I.clock} ${S.cooldownUntil > Date.now() ? `Try again in ${Math.ceil((S.cooldownUntil - Date.now()) / 1000)} s` : S.notice.title}</b><span class="fg2">${S.notice.message}</span></div>`);
@@ -136,7 +146,7 @@ function startNotices(status) {
     const full = status.queue_length >= status.queue_limit;
     out.push(h`<div class="notice warn" role="status" id="busy-notice"><b>${I.clock} ${full ? "The queue is full" : "Another run is in progress"}</b><span class="fg2">${full ? "Try again soon, or watch a replay." : "If you start a run, it waits for the sandbox to be free. This page updates on its own."}</span><span><span class="pill warn">Queue ${status.queue_length} of ${status.queue_limit}</span></span></div>`);
   }
-  if (status) out.push(budgetNotice(status));
+  if (status) out.push(budgetNotice(status), limitNotice(status));
   return out;
 }
 function replaySummary(r) {
@@ -144,6 +154,41 @@ function replaySummary(r) {
   if (r.has_fix) return "The agent tried a fix, and it wasn't verified";
   if (r.target === "hostile-build") return "Containment test";
   return { FAIL: "Violation proven", PASS: "Invariants held", INCONCLUSIVE: "Not enough evidence. This isn't a pass." }[r.verdict] || "No verdict";
+}
+/* The start page's proof: real recorded runs, drawn only if they hold up. There's no placeholder. */
+function ticketProof(r) {
+  if (!r || !r.result || !r.fix) return "";
+  const chosen = list(r.fix.attempts).find(a => a.passed);
+  if (!chosen || !gateFor(r.result, r.fix, chosen).verified) return "";
+  const before = r.result.contrast, after = chosen.candidate.contrast;
+  if (!before || !after || before.stock_before == null) return "";
+  return h`<article class="proof" id="proof-ticket">
+    <div class="proof-h"><span class="pill info">Replay</span><b>${targetName(r.target)}</b><span class="sp muted small mono">${when(r.recorded_at)}</span></div>
+    <div class="proof-flow">
+      <div class="proof-step"><span class="pill fail">${I.x} FAIL</span><span class="proof-big bad">${before.accepted} accepted</span><span class="fg2 small">for ${plural(num(before.stock_before), "ticket")}${num(before.rejected) || num(before.unexpected) || num(before.transport_error) ? "" : ", and every response said success"}</span></div>
+      <span class="proof-arrow">${I.arrow}</span>
+      <div class="proof-step"><span class="pill pass">${I.check} Fix verified</span><span class="proof-big">${after.accepted} accepted</span><span class="fg2 small">${after.rejected} rejected, under the same workload</span></div>
+    </div>
+    <div class="proof-f"><span class="muted small">${chosen.model || r.fix.model} wrote the fix on attempt ${chosen.attempt}, for ${usd(chosen.cost_usd)}.</span><button class="btn sm sp" data-act="replay" data-id="${r.id}">${I.play} Watch this run</button></div>
+  </article>`;
+}
+function hostileProof(r) {
+  if (!r || !r.result || !list(r.result.probes).length) return "";
+  const c = containment(r.result);
+  if (!c.contained || r.result.host_verified.containers_left !== 0) return "";
+  return h`<article class="proof" id="proof-hostile">
+    <div class="proof-h"><span class="pill info">Replay</span><b>${targetName(r.target)}</b><span class="sp muted small mono">${when(r.recorded_at)}</span></div>
+    <div class="proof-flow">
+      <div class="proof-step"><span class="pill incon">INCONCLUSIVE, never a pass</span><span class="proof-big">${c.attacks.length} attacks, none got out</span><span class="fg2 small">${c.stopped} blocked, absent or killed. ${c.limited} limited, not blocked. 0 containers left.</span></div>
+    </div>
+    <div class="proof-f"><span class="muted small">Real code attacking its own sandbox.</span><button class="btn sm sp" data-act="replay" data-id="${r.id}">${I.play} Watch this run</button></div>
+  </article>`;
+}
+function renderProofs() {
+  const ticket = ticketProof(S.proofs.ticket), hostile = hostileProof(S.proofs.hostile);
+  if (!ticket && !hostile) return "";
+  return h`<section class="proofs" aria-label="Recorded runs"><div class="proof-title"><span class="eyebrow">What a real run found</span><span class="muted small">Recorded on this server. Nothing here is live until you press Run.</span></div>
+    <div class="proof-grid">${ticket}${hostile}</div></section>`;
 }
 function renderStart() {
   const status = S.status;
@@ -159,6 +204,7 @@ function renderStart() {
   <section class="panel hero fade-in">
     <h1>${SITE.headline}</h1>
     <p class="lead">${SITE.lead}</p>
+    ${renderProofs()}
     ${step("01", "Choose a target")}
     ${status ? h`<fieldset class="targets"><legend class="sr">Target</legend>
       ${targets.map(t => h`<label class="target"><input type="radio" name="target" id="target-${t.id}" value="${t.id}" data-act="pick" ${t.id === chosen ? raw("checked") : ""}>
@@ -189,7 +235,7 @@ function stagesFor(st) {
   const at = name => (list(st.events).find(e => e.name === name) || {}).at;
   const queued = at("queued"), started = at("sandbox_started"), finished = at("finished") || at("failed") || at("shutdown");
   const failedRun = st.stage === "failed" || (st.result && st.result.status === "failed");
-  const stage = (label, state, time, detail) => ({ label, state, time, detail });
+  const stage = (label, state, time, detail, timer) => ({ label, state, time, detail, timer });
   const stages = [];
   if (started) stages.push(stage("Queued", "done", seconds(queued, started), "Waited for the sandbox to be free."));
   else if (failedRun) stages.push(stage("Queued", "failed", "", (st.result && st.result.verdict_summary) || "The run ended before it started."));
@@ -197,7 +243,7 @@ function stagesFor(st) {
   if (!started) stages.push(stage("Load test in a new sandbox", "pending", "", ""));
   else if (failedRun) stages.push(stage("Load test in a new sandbox", "failed", seconds(started, finished), (st.result && st.result.verdict_summary) || "The run failed."));
   else if (finished) stages.push(stage("Load test in a new sandbox", "done", seconds(started, finished), "Finished."));
-  else stages.push(stage("Load test in a new sandbox", "active", "", "The server reports no progress inside this stage, so none is drawn here."));
+  else stages.push(stage("Load test in a new sandbox", "active", "", `${USUAL_RUN[st.target] || ""} The server reports no progress inside this stage, so none is drawn here.`, elapsed(started)));
   stages.push(stage("Verdict", failedRun ? "pending" : finished ? "done" : "pending", "", ""));
   return stages;
 }
@@ -206,7 +252,7 @@ function renderStages(stages) {
     const st = s.state;
     const ic = st === "done" ? h`<span class="pass-ic">${I.check}</span>` : st === "active" ? raw('<span class="spin" aria-hidden="true"></span>') : st === "failed" ? h`<span class="fail-ic">${I.x}</span>` : raw('<span class="hollow" aria-hidden="true"></span>');
     const word = { done: "done", active: "in progress", failed: "failed", pending: "not started" }[st];
-    return h`<div class="stage ${st}"><span class="ic">${ic}</span><span class="nm">${s.label} <span class="sr">(${word})</span></span><span class="tm">${st === "active" ? "now" : st === "failed" && !s.time ? "stopped" : s.time}</span>${s.detail ? h`<span class="dt">${s.detail}</span>` : ""}</div>`;
+    return h`<div class="stage ${st}"><span class="ic">${ic}</span><span class="nm">${s.label} <span class="sr">(${word})</span></span><span class="tm" aria-hidden="${st === "active" && s.timer ? "true" : "false"}">${st === "active" ? s.timer || "now" : st === "failed" && !s.time ? "stopped" : s.time}</span>${s.detail ? h`<span class="dt">${s.detail}</span>` : ""}</div>`;
   })}</div>`;
 }
 function renderRunning(st) {
@@ -227,33 +273,76 @@ function renderFailedRun(st) {
 }
 
 /* ---------- evidence ---------- */
-function timeline(tl, performance) {
+const pointEnd = v => num(v.offset_ms) + num(v.duration_ms);
+function overlapWindow(rows) {
+  // The first moment the most requests were in flight, from the requests' own times.
+  const events = [];
+  rows.forEach(r => { events.push([num(r.offset_ms), 1], [pointEnd(r), -1]); });
+  events.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  let current = 0, peak = 0, from = 0, to = 0;
+  events.forEach(([at, change], i) => {
+    current += change;
+    if (current > peak) { peak = current; from = at; to = i + 1 < events.length ? events[i + 1][0] : at; }
+  });
+  return { peak, from, to };
+}
+function stockFor(result, tl) {
+  const c = result.contrast;
+  return c && c.trial === tl.trial && c.stock_before != null ? num(c.stock_before) : null;
+}
+function timelineChart(tl, stock, sharedEnd) {
   const rows = list(tl.points);
   if (!rows.length) return "";
-  const end = v => num(v.offset_ms) + num(v.duration_ms);
-  const maxEnd = Math.max(1, ...rows.map(end));
+  const maxEnd = Math.max(1, sharedEnd || 0, ...rows.map(pointEnd));
   const stepMs = [5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000, 10000, 20000, 50000].find(s => maxEnd / s <= 10) || 100000;
   const xMax = Math.ceil(maxEnd / stepMs) * stepMs;
   const dense = rows.length > 40;
   const W = 1000, L = dense ? 16 : 60, R = 16, rh = dense ? 4 : 11, gap = dense ? 1 : 4, top = 14, H = top + rows.length * (rh + gap) + 28;
   const x = v => L + (num(v) / xMax) * (W - L - R);
+  // Which accepted request "got" the stock is only an order of finishing, and the legend says so.
+  const accepted = rows.filter(r => r.outcome === "accepted").sort((a, b) => pointEnd(a) - pointEnd(b));
+  const beyond = new Set(stock == null ? [] : accepted.slice(stock));
+  const overlap = tl.truncated ? null : overlapWindow(rows);
   const parts = [];
+  if (overlap && overlap.peak >= 2 && overlap.to > overlap.from) parts.push(h`<rect class="t-win" x="${f1(x(overlap.from))}" y="${top - 6}" width="${f1(Math.max(2, x(overlap.to) - x(overlap.from)))}" height="${H - 18 - top}"/>`);
   for (let v = 0; v <= xMax; v += stepMs) parts.push(h`<line class="t-grid" x1="${f1(x(v))}" x2="${f1(x(v))}" y1="${top - 6}" y2="${H - 24}"/><text class="t-lbl" x="${f1(x(v))}" y="${H - 8}" text-anchor="middle">${v}${v === 0 ? " ms" : ""}</text>`);
   rows.forEach((r, i) => {
     const y = top + i * (rh + gap);
-    const cls = r.outcome === "accepted" ? "t-acc" : r.outcome === "rejected" ? "t-rej" : "t-unx";
+    const cls = beyond.has(r) ? "t-over" : r.outcome === "accepted" ? "t-acc" : r.outcome === "rejected" ? "t-rej" : "t-unx";
     if (!dense) parts.push(h`<text class="t-lbl" x="${L - 8}" y="${y + rh - 2}" text-anchor="end">#${String(i + 1).padStart(2, "0")}</text>`);
-    parts.push(h`<rect class="${cls}" x="${f1(x(r.offset_ms))}" y="${y}" width="${f1(Math.max(2, x(end(r)) - x(r.offset_ms)))}" height="${rh}"><title>request ${i + 1} · ${r.outcome} · ${r.duration_ms} ms</title></rect>`);
+    parts.push(h`<rect class="${cls}" x="${f1(x(r.offset_ms))}" y="${y}" width="${f1(Math.max(2, x(pointEnd(r)) - x(r.offset_ms)))}" height="${rh}"><title>request ${i + 1} · ${beyond.has(r) ? "accepted with no ticket behind it" : r.outcome} · ${r.duration_ms} ms</title></rect>`);
   });
-  const count = fn => rows.filter(fn).length;
-  const ok = count(r => r.outcome === "accepted"), rej = count(r => r.outcome === "rejected"), other = rows.length - ok - rej;
+  const ok = accepted.length, over = beyond.size, rej = rows.filter(r => r.outcome === "rejected").length, other = rows.length - ok - rej;
+  return h`<div class="legend">
+      <span class="lg"><span class="sw acc"></span>${stock == null ? `Accepted (${ok})` : `Accepted, within stock (${ok - over})`}</span>
+      ${over ? h`<span class="lg"><span class="sw over"></span>Accepted, no ticket behind it (${over})</span>` : ""}
+      <span class="lg"><span class="sw rej"></span>Rejected, expected (${rej})</span>
+      ${other ? h`<span class="lg"><span class="sw unx"></span>Unexpected or transport error (${other})</span>` : ""}
+      ${overlap && overlap.peak >= 2 ? h`<span class="lg"><span class="sw win"></span>${overlap.peak} in flight at once</span>` : ""}
+    </div>
+    <div class="tl-wrap" tabindex="0" aria-label="Request timeline, scrollable"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Request timeline: ${ok} accepted, ${rej} rejected, ${other} other">${parts}</svg></div>
+    ${over ? h`<p class="muted small">Bars are marked in the order requests finished. Which request "got" the ticket doesn't matter: the proof is the count.</p>` : ""}
+    ${tl.truncated ? h`<p class="muted small">An evenly spaced sample of ${rows.length} of ${tl.total_requests} requests.</p>` : ""}`;
+}
+function latencyText(performance) {
   const lat = performance && performance.latency_ms;
-  const latText = lat && lat.p50 != null && lat.p95 != null ? `p50 ${Math.round(num(lat.p50))} ms · p95 ${Math.round(num(lat.p95))} ms · ` : "";
-  return h`<section class="panel" id="timeline"><div class="ph"><h2>Request timeline · trial ${tl.trial}</h2><span class="sp lat">${latText}latency doesn't affect the verdict</span></div>
+  return `${lat && lat.p50 != null && lat.p95 != null ? `p50 ${Math.round(num(lat.p50))} ms · p95 ${Math.round(num(lat.p95))} ms · ` : ""}latency doesn't affect the verdict`;
+}
+function timeline(result) {
+  const tl = result.timeline;
+  if (!list(tl.points).length) return "";
+  return h`<section class="panel" id="timeline"><div class="ph"><h2>Request timeline · trial ${tl.trial}</h2><span class="sp lat">${latencyText(result.performance)}</span></div>
+    <div class="pb stack">${timelineChart(tl, stockFor(result, tl))}</div></section>`;
+}
+function timelineBeforeAfter(baseline, candidate) {
+  const before = baseline.timeline, after = candidate.timeline;
+  if (!before || !list(before.points).length) return after ? timeline(candidate) : "";
+  if (!after || !list(after.points).length) return timeline(baseline);
+  const sharedEnd = Math.max(...list(before.points).map(pointEnd), ...list(after.points).map(pointEnd));
+  return h`<section class="panel" id="timeline"><div class="ph"><h2>Request timeline · before and after</h2><span class="sp lat">same time scale · latency doesn't affect the verdict</span></div>
     <div class="pb stack">
-      <div class="legend"><span class="lg"><span class="sw acc"></span>Accepted (${ok})</span><span class="lg"><span class="sw rej"></span>Rejected, expected (${rej})</span><span class="lg"><span class="sw unx"></span>Unexpected or transport error (${other})</span></div>
-      <div class="tl-wrap" tabindex="0" aria-label="Request timeline, scrollable"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Request timeline: ${ok} accepted, ${rej} rejected, ${other} other">${parts}</svg></div>
-      ${tl.truncated ? h`<p class="muted small">An evenly spaced sample of ${rows.length} of ${tl.total_requests} requests.</p>` : ""}
+      <div class="eyebrow">Before the fix · trial ${before.trial}</div>${timelineChart(before, stockFor(baseline, before), sharedEnd)}
+      <div class="eyebrow tl-next">After the fix · trial ${after.trial}</div>${timelineChart(after, stockFor(candidate, after), sharedEnd)}
     </div></section>`;
 }
 
@@ -344,7 +433,18 @@ function failSub(result) {
   if (!c || num(c.rejected) || num(c.unexpected) || num(c.transport_error)) return "";
   return `Every request got a success response${c.stock_after != null && num(c.stock_after) >= 0 ? `, and the stock counter reads ${c.stock_after}` : ""}, so the app looks healthy. It wasn't.`;
 }
-const evidenceStack = result => h`${renderLedger(result)}${renderProvenSuspected(result)}${result.timeline ? timeline(result.timeline, result.performance) : ""}${renderDisclosures(result)}`;
+function renderTrialStrip(result) {
+  const finished = list(result.trials).filter(t => t.status === "completed");
+  const concurrent = finished.filter(t => t.kind === "concurrent"), serial = finished.find(t => t.kind === "serial_control");
+  if (!concurrent.length) return "";
+  const broke = t => list(t.invariants).some(item => item.result === "fail");
+  return h`<section class="panel" id="trial-strip"><div class="ph"><h2>${serial ? "Same requests, different timing" : "Trials"}</h2></div>
+    <div class="ticks">
+      ${concurrent.map(t => h`<div class="tick ${broke(t) ? "bad" : "ok"}"><span class="tick-h">${broke(t) ? I.x : I.check}<span class="mono">Trial ${t.trial}</span></span><b>${t.accepted} accepted</b><span class="muted small">${t.peak_in_flight} in flight at once</span></div>`)}
+      ${serial ? h`<div class="tick serial ${broke(serial) ? "bad" : "ok"}"><span class="tick-h">${broke(serial) ? I.x : I.check}<span class="mono">One at a time</span></span><b>${serial.accepted} accepted</b><span class="muted small">${serial.rejected} rejected</span></div>` : ""}
+    </div></section>`;
+}
+const evidenceStack = result => h`${renderTrialStrip(result)}${renderLedger(result)}${renderProvenSuspected(result)}${result.timeline ? timeline(result) : ""}${renderDisclosures(result)}`;
 function renderFailFull(result) {
   return h`${verdictBlock("FAIL", trialsLine(result), failHeadline(result), failSub(result))}${evidenceStack(result)}`;
 }
@@ -421,7 +521,7 @@ function fixCta(st) {
   }
   const reason = status && !status.agent_enabled
     ? (AGENT_OFF[status.agent_disabled_reason] || "The fix agent is off.")
-    : "This run can't be fixed any more: its evidence is no longer kept.";
+    : "This run can't be fixed right now. Start a new run to try again.";
   return h`<section class="panel cta" id="fix-cta"><button class="runbtn" disabled>Let the agent fix it</button><span class="fg2">${reason} Replays still work.</span></section>`;
 }
 function renderFailState(st) {
@@ -432,7 +532,7 @@ function workingCard(fix, st) {
   const started = list(st.events).find(e => e.name === "fix_started");
   const queued = fix.status === "queued";
   return h`<section class="attempt fade-in" id="agent-working" aria-live="polite"><div class="attempt-h"><b>${queued ? "Waiting for the sandbox" : `Attempt ${number} of ${fix.max_attempts}`}</b><span class="chip">${fix.model}</span><span class="pill info">${queued ? "Queued" : "In progress"}</span>${started && !queued ? h`<span class="sp muted small mono">started ${when(started.at)}</span>` : ""}</div>
-    <div class="wait"><p>${queued ? "The fix starts when the sandbox is free." : "Writing a fix from the failing evidence, then re-testing it in a new sandbox."}</p><div class="breath" aria-hidden="true"></div><p class="muted small">Nothing runs until the change is written and checked against the code rules.</p></div></section>`;
+    <div class="wait"><p>${queued ? "The fix starts when the sandbox is free." : "Writing a fix from the failing evidence, then re-testing it in a new sandbox."}</p><div class="breath" aria-hidden="true"></div><p class="muted small">${started && !queued ? h`<span class="mono fg2" aria-hidden="true">${elapsed(started.at)} so far · </span>This usually takes 10 to 25 s. ` : ""}Nothing runs until the change is written and checked against the code rules.</p></div></section>`;
 }
 function renderFixState(st) {
   const fix = st.fix;
@@ -445,10 +545,12 @@ function renderFixState(st) {
   const passed = chosen && chosen.candidate && chosen.candidate.verdict === "PASS";
   const cards = h`${earlier.map(a => attemptCard(a, fix, { collapsed: true, more: true }))}${chosen ? attemptCard(chosen, fix) : ""}`;
   const gate = chosen ? gateFor(st.result, fix, chosen) : null;
-  if (gate && gate.verified) return h`${head}${cards}${renderVerify(st.result, chosen, gate)}${backRow()}`;
+  if (gate && gate.verified) return h`${head}${cards}${renderVerify(st.result, chosen, gate)}${st.replay ? RUN_LIVE(st.target) : nextStep("Now try to break out", "Real attack code runs in a new sandbox of its own. See what it can reach.", "Run the hostile build", "hostile-build")}${backRow()}`;
   return h`${head}${cards}${passed ? renderVerify(st.result, chosen, gate) : ""}${step(passed ? "05" : "04", "Result")}${renderHonest(st.result, fix)}`;
 }
 const backRow = () => h`<div><button class="btn" data-act="home">Start a new run</button></div>`;
+const nextStep = (title, body, label, target) => h`<section class="panel next" id="next-step"><div class="next-b"><span class="eyebrow">Next</span><b>${title}</b><span class="fg2">${body}</span></div><button class="runbtn" data-act="go" data-target="${target}">${I.play} ${label}</button></section>`;
+const RUN_LIVE = target => nextStep("Run this yourself, live", "Everything above was recorded. This starts a new sandbox now, with the same fixed target.", "Run it live", target);
 
 /* ---------- 6 · verification: "Fix verified" appears only when every part of the gate holds ---------- */
 function gateFor(baseline, fix, attempt) {
@@ -503,7 +605,7 @@ function renderVerify(baseline, attempt, gate) {
       return h`<tr><td class="nmcell"><b>${i.name == null ? "Unnamed invariant" : i.name}</b>${i.reason ? h`<div class="obsline">${NOT_VERIFIED_TEXT[i.reason] || i.reason}</div>` : ""}</td><td>${statusPill(b && b.status)}<div class="obsline">${obs(b)}</div></td><td>${statusPill(a && a.status)}<div class="obsline">${obs(a)}</div></td><td class="r">${changeTag(label)}</td></tr>`;
     })}
     </tbody></table></div></section>` : ""}
-  ${verified && c.timeline ? timeline(c.timeline, c.performance) : ""}
+  ${verified ? timelineBeforeAfter(baseline, c) : ""}
   ${renderDisclosures(c)}
   <p class="foot-note">${verified ? `This shows the invariants held for this workload, these ${n} trials and this code. It isn't proof that the race can never happen.` : "The invariants above were checked from responses and the target's own reports. They don't outweigh a failed check."}</p>`;
 }
@@ -579,14 +681,19 @@ function probeVerified(p, host) {
     default: return "Nothing to check.";
   }
 }
-function renderHostileState(st) {
-  const result = st.result, host = result.host_verified || {}, target = host.target;
-  const icon = { blocked: I.shield, absent: I.empty, killed: I.stop, limited: I.gauge, none: I.empty, escaped: I.x };
+function containment(result) {
+  const target = (result.host_verified || {}).target;
   const rows = list(result.probes).map(p => ({ p, res: probeResult(p, target) }));
   const attacks = rows.filter(r => r.p.name !== "guard");
   const count = k => rows.filter(r => r.res.kind === k).length;
   const contained = attacks.length > 0 && rows.length === attacks.length && attacks.every(r => ["blocked", "absent", "killed", "limited"].includes(r.res.kind)) && target && target.network === "none";
   const open = rows.filter(r => r.res.kind === "escaped" || r.res.kind === "none").length;
+  return { rows, attacks, count, contained, open, limited: count("limited"), stopped: count("blocked") + count("absent") + count("killed") };
+}
+function renderHostileState(st) {
+  const result = st.result, host = result.host_verified || {}, target = host.target;
+  const icon = { blocked: I.shield, absent: I.empty, killed: I.stop, limited: I.gauge, none: I.empty, escaped: I.x };
+  const { rows, attacks, count, contained, open } = containment(result);
   const headline = contained ? `The build tried ${attacks.length} ways to escape. None got out.` : rows.length ? `The build tried ${attacks.length} ways to escape. ${open} weren't contained or have no result.` : "The build reported no attempts.";
   const hostFacts = target ? [
     { k: "Network", v: target.network, ok: target.network === "none" },
@@ -614,6 +721,7 @@ function renderHostileState(st) {
     ${vm ? h`<div class="cell"><b class="${vm.healthy ? "ok" : "bad"}">${vm.healthy ? I.check : I.x}<span>${vm.healthy ? "Server healthy" : "Server needs attention"}</span></b><span class="muted small">${st.replay ? "checked now, not at the time of this run" : "from the server's status"}</span></div>` : ""}
     <div class="cell"><b class="${left === 0 ? "ok" : "bad"}">${left === 0 ? I.check : I.x}<span>${left == null ? "Containers left unknown" : plural(num(left), "container") + " left"}</span></b><span class="muted small">counted by the host after the run</span></div></section>
   ${renderDisclosures(result)}
+  ${st.replay ? RUN_LIVE("hostile-build") : nextStep("Now see a real bug get fixed", "Twenty buyers race for one ticket, the app oversells it, and an AI agent writes the fix.", "Run the Ticket API", "ticket-api")}
   ${backRow()}`;
 }
 
@@ -632,7 +740,7 @@ function renderTop() {
   const status = S.status;
   const off = status && !status.agent_enabled, busy = status && status.busy;
   const label = !status ? (S.statusFailed ? "Server unreachable" : "Connecting") : busy ? "Sandbox in use" : off ? (String(status.agent_disabled_reason).startsWith("fix_") ? "Fix limit reached" : "Live agent off") : "Live agent on";
-  return h`<span class="status" id="server-status"><span class="dot ${!status || off ? "off" : busy ? "busy" : ""}" aria-hidden="true"></span>${label}</span>
+  return h`<span class="top-facts">Vultr VM · Serverless Inference · a new sandbox for every run</span><span class="status" id="server-status"><span class="dot ${!status || off ? "off" : busy ? "busy" : ""}" aria-hidden="true"></span>${label}</span>
     <button class="iconbtn" data-act="theme" aria-label="Toggle light and dark theme" title="Toggle theme">${I.sun}</button>`;
 }
 function render() {
@@ -668,7 +776,19 @@ async function refreshStatus() {
 }
 async function refreshReplays() {
   const { ok, body } = await api("/api/replays");
-  if (ok && Array.isArray(body.replays)) { S.replays = body.replays; render(); }
+  if (ok && Array.isArray(body.replays)) { S.replays = body.replays; render(); refreshProofs(); }
+}
+async function refreshProofs() {
+  const latest = {
+    ticket: S.replays.find(r => r.target === "ticket-api" && r.fix_verified && r.has_fix),
+    hostile: S.replays.find(r => r.target === "hostile-build"),
+  };
+  for (const kind of Object.keys(latest)) {
+    const item = latest[kind];
+    if (!item || (S.proofs[kind] && S.proofs[kind].id === item.id)) continue;
+    const { ok, body } = await api(`/api/replays/${encodeURIComponent(item.id)}`);
+    if (ok && body && body.id === item.id && body.target === item.target) { S.proofs[kind] = body; render(); }
+  }
 }
 const terminal = st => ["done", "failed"].includes(st.stage) && !(st.fix && ["queued", "running"].includes(st.fix.status));
 async function follow(id) {
@@ -699,8 +819,8 @@ function goHome(notice) {
   moved();
   refreshStatus(); refreshReplays();
 }
-async function startRun() {
-  const chosen = document.querySelector('input[name="target"]:checked');
+async function startRun(targetId) {
+  const chosen = targetId ? { value: targetId } : document.querySelector('input[name="target"]:checked');
   if (!chosen) return;
   S.target = chosen.value;
   const { ok, status, body, retryAfter } = await api("/api/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target: chosen.value }) });
@@ -743,6 +863,7 @@ document.addEventListener("click", e => {
   const act = el.dataset.act;
   if (act === "home") { e.preventDefault(); goHome(); }
   else if (act === "run") startRun();
+  else if (act === "go") { S.target = el.dataset.target; goHome(); startRun(el.dataset.target); }
   else if (act === "fix") startFix();
   else if (act === "replay") openReplay(el.dataset.id);
   else if (act === "theme") {
