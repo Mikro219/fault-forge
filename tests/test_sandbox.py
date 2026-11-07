@@ -1537,3 +1537,77 @@ def test_hostile_probe_names_cannot_crash_the_manager():
         b'FF_PROBE {"probe": "real", "phase": "started"}\n'
     )
     assert sandbox.unfinished_probes(probes) == ["real"]
+
+
+# Regression scenarios, in real sandboxes
+
+
+WIPES_STOCK = (TICKET_API / "false_fixes" / "wipes_stock" / "app.py").read_bytes()
+
+
+def verified_ticket_spec(app: bytes) -> TargetSpec:
+    return TargetSpec(app_source=app, support_dir=SUPPORT, config_path=TICKET_CONFIG, state_verifier=TICKET_API_STATE_VERIFIER)
+
+
+@docker_test
+def test_the_reference_fix_passes_every_regression_scenario(contained: None, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    for scenario in ("plenty-of-stock", "sold-out"):
+        result = run_sandboxed(verified_ticket_spec(REFERENCE_FIX), tmp_path / scenario, scenario)
+        assert result.status == "completed", result.failure_detail
+        assert result.report.verdict == "PASS", result.report.verdict_reason
+        assert result.containment.state_verification.status == "matched"
+        assert result.containment.containers_left == 0
+        show(capsys, f"regression {scenario}: accepted={result.report.trials[0].client.accepted} wall={result.containment.wall_s} s")
+
+
+@docker_test
+def test_a_fix_that_wipes_stock_passes_the_race_and_is_caught_by_regression(contained: None, tmp_path: Path) -> None:
+    """Proves the regression step finds a bug the main scenario can't see."""
+    buggy = run_sandboxed(ticket_spec(BUGGY), tmp_path / "project", SCENARIO)
+    race = run_sandboxed(
+        verified_ticket_spec(WIPES_STOCK), tmp_path / "project", SCENARIO, RunOptions(compare_to=buggy.report.run_id),
+    )
+    assert race.status == "completed", race.failure_detail
+    assert race.report.verdict == "PASS" and race.report.comparison.fix_verified is True
+    assert race.containment.state_verification.status == "matched"
+
+    plenty = run_sandboxed(verified_ticket_spec(WIPES_STOCK), tmp_path / "plenty", "plenty-of-stock")
+    assert plenty.status == "completed", plenty.failure_detail
+    assert plenty.report.verdict == "FAIL"
+    assert plenty.report.trials[0].client.accepted == 1
+
+
+RESERVE_FIRST = b"""from fastapi.responses import JSONResponse
+
+from ticket_support import db, payments
+from ticket_support.server import ReserveRequest, create_app, request_key
+from fastapi import Request
+
+app = create_app()
+
+
+@app.post("/reserve")
+async def reserve(body: ReserveRequest, request: Request):
+    with db.tx_immediate():
+        claimed = db.claim_stock(body.item_id)
+    if not claimed:
+        return JSONResponse({"error": "sold out"}, status_code=409)
+    auth = await payments.authorize(body.buyer, key=request_key(request))
+    with db.tx_immediate():
+        order_id = db.insert_order(body.item_id, body.buyer, auth.id)
+        payments.attach(auth.id, order_id)
+    return {"order_id": order_id}
+"""
+
+
+@docker_test
+def test_a_correct_fix_that_rejects_quickly_isnt_blocked(contained: None, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """Claiming before authorizing is correct, and its refusals return at once. Fail-closed regression
+    checks mustn't turn too little overlap into a blocked fix."""
+    for scenario in (SCENARIO, "plenty-of-stock", "sold-out"):
+        result = run_sandboxed(verified_ticket_spec(RESERVE_FIRST), tmp_path / scenario, scenario)
+        assert result.status == "completed", result.failure_detail
+        peaks = [trial.peak_in_flight for trial in result.report.trials]
+        show(capsys, f"reserve-first {scenario}: {result.report.verdict} peaks={peaks}")
+        assert result.report.verdict == "PASS", result.report.verdict_reason
+

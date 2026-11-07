@@ -195,6 +195,8 @@ def config_hash(
         },
         "script": k6_runner.script_sha256(scenario.script),
         "k6_version": k6_version,
+        # Left out when unset, so that a scenario without one keeps its fingerprint.
+        **({"scenario_reset": scenario.reset_json} if scenario.reset_json is not None else {}),
     }
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
     return f"sha256:{hashlib.sha256(encoded.encode()).hexdigest()}"
@@ -258,13 +260,14 @@ def _wait_until_idle(hooks: TargetHooks, limits: Limits) -> None:
         pass
 
 
-def _reset_took_effect(project: ProjectConfig, before: Snapshot) -> bool:
+def _reset_took_effect(project: ProjectConfig, scenario: ScenarioConfig, before: Snapshot) -> bool:
     reset = project.target.reset
     if reset is None:
         return True
+    body = reset.json_body if scenario.reset_json is None else scenario.reset_json
     return all(
         before.values.get(key) == value
-        for key, value in reset.json_body.items()
+        for key, value in body.items()
         if type(value) is int
     )
 
@@ -312,7 +315,7 @@ def _run_one_trial(
 
     _wait_until_idle(hooks, limits)
     try:
-        hooks.reset()
+        hooks.reset(scenario.reset_json)
     except HookError:
         return TrialOutcome(_stopped_early(number, kind, planned, "reset_failed", None), None, ())
     try:
@@ -321,7 +324,7 @@ def _run_one_trial(
         return TrialOutcome(_stopped_early(number, kind, planned, "state_snapshot_failed", None), None, ())
     report_module.write_json(trial_dir / "state-before.json", before.raw)
     builds = (before.build,) if before.build else ()
-    if before.in_flight or not _reset_took_effect(project, before):
+    if before.in_flight or not _reset_took_effect(project, scenario, before):
         return TrialOutcome(_stopped_early(number, kind, planned, "reset_failed", before), None, builds)
 
     # Measured after the hooks, which can each use their full timeout. Reserving time for the

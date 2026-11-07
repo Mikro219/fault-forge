@@ -35,6 +35,7 @@ def _check_body(label: str, body: dict | None) -> None:
 def _check_scenario(scenario: ScenarioConfig) -> None:
     safety.validate_path(scenario.request.path)
     _check_body(f"{scenario.id} request body", scenario.request.json_body)
+    _check_body(f"{scenario.id} reset body", scenario.reset_json)
     if scenario.script not in k6_runner.SCRIPTS:
         raise _invalid(f"{scenario.id} uses unknown script {scenario.script!r}")
     capture = scenario.outcomes.capture_field

@@ -9,6 +9,18 @@ if [[ $# -ne 1 || ! "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     exit 2
 fi
 ip="$1"
+
+# This copies the working tree, whatever branch it's on, so only a clean main may go live.
+checkout="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+branch="$(git -C "$checkout" rev-parse --abbrev-ref HEAD)"
+if [[ "$branch" != "main" ]]; then
+    echo "refusing to deploy: this checkout is on '$branch', not main" >&2
+    exit 2
+fi
+if [[ -n "$(git -C "$checkout" status --porcelain --untracked-files=normal)" ]]; then
+    echo "refusing to deploy: this checkout has uncommitted changes" >&2
+    exit 2
+fi
 hostname="${ip//./-}.sslip.io"
 remote="${FF_DEPLOY_USER:-root}@${ip}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

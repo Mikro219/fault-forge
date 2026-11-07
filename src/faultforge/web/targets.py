@@ -23,6 +23,7 @@ class AgentInputs:
     business_rules: bytes
     support_dir: Path
     config_path: Path
+    regression_scenarios: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,7 @@ def load_targets(demo_root: Path = DEMO_ROOT) -> MappingProxyType:
                 business_rules=fix_agent.read_prompt_file(ticket / "BUSINESS_RULES.md"),
                 support_dir=support_dir,
                 config_path=ticket_config,
+                regression_scenarios=fix_agent.regression_scenarios_for(ticket_config, "last-ticket-rush"),
             ),
         ),
         "hostile-build": FixedTarget(

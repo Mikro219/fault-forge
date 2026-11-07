@@ -140,6 +140,13 @@ DIFF = """--- app.py (original)
      return confirm(request)"""
 
 
+def regression_ok() -> list[dict]:
+    return [
+        {"scenario": name, "passed": True, "verdict": "PASS", "state_verification": "matched", "failure_reason": None, "failed_invariants": []}
+        for name in ("plenty-of-stock", "sold-out")
+    ]
+
+
 def attempt(number: int, passed: bool = False, failure: str | None = "candidate_fail", **overrides) -> dict:
     base = {
         "attempt": number, "model": "glm-5.3", "passed": passed, "failure_reason": failure,
@@ -148,6 +155,7 @@ def attempt(number: int, passed: bool = False, failure: str | None = "candidate_
         "state_verification": "matched", "code_changed": True, "diff": DIFF, "diff_untrusted": True, "diff_truncated": False,
         "input_tokens": 5214, "output_tokens": 688, "usage_reported": True, "cost_usd": 0.0060,
         "candidate": candidate() if passed else run_view(deployed_code_sha256=NEW_HASH),
+        "regression": regression_ok() if passed else [],
     }
     return {**base, **overrides}
 
@@ -264,6 +272,13 @@ def states() -> dict:
         "id": "r_" + "1" * 16, "replay": True, "recorded_at": "2026-11-04T20:22:00+00:00", "target": "ticket-api",
         "result": run_view(), "fix": verified,
     }
+    regression_broke = attempt(
+        1, False, "regression_failed", failure_text="The fix passed the main scenario, but broke another one.", gate_failed=["regression_suite"], verdict="PASS", candidate=candidate(),
+        regression=[
+            {"scenario": "plenty-of-stock", "passed": False, "verdict": "FAIL", "state_verification": "matched", "failure_reason": "candidate_fail", "failed_invariants": ["Every buyer gets a ticket while stock lasts"]},
+            {"scenario": "sold-out", "passed": True, "verdict": "PASS", "state_verification": "matched", "failure_reason": None, "failed_invariants": []},
+        ],
+    )
     budget = copy.deepcopy(status(agent_enabled=False, agent_disabled_reason="daily_usd_cap"))
     budget["budget"]["exhausted"] = True
     result = {
@@ -287,6 +302,7 @@ def states() -> dict:
         "pass-mismatch": {**base, "run": run_state(result=run_view(), fix_=fix("not_verified", [mismatch_attempt], "attempts_exhausted", "No attempt passed, and the agent stopped at its attempt limit."))},
         "pass-alone-mismatch": {**base, "run": run_state(result=candidate("mismatch", comparison=None, fix_verified=False))},
         "honest": {**base, "run": run_state(result=run_view(), fix_=exhausted)},
+        "regression-broke": {**base, "run": run_state(result=run_view(), fix_=fix("not_verified", [regression_broke], "attempts_exhausted", "No attempt passed, and the agent stopped at its attempt limit."))},
         "inconclusive": {**base, "run": run_state(result=inconclusive)},
         "hostile": {**base, "run": run_state(result=hostile_result())},
         "failed": {**base, "run": run_state("failed", failed, names=("queued", "sandbox_started", "failed"))},

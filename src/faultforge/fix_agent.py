@@ -54,6 +54,7 @@ TERMINAL_FAILURES = frozenset({"budget_exhausted", "auth_rejected", "unknown_mod
 GATE_FIX_VERIFIED = "comparison_fix_verified"
 GATE_STATE = "state_verification"
 GATE_CODE = "code_changed"
+GATE_REGRESSION = "regression_suite"
 
 SAFE_NAME = re.compile(r"[a-z][a-z0-9_]{0,47}")
 SAFE_OBSERVED_NAME = re.compile(r"(?:(?:min|max)_)?(?:client|before|after)\.[a-z][a-z0-9_]{0,47}|total")
@@ -359,6 +360,12 @@ def build_messages(
         {"role": "system", "content": system_prompt(_text(business_rules).strip())},
         {"role": "user", "content": "\n\n".join(parts)},
     ]
+
+
+def regression_scenarios_for(config_path: Path, scenario_id: str) -> tuple[str, ...]:
+    """Every other scenario in the target's trusted config, in the config's order."""
+    config = config_module.parse_config(Path(config_path).read_text(encoding="utf-8"))
+    return tuple(scenario.id for scenario in config.scenarios if scenario.id != scenario_id)
 
 
 def invariant_names_for(config_path: Path, scenario_id: str) -> frozenset[str]:
@@ -919,6 +926,19 @@ def propose_fix(
 
 
 @dataclass(frozen=True)
+class RegressionRecord:
+    """One other scenario, run against the candidate. Holds no text from the target."""
+
+    scenario_id: str
+    passed: bool
+    verdict: str | None
+    state_verification: str | None
+    failure_reason: str | None
+    failed_invariants: tuple[str, ...]
+    run_id: str | None
+
+
+@dataclass(frozen=True)
 class AttemptRecord:
     attempt: int
     model: str
@@ -949,6 +969,7 @@ class AttemptRecord:
     finish_reason: str | None
     reasoning_tokens: int | None
     policy_rejection_reason: str | None
+    regression: tuple[RegressionRecord, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return dataclasses.asdict(self)
@@ -975,9 +996,10 @@ AttemptHook = Callable[[AttemptRecord, Proposal], None]
 
 
 def gate_failures(result: SandboxResult | None, baseline_code_sha256: str | None) -> tuple[str, ...]:
-    """The only definition of success, and it needs all three: the comparison says fix_verified, the
-    database agrees with what the target reported, and the host deployed different code from the
-    baseline. Not the verdict alone, and not a FIXED invariant."""
+    """The main scenario's part of success, and it needs all three: the comparison says fix_verified,
+    the database agrees with what the target reported, and the host deployed different code from the
+    baseline. Not the verdict alone, and not a FIXED invariant. run_fix_loop then adds the regression
+    scenarios, and only the whole of that counts as a verified fix."""
     failed = []
     report = result.report if result is not None and result.status == "completed" else None
     if report is None or report.comparison is None or report.comparison.fix_verified is not True:
@@ -1040,12 +1062,19 @@ def run_fix_loop(
     sleep: Callable[[float], None] = time.sleep,
     on_attempt: AttemptHook | None = None,
     state_verifier: Mapping[str, str] = TICKET_API_STATE_VERIFIER,
+    # Required, so that no caller can skip the check by leaving it out. Empty means no others exist.
+    regression_scenarios: Sequence[str],
 ) -> LoopResult:
     """Each candidate that passes the policy runs in a new sandbox and is compared with the baseline.
     options must match the baseline's, or the comparison is refused as not comparable.
-    baseline_code_sha256 is SandboxResult.deployed_code_sha256 of the baseline run."""
+    baseline_code_sha256 is SandboxResult.deployed_code_sha256 of the baseline run.
+
+    A candidate that passes the gate must then pass every regression scenario, each in a new sandbox
+    with the same code. That finds what a fix broke elsewhere, but only what those scenarios check."""
     if not 1 <= attempts <= MAX_ATTEMPTS:
         raise ValueError(f"attempts must be 1 to {MAX_ATTEMPTS}")
+    if scenario_id in regression_scenarios:
+        raise ValueError("a scenario can't be its own regression check")
     _require_reasoning_effort(reasoning_effort)
     if baseline.verdict != "FAIL":
         return LoopResult(model, baseline.run_id, (), False, "baseline_not_fail")
@@ -1064,6 +1093,7 @@ def run_fix_loop(
             max_tokens=max_tokens, reasoning_effort=reasoning_effort, transport=transport, sleep=sleep,
         )
         result = None
+        regression: tuple[RegressionRecord, ...] = ()
         failure = proposal.failure_reason
         detail = proposal.failure_detail
         violations: tuple[str, ...] = ()
@@ -1080,8 +1110,17 @@ def run_fix_loop(
                 result, failure, detail = _run_candidate(
                     spec, project_dir, scenario_id, run_options, run_sandboxed, baseline_code_sha256
                 )
+                if result is not None and failure is None and regression_scenarios:
+                    regression = _run_regression(
+                        spec, project_dir, regression_scenarios, options, run_sandboxed,
+                        result.deployed_code_sha256, config_path,
+                    )
+                    if not all(item.passed for item in regression):
+                        failure = "regression_failed"
+                        detail = _regression_detail(regression, config_path)
         record = _record(
-            number, proposal, result, failure, detail, violations, baseline_code_sha256, time.monotonic() - started
+            number, proposal, result, failure, detail, violations, baseline_code_sha256, time.monotonic() - started,
+            regression,
         )
         records.append(record)
         if on_attempt is not None:
@@ -1110,13 +1149,79 @@ def _run_candidate(
     return (result, *_sandbox_failure(result, baseline_code_sha256))
 
 
+def _regression_failure(result: SandboxResult, code_sha256: str | None) -> str | None:
+    """Fails closed: only a clean PASS of the same code, with a matching database, counts."""
+    if result.status != "completed" or result.report is None:
+        return f"sandbox_{result.failure_reason or 'no_report'}"
+    if result.report.verdict != "PASS":
+        return f"candidate_{result.report.verdict.lower()}"
+    facts = result.containment.state_verification
+    if facts is None or facts.status == "unavailable" or facts.status == "not_requested":
+        return "state_unavailable"
+    if facts.status != "matched":
+        return "state_mismatch"
+    if code_sha256 is None or result.deployed_code_sha256 != code_sha256:
+        return "code_mismatch"
+    return None
+
+
+def _run_regression(
+    spec: TargetSpec, project_dir: Path, scenarios: Sequence[str], options: RunOptions, run_sandboxed: RunSandboxed,
+    code_sha256: str | None, config_path: Path,
+) -> tuple[RegressionRecord, ...]:
+    """All of them run, so one retry sees everything the candidate broke. Another scenario has a
+    different workload, so there's no comparison with the baseline."""
+    records = []
+    plain = dataclasses.replace(options, compare_to=None)
+    for scenario_id in scenarios:
+        try:
+            result = run_sandboxed(spec, project_dir, scenario_id, plain)
+        except Exception as error:
+            records.append(RegressionRecord(scenario_id, False, None, None, f"sandbox_exception_{type(error).__name__}", (), None))
+            continue
+        report = result.report if result.status == "completed" else None
+        trusted = invariant_names_for(config_path, scenario_id)
+        failure = _regression_failure(result, code_sha256)
+        facts = result.containment.state_verification
+        records.append(RegressionRecord(
+            scenario_id=scenario_id,
+            passed=failure is None,
+            verdict=report.verdict if report is not None else None,
+            state_verification=facts.status if facts is not None else None,
+            failure_reason=failure,
+            failed_invariants=tuple(dict.fromkeys(
+                violation.invariant for violation in (report.violations if report is not None else ())
+                if violation.invariant in trusted
+            )),
+            run_id=report.run_id if report is not None else None,
+        ))
+    return tuple(records)
+
+
+def _regression_detail(records: Sequence[RegressionRecord], config_path: Path) -> str:
+    """Goes to the model on a retry, so it holds only names and descriptions from the trusted config
+    and fixed words, never values from the target."""
+    config = config_module.parse_config(Path(config_path).read_text(encoding="utf-8"))
+    descriptions = {scenario.id: scenario.description for scenario in config.scenarios}
+    lines = ["The file passed the main scenario, but broke other behaviour:"]
+    for item in records:
+        if item.passed:
+            continue
+        rules = f" Rules broken: {'; '.join(item.failed_invariants)}." if item.failed_invariants else ""
+        lines.append(f"- Scenario {item.scenario_id} ({descriptions.get(item.scenario_id, 'no description')}): {item.failure_reason}.{rules}")
+    return "\n".join(lines)
+
+
 def _record(
     number: int, proposal: Proposal, result: SandboxResult | None, failure: str | None, detail: str | None,
     violations: tuple[str, ...], baseline_code_sha256: str | None, wall_seconds: float,
+    regression: tuple[RegressionRecord, ...] = (),
 ) -> AttemptRecord:
     report = result.report if result is not None else None
     code = proposal.code
     failed = gate_failures(result, baseline_code_sha256)
+    if not all(item.passed for item in regression):
+        failed = (*failed, GATE_REGRESSION)
     facts = result.containment.state_verification if result is not None else None
     return AttemptRecord(
         attempt=number,
@@ -1148,4 +1253,5 @@ def _record(
         finish_reason=proposal.finish_reason,
         reasoning_tokens=proposal.reasoning_tokens,
         policy_rejection_reason="; ".join(violations) if violations else None,
+        regression=regression,
     )

@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from faultforge import fix_agent, lifecycle
-from faultforge.fix_agent import ApiKey, AttemptRecord, LoopResult, ModelPrice, Proposal
+from faultforge.fix_agent import ApiKey, AttemptRecord, LoopResult, ModelPrice, Proposal, RegressionRecord
 from faultforge.lifecycle import RunOptions
 from faultforge.models import Comparison, InvariantComparison, RequestRecord, ViolationEvidence
 from faultforge.sandbox import ContainerFacts, ContainmentFacts, MountFact, SandboxResult, StateVerification, TargetSpec
@@ -1031,6 +1031,12 @@ def test_a_real_fix_loop_against_fake_transport_and_sandbox(tmp_path: Path) -> N
             self.calls.append((target_spec, project_dir, scenario_id, options))
             number = len(self.calls)
             run_id = f"run_20260101_000000_{number:04x}"
+            if scenario_id != "last-ticket-rush":
+                return SandboxResult(
+                    status="completed", report=model_trial.synthetic_report(run_id, "PASS", None),
+                    deployed_code_sha256="d" * 64,
+                    containment=ContainmentFacts(wall_s=1, wall_limit_s=100, containers_left=0, state_verification=StateVerification(status="matched")),
+                )
             if options.compare_to is None:
                 return poisoned_result(run_id, project_dir)
             comparison = Comparison(
@@ -1190,6 +1196,101 @@ def test_the_page_explains_every_fix_limit() -> None:
     source = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
     for reason in ("fix_ip_limit", "fix_ip_daily_limit", "fix_daily_limit"):
         assert f"{reason}:" in source
+
+
+def test_the_ticket_target_runs_its_regression_scenarios_and_the_page_gets_only_their_results(harness) -> None:
+    loop = FakeFixLoop()
+    h = enabled_harness(harness, loop)
+    run_id = run_to_done(h, "10.1.4.1")
+    assert h.client.post(f"/api/runs/{run_id}/fix").status_code == 202
+    h.wait(run_id, "done")
+    assert tuple(loop.kwargs["regression_scenarios"]) == ("plenty-of-stock", "sold-out")
+
+
+def test_a_regression_result_reaches_the_attempt_view_and_old_replays_still_load() -> None:
+    record = dataclasses.replace(
+        attempt_record(1, False, "regression_failed"),
+        regression=(
+            RegressionRecord("plenty-of-stock", False, "FAIL", "matched", "candidate_fail", ("Every buyer gets a ticket while stock lasts",), "run_x"),
+            RegressionRecord("sold-out", True, "PASS", "matched", None, (), "run_y"),
+        ),
+    )
+    view = viewmodel.build_attempt_view(record, Proposal(model=AGENT_MODEL, code="# x\n"), b"# y\n", None)
+    assert [(item.scenario, item.passed) for item in view.regression] == [("plenty-of-stock", False), ("sold-out", True)]
+    assert view.failure_text == "The fix passed the main scenario, but broke another one."
+    stored = view.model_dump(mode="json")
+    del stored["regression"]
+    assert viewmodel.AttemptView.model_validate(stored).regression == []
+
+
+def _checked_replay(view: ReplayView, replay_id: str) -> ReplayView:
+    fix = view.fix.model_copy(update={"attempts": [
+        view.fix.attempts[0].model_copy(update={"regression": [viewmodel.RegressionView(
+            scenario="sold-out", passed=True, verdict="PASS", state_verification="matched", failure_reason=None, failed_invariants=[],
+        )]}),
+    ]})
+    return view.model_copy(update={"id": replay_id, "fix": fix})
+
+
+def test_older_replays_cant_crowd_out_regression_checked_ones(harness) -> None:
+    h = enabled_harness(harness, replays_per_kind=1)
+    run_id = run_to_done(h, "10.1.6.1")
+    assert h.client.post(f"/api/runs/{run_id}/fix").status_code == 202
+    h.wait(run_id, "done")
+    store = h.manager.replays
+    older = store.get(run_id)
+    assert older.fix is not None and not any(item.regression for item in older.fix.attempts)
+    assert store.save(older.model_copy(update={"id": "r_" + "e" * 16})) is False
+    checked = _checked_replay(older, "r_" + "f" * 16)
+    assert store.save(checked) is True
+    summaries = {item.id: item for item in store.summaries()}
+    assert summaries[run_id].regression_checked is False
+    assert summaries[checked.id].regression_checked is True
+
+
+def test_the_evidence_on_the_page_stays_the_main_scenario(harness) -> None:
+    """A regression run must not replace the candidate the page shows."""
+    calls: list[str] = []
+
+    def loop(**kwargs) -> LoopResult:
+        spec = TARGETS["ticket-api"].spec
+        main = kwargs["run_sandboxed"](spec, kwargs["project_dir"], kwargs["scenario_id"], RunOptions())
+        calls.append(main.report.run_id)
+        kwargs["run_sandboxed"](spec, kwargs["project_dir"], "plenty-of-stock", RunOptions())
+        record = attempt_record(1, True, None)
+        kwargs["on_attempt"](record, Proposal(model=AGENT_MODEL, code="# x\n"))
+        return LoopResult(kwargs["model"], kwargs["baseline"].run_id, (record,), True, "fix_verified")
+
+    h = harness(agent_enabled=True, api_key=ApiKey(KEY), fix_loop=loop)
+    run_id = run_to_done(h, "10.1.5.1")
+    assert h.client.post(f"/api/runs/{run_id}/fix").status_code == 202
+    body = h.wait(run_id, "done")
+    assert h.sandbox.calls[-1][2] == "plenty-of-stock"
+    assert body["fix"]["attempts"][0]["candidate"]["run_id"] == calls[0]
+
+
+def test_deploying_refuses_anything_but_a_clean_main(tmp_path: Path) -> None:
+    def git(*args: str) -> None:
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-C", str(tmp_path), *args], check=True, capture_output=True)
+
+    script = tmp_path / "deploy" / "deploy.sh"
+    script.parent.mkdir()
+    script.write_bytes((ROOT / "deploy" / "deploy.sh").read_bytes())
+    git("init", "-q", "-b", "main")
+    git("add", ".")
+    git("commit", "-q", "-m", "x")
+    # Both cases stop at the script's checks, before it could reach this reserved address.
+    def deploy() -> subprocess.CompletedProcess:
+        return subprocess.run(["bash", str(script), "192.0.2.1"], capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"}, timeout=20)
+
+    (tmp_path / "new.txt").write_text("x")
+    dirty = deploy()
+    assert dirty.returncode == 2 and "uncommitted" in dirty.stderr
+    git("add", ".")
+    git("commit", "-q", "-m", "y")
+    git("switch", "-q", "-c", "feature")
+    other = deploy()
+    assert other.returncode == 2 and "'feature'" in other.stderr
 
 
 def test_defaults_match_the_limits_asked_for(tmp_path: Path) -> None:

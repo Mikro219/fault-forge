@@ -409,7 +409,9 @@ class RunManager:
 
         def sandboxed(spec: TargetSpec, project_dir: Path, scenario_id: str, options: RunOptions) -> SandboxResult:
             result = self._run_sandboxed(spec, project_dir, scenario_id, options)
-            latest["result"] = result
+            # The page's evidence is the main scenario. Regression runs are reported on the attempt.
+            if scenario_id == record.target.scenario_id:
+                latest["result"] = result
             return result
 
         def on_attempt(attempt: AttemptRecord, proposal: Proposal) -> None:
@@ -443,6 +445,7 @@ class RunManager:
             reasoning_effort=AGENT_REASONING_EFFORT,
             transport=self._transport,
             on_attempt=on_attempt,
+            regression_scenarios=agent.regression_scenarios,
         )
         self._finish_fix(record, "verified" if loop.success else "not_verified", loop.stop_reason)
 

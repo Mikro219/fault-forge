@@ -11,8 +11,10 @@ from pathlib import Path
 import httpx
 import pytest
 
-from faultforge import fix_agent
+from faultforge import config as config_module, fix_agent
 from faultforge.fix_agent import (
+    GATE_REGRESSION,
+    regression_scenarios_for,
     ApiKey,
     ModelPrice,
     OutputRejected,
@@ -25,6 +27,7 @@ from faultforge.fix_agent import (
     run_fix_loop,
 )
 from faultforge.models import Comparison, InvariantComparison, RequestRecord, ViolationEvidence
+from faultforge.lifecycle import RunOptions
 from faultforge.sandbox import (
     TICKET_API_STATE_VERIFIER,
     ContainmentFacts,
@@ -166,7 +169,7 @@ def loop(fake: FakeModel, sandbox: FakeSandbox, tmp_path: Path, spend: TokenBudg
         support_sources={"support/a.py": b"x = 1\n"}, business_rules=b"- A rule.", baseline=BASELINE,
         baseline_code_sha256=BASELINE_SHA,
         support_dir=SUPPORT, config_path=CONFIG, project_dir=tmp_path, scenario_id=SCENARIO,
-        run_sandboxed=sandbox, transport=fake.transport, sleep=lambda _: None,
+        run_sandboxed=sandbox, transport=fake.transport, sleep=lambda _: None, regression_scenarios=(),
     )
     return run_fix_loop(**{**arguments, **overrides})
 
@@ -1403,3 +1406,109 @@ def test_the_summary_separates_the_comparison_from_the_full_gate() -> None:
         "full_gate_success=1", "'mismatch': 1", "'PASS': 2", "median_wall_s(model/total)=2.0/4.0", "tokens=60+30",
     ):
         assert fact in printed[0]
+
+
+# The regression suite: a verified candidate must also pass every other scenario
+
+
+REGRESSION = ("plenty-of-stock", "sold-out")
+REGRESSION_PASS = sandbox_result(report("PASS", None, 3))
+
+
+def relabelled(verdict: str) -> SandboxResult:
+    """A verdict the report's validators wouldn't build without its evidence."""
+    base = sandbox_result(report("FAIL", None, 3))
+    return base.model_copy(update={"report": base.report.model_copy(update={"verdict": verdict})})
+
+
+def regression_loop(sandbox: FakeSandbox, tmp_path: Path, fake: FakeModel | None = None, **overrides):
+    return loop(fake or FakeModel(), sandbox, tmp_path, regression_scenarios=REGRESSION, **overrides)
+
+
+def test_a_verified_candidate_runs_every_regression_scenario_with_the_same_code(tmp_path: Path) -> None:
+    sandbox = FakeSandbox(VERIFIED, REGRESSION_PASS, REGRESSION_PASS)
+    result = regression_loop(sandbox, tmp_path)
+    assert result.success is True and result.stop_reason == "fix_verified"
+    assert [call[2] for call in sandbox.calls] == [SCENARIO, *REGRESSION]
+    assert len({call[0].app_source for call in sandbox.calls}) == 1
+    # Another scenario has a different workload, so it can't be compared with the baseline.
+    assert sandbox.calls[0][3].compare_to == BASELINE.run_id
+    assert all(call[3].compare_to is None for call in sandbox.calls[1:])
+    attempt = result.attempts[0]
+    assert attempt.fix_verified is True and GATE_REGRESSION not in attempt.gate_failed
+    assert [(item.scenario_id, item.passed) for item in attempt.regression] == [(name, True) for name in REGRESSION]
+    assert attempt.run_id == VERIFIED.report.run_id
+
+
+def test_a_regression_run_is_never_compared_with_anything(tmp_path: Path) -> None:
+    sandbox = FakeSandbox(VERIFIED, REGRESSION_PASS, REGRESSION_PASS)
+    regression_loop(sandbox, tmp_path, options=RunOptions(compare_to="run_20260101_000000_ffff"))
+    assert all(call[3].compare_to is None for call in sandbox.calls[1:])
+
+
+def test_no_regression_runs_when_the_main_scenario_failed(tmp_path: Path) -> None:
+    sandbox = FakeSandbox(sandbox_result(report("FAIL", None, 2)))
+    result = regression_loop(sandbox, tmp_path, attempts=1)
+    assert [call[2] for call in sandbox.calls] == [SCENARIO]
+    assert result.attempts[0].regression == ()
+
+
+@pytest.mark.parametrize(
+    ("broken", "reason"),
+    [
+        (sandbox_result(report("FAIL", None, 3)), "candidate_fail"),
+        (relabelled("INCONCLUSIVE"), "candidate_inconclusive"),
+        (relabelled("ERROR"), "candidate_error"),
+        (sandbox_result(None, status="failed", failure_reason="wall_limit_exceeded"), "sandbox_wall_limit_exceeded"),
+        (sandbox_result(report("PASS", None, 3), state=StateVerification(status="mismatch")), "state_mismatch"),
+        (sandbox_result(report("PASS", None, 3), state=StateVerification(status="unavailable")), "state_unavailable"),
+        (sandbox_result(report("PASS", None, 3), state=None), "state_unavailable"),
+        (sandbox_result(report("PASS", None, 3), code_sha="d" * 64), "code_mismatch"),
+        (sandbox_result(report("PASS", None, 3), code_sha=None), "code_mismatch"),
+        (RuntimeError(INJECTION), "sandbox_exception_RuntimeError"),
+    ],
+)
+def test_anything_but_a_clean_pass_blocks_the_fix(tmp_path: Path, broken: object, reason: str) -> None:
+    sandbox = FakeSandbox(VERIFIED, REGRESSION_PASS, broken)
+    result = regression_loop(sandbox, tmp_path, attempts=1)
+    attempt = result.attempts[0]
+    assert result.success is False and attempt.fix_verified is False
+    assert attempt.failure_reason == "regression_failed" and attempt.gate_failed == (GATE_REGRESSION,)
+    assert [(item.passed, item.failure_reason) for item in attempt.regression] == [(True, None), (False, reason)]
+    assert INJECTION not in json.dumps(attempt.to_dict())
+
+
+def test_a_regression_failure_goes_back_to_the_model_and_a_retry_can_pass(tmp_path: Path) -> None:
+    sandbox = FakeSandbox(VERIFIED, sandbox_result(report("FAIL", None, 3)), REGRESSION_PASS, VERIFIED, REGRESSION_PASS, REGRESSION_PASS)
+    fake = FakeModel(completion(candidate_output("one")), completion(candidate_output("two")))
+    result = regression_loop(sandbox, tmp_path, fake)
+    assert result.success is True and len(result.attempts) == 2
+    assert result.attempts[0].fix_verified is False and result.attempts[1].fix_verified is True
+    retry = fake.requests[1].content.decode()
+    assert "regression_failed" in retry and "plenty-of-stock" in retry and "every buyer must get one" in retry
+
+
+def test_regression_feedback_holds_no_target_strings(tmp_path: Path) -> None:
+    poisoned = report("FAIL", None, 3)
+    poisoned = poisoned.model_copy(update={
+        "violations": [item.model_copy(update={"invariant": INJECTION}) for item in poisoned.violations],
+    })
+    sandbox = FakeSandbox(VERIFIED, sandbox_result(poisoned), REGRESSION_PASS, VERIFIED, REGRESSION_PASS, REGRESSION_PASS)
+    fake = FakeModel(completion(candidate_output("one")), completion(candidate_output("two")))
+    result = regression_loop(sandbox, tmp_path, fake)
+    assert INJECTION not in fake.requests[1].content.decode()
+    assert result.attempts[0].regression[0].failed_invariants == ()
+
+
+def test_a_scenario_cant_be_its_own_regression(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        loop(FakeModel(), FakeSandbox(), tmp_path, regression_scenarios=(SCENARIO,))
+
+
+def test_the_ticket_demo_declares_its_regression_scenarios() -> None:
+    config = config_module.parse_config(CONFIG.read_text(encoding="utf-8"))
+    assert regression_scenarios_for(CONFIG, SCENARIO) == REGRESSION
+    by_id = {scenario.id: scenario for scenario in config.scenarios}
+    assert by_id["last-ticket-rush"].reset_json is None
+    assert by_id["plenty-of-stock"].reset_json == {"stock": 20}
+    assert by_id["sold-out"].reset_json == {"stock": 0}

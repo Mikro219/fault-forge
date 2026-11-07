@@ -119,10 +119,11 @@ class TargetHooks:
     def health(self) -> None:
         self._call("GET", self.target.health)
 
-    def reset(self) -> None:
+    def reset(self, body: dict[str, object] | None = None) -> None:
+        """body replaces the configured reset body, for a scenario with its own starting state."""
         reset = self.target.reset
         if reset is not None:
-            self._call(reset.method, reset.path, reset.json_body)
+            self._call(reset.method, reset.path, reset.json_body if body is None else body)
 
     def state(self) -> Snapshot:
         content = self._call("GET", self.target.state)

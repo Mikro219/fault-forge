@@ -74,6 +74,33 @@ Each try sent the buggy `app.py`, the support code, the business rules and a rea
 - Ticket API: `FAIL` with 20 of 20 accepted. Hostile build: `INCONCLUSIVE` in 26.5 s, with 0 containers left.
 - The hostile CPU attack stops itself after 10 s. It's throttled, not blocked, so only the wall limit bounds code that doesn't stop.
 
+## Regression scenarios (2026-11-07)
+
+A candidate that passes the gate also runs `plenty-of-stock` (20 tickets, 20 buyers) and `sold-out` (0 tickets, 20 buyers), each in a new sandbox. Tested in real containers on the dev machine:
+
+- The reference fix passes both, at about 7 s per scenario.
+- `false_fixes/wipes_stock` sets stock to 0 instead of subtracting 1. It gets `PASS` and `fix_verified` on the race with a matching database, then `FAIL` on `plenty-of-stock` with 1 accepted.
+
+Regression runs only check the scenarios defined in the config, so they can't find a bug in behaviour no scenario covers. No model has been run against them yet.
+
+## SportsDeck spike (2026-11-07, local only)
+
+Commit `065e475` of a Next.js, Postgres and Redis app, run on the dev machine in containers sharing one network namespace with no outside network, with random throwaway secrets and real k6 2.3.0. The app, Postgres and Redis were read-only with all capabilities dropped. FaultForge's own loop wasn't used, so this isn't a FaultForge verdict.
+
+| Measure | Result |
+|---|---|
+| `POST /api/auth/refresh`, one token, 20 at once, 5 trials | Accepted 20, 3, 5, 3, 3, with that many live tokens left afterwards. No 500s. The 20 came from the first, cold trial |
+| The same 20 requests one at a time | 1 accepted, 19 rejected, 1 token left |
+| Hand-written one-file fix (atomic `deleteMany`, checks the count), 5 trials | 1 accepted, 19 rejected, 1 token left, in all 5 |
+| Startup, including migrations | 11.5 s |
+| Memory after load | App 114 MiB, Postgres 108 MiB, Redis 6 to 15 MiB |
+| Image | 1.66 GB; first build 5 min 10 s; rebuild with dependencies cached 3 min 30 s |
+| `next build` with 2 CPUs, 3 GB, no network | Worked: 140 s, 2214 MiB peak |
+
+- The committed lockfile doesn't match `package.json`, so `npm ci` and the repo's own `docker build` fail. The spike used `npm install` in a scratch copy, so its dependency versions aren't pinned by the repo.
+- The race is real but varies: after the first trial, overlap was 52 to 93 ms and 3 to 5 requests got through. A verdict needs "more than 1", not an exact count.
+- A rebuild can't fit inside the 100 s sandbox limit, so a target like this needs a separate build phase with its own limit.
+
 ## Not tested
 
 - The bridge-gateway egress test and the rest of `tests/test_sandbox.py` ran on the dev machine, not the VM.

@@ -44,3 +44,72 @@ scenarios:
         check: after.stock >= 0
     disclosures:
       - Payment provider is an in-process stub with a fixed 50 ms delay, which widens the race window.
+
+  # Regression scenarios: a candidate fix must also pass these. They guard behaviour the race above
+  # can't see, because with 1 ticket in stock, selling one and destroying all the stock look the same.
+  - id: plenty-of-stock
+    description: 20 buyers, 20 tickets, so every buyer must get one
+    mutates_data: true
+    user_confirmed: true
+    script: burst_request
+    reset_json: { stock: 20 }
+    request:
+      method: POST
+      path: /reserve
+      json: { item_id: 1, buyer: "buyer-${VU}-${ITER}" }
+    outcomes:
+      accepted_status: [200, 201]
+      rejected_status: [409]
+      capture_field: order_id
+    load: { vus: 20, iterations: 20, max_duration_s: 10, min_peak_in_flight: 10 }
+    invariants:
+      - name: Every buyer gets a ticket while stock lasts
+        type: liveness
+        check: client.accepted >= before.stock
+      - name: No more tickets confirmed than were in stock
+        type: capacity
+        check: client.accepted <= before.stock
+      - name: Stock accounting balances
+        type: accounting
+        check: before.stock - after.stock == after.orders_confirmed - before.orders_confirmed
+      - name: Every confirmation is recorded
+        type: consistency
+        check: client.accepted == after.orders_confirmed - before.orders_confirmed
+      - name: No customer holds a payment authorization without a ticket
+        type: orphan
+        check: after.payments_unattached == 0
+      - name: Every order has a payment authorization
+        type: integrity
+        check: after.orders_without_payment == 0
+    disclosures:
+      - Payment provider is an in-process stub with a fixed 50 ms delay, which widens the race window.
+  - id: sold-out
+    description: 20 buyers, no tickets, so every buyer must be refused
+    mutates_data: true
+    user_confirmed: true
+    script: burst_request
+    reset_json: { stock: 0 }
+    request:
+      method: POST
+      path: /reserve
+      json: { item_id: 1, buyer: "buyer-${VU}-${ITER}" }
+    outcomes:
+      accepted_status: [200, 201]
+      rejected_status: [409]
+      capture_field: order_id
+    load: { vus: 20, iterations: 20, max_duration_s: 10, min_peak_in_flight: 10 }
+    invariants:
+      - name: Nothing is sold when nothing is in stock
+        type: capacity
+        check: client.accepted <= before.stock
+      - name: Stock never negative
+        type: bound
+        check: after.stock >= 0
+      - name: No order is recorded
+        type: consistency
+        check: client.accepted == after.orders_confirmed - before.orders_confirmed
+      - name: No customer holds a payment authorization without a ticket
+        type: orphan
+        check: after.payments_unattached == 0
+    disclosures:
+      - Payment provider is an in-process stub with a fixed 50 ms delay, which widens the race window.

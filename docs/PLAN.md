@@ -103,6 +103,12 @@ The internal target is **submission-ready by the end of 7 November UTC**, which 
 - `Comparison.fix_verified` is what the agent loop in M6 must use, not per-invariant `FIXED`. An invariant can be `FIXED` in a retest that still has unexpected 500s. `fix_verified` is true only when the candidate's verdict is `PASS`, at least one invariant is `FIXED`, and none is `NOT_VERIFIED`, `STILL_FAILING` or `REGRESSED`.
 - M4 must bound k6's memory, because k6 buffers response bodies when `capture_field` is set, and must prove that a memory kill yields a report or a structured failure.
 
+### Post-M7 decisions (feature/sportsdeck)
+
+- **Regression gate.** `fix_verified` proves the failing scenario, not the rest of the app. A candidate must also pass every other scenario in its target's config, fail-closed, in new sandboxes. Stored replays from before this have no regression results and still load.
+- **Scenario reset.** `reset_json` replaces the reset body for one scenario. It's left out of the workload fingerprint when unset, so existing scenarios keep theirs.
+- **Bring-your-own repo stays owner-only.** The app's user can control Docker, so the public API still takes no code. A repo is imported by the owner at a pinned commit, then appears as a fixed target.
+
 ### M4 decisions
 
 AI-written `app.py` shares a process with the hooks, so the state and `build_id` it reports could be forged. `report.json` is unchanged; these checks sit in `SandboxResult` and the fix gate.

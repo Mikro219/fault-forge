@@ -825,3 +825,14 @@ def test_markdown_is_short_with_every_section_present():
 def test_hard_limits_match_the_plan():
     assert (LIMITS.max_vus, LIMITS.max_iterations_per_trial, LIMITS.max_trial_duration_s) == (50, 500, 20)
     assert (LIMITS.max_trials, LIMITS.max_requests_total, LIMITS.max_wall_s_total) == (5, 2000, 60)
+
+
+def test_a_scenario_can_reset_to_its_own_state_and_only_if_it_differs_changes_the_hash() -> None:
+    project = config.parse_config((ROOT / "demo" / "ticket-api" / "faultforge.yaml").read_text(encoding="utf-8"))
+    by_id = {scenario.id: scenario for scenario in project.scenarios}
+    rush, plenty = by_id["last-ticket-rush"], by_id["plenty-of-stock"]
+    hash_of = lambda scenario, reset: lifecycle.config_hash(project, scenario.model_copy(update={"reset_json": reset}), rush.load, "v")
+    assert hash_of(rush, None) != hash_of(rush, {"stock": 20})
+    assert hash_of(rush, {"stock": 20}) != hash_of(rush, {"stock": 21})
+    assert plenty.reset_json == {"stock": 20}
+

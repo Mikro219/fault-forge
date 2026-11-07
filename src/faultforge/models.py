@@ -131,6 +131,8 @@ class ScenarioConfig(Contract):
     request: RequestTemplate
     outcomes: OutcomeConfig
     load: LoadConfig
+    # Replaces target.reset's body for this scenario, such as a different starting stock.
+    reset_json: dict[str, object] | None = None
     invariants: list[InvariantConfig] = Field(min_length=1)
     disclosures: list[str] = Field(default_factory=list)
 
@@ -154,6 +156,8 @@ class ProjectConfig(Contract):
             raise ValueError("scenario ids must be unique")
         if self.target.reset is None and any(s.mutates_data for s in self.scenarios):
             raise ValueError("mutating scenarios require target.reset")
+        if self.target.reset is None and any(s.reset_json is not None for s in self.scenarios):
+            raise ValueError("reset_json requires target.reset")
         return self
 
 

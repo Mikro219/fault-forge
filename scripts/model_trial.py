@@ -182,6 +182,8 @@ class DryRunSandbox:
     def __call__(self, spec: TargetSpec, project_dir: Path, scenario_id: str, options: RunOptions) -> SandboxResult:
         self.runs += 1
         run_id = f"run_20260101_000000_{self.runs:04x}"
+        if scenario_id != SCENARIO:
+            return _synthetic_sandbox_result(synthetic_report(run_id, "PASS"), spec)
         if options.compare_to is None:
             return _synthetic_sandbox_result(synthetic_report(run_id), spec)
         comparison = Comparison(
@@ -298,6 +300,7 @@ def _run_model(
         baseline_code_sha256=baseline_code_sha256,
         support_dir=inputs.support_dir, config_path=inputs.config_path, project_dir=output.project_dir,
         scenario_id=SCENARIO, run_sandboxed=sandbox, options=RunOptions(), attempts=attempts,
+        regression_scenarios=fix_agent.regression_scenarios_for(inputs.config_path, SCENARIO),
         max_tokens=settings.max_tokens, reasoning_effort=reasoning_effort, transport=transport, sleep=sleep, on_attempt=on_attempt,
     )
 

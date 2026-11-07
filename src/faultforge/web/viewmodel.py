@@ -120,6 +120,7 @@ ATTEMPT_TEXT: Mapping[str, str] = {
     "candidate_inconclusive": "The fix ran in a new sandbox, but the result was inconclusive.",
     "candidate_error": "The fix ran in a new sandbox, but no trial started.",
     "not_verified": "The fix passed, but the comparison couldn't verify it against the baseline.",
+    "regression_failed": "The fix passed the main scenario, but broke another one.",
     "state_mismatch": "What the service reported disagrees with its database.",
     "state_unavailable": "The service's database couldn't be checked.",
     "code_unchanged": "The code is identical to the failing baseline.",
@@ -363,6 +364,17 @@ class RunView(View):
     disclosures: list[str]
 
 
+class RegressionView(View):
+    """One other scenario run against the candidate. Names come from the trusted config."""
+
+    scenario: str
+    passed: bool
+    verdict: Verdict | None
+    state_verification: str | None
+    failure_reason: str | None
+    failed_invariants: list[str]
+
+
 class AttemptView(View):
     attempt: int
     model: str
@@ -382,6 +394,8 @@ class AttemptView(View):
     usage_reported: bool
     cost_usd: float
     candidate: RunView | None = None
+    # Defaulted so that replays stored before regression checks still load.
+    regression: list[RegressionView] = Field(default_factory=list)
 
 
 class FixView(View):
@@ -426,6 +440,7 @@ class ReplaySummaryView(View):
     verdict: Verdict | None
     fix_verified: bool
     has_fix: bool
+    regression_checked: bool = False
 
 
 class ReplayView(View):
@@ -852,4 +867,15 @@ def build_attempt_view(
         usage_reported=record.usage_reported,
         cost_usd=record.cost_usd,
         candidate=candidate,
+        regression=[
+            RegressionView(
+                scenario=item.scenario_id,
+                passed=item.passed,
+                verdict=item.verdict,
+                state_verification=_matching(item.state_verification, SAFE_CODE),
+                failure_reason=_matching(item.failure_reason, SAFE_CODE),
+                failed_invariants=list(item.failed_invariants),
+            )
+            for item in record.regression
+        ],
     )

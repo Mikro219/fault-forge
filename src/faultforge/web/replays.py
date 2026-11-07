@@ -23,6 +23,10 @@ MAX_REPLAY_BYTES = 4 * 1024 * 1024
 MAX_REPLAYS_LOADED = 500
 
 
+def _regression_checked(replay: ReplayView) -> bool:
+    return replay.fix is not None and any(attempt.regression for attempt in replay.fix.attempts)
+
+
 class ReplayStore:
     """Replays are never deleted, so growth is bounded by storing only the first few of each kind:
     a target, a verdict, and whether a fix ran. A stored run gains its fix if that kind has room."""
@@ -49,8 +53,9 @@ class ReplayStore:
             self._replays[replay.id] = replay
 
     @staticmethod
-    def _kind(replay: ReplayView) -> tuple[str, str | None, bool]:
-        return replay.target, replay.result.verdict, replay.fix is not None
+    def _kind(replay: ReplayView) -> tuple[str, str | None, bool, bool]:
+        """Regression-checked runs are their own kind, so stored older runs can't crowd them out."""
+        return replay.target, replay.result.verdict, replay.fix is not None, _regression_checked(replay)
 
     def save(self, replay: ReplayView) -> bool:
         if not SAFE_ID.fullmatch(replay.id) or replay.result.status != "completed":
@@ -80,6 +85,7 @@ class ReplayStore:
                 id=item.id, recorded_at=item.recorded_at, target=item.target, verdict=item.result.verdict,
                 fix_verified=any(attempt.passed for attempt in item.fix.attempts) if item.fix else False,
                 has_fix=item.fix is not None,
+                regression_checked=_regression_checked(item),
             )
             for item in replays
         ]

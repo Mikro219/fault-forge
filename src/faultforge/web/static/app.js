@@ -67,6 +67,7 @@ const GATE_TEXT = {
   comparison_fix_verified: "the comparison with the failing run didn't verify it",
   state_verification: "the database check didn't match",
   code_changed: "the deployed code didn't change",
+  regression_suite: "it broke another scenario",
 };
 const NOT_VERIFIED_TEXT = {
   trials_incomplete: "trials incomplete",
@@ -150,7 +151,7 @@ function startNotices(status) {
   return out;
 }
 function replaySummary(r) {
-  if (r.fix_verified) return "Fix verified";
+  if (r.fix_verified) return r.regression_checked ? "Fix verified" : "Fix verified, not checked against other scenarios";
   if (r.has_fix) return "The agent tried a fix, and it wasn't verified";
   if (r.target === "hostile-build") return "Containment test";
   return { FAIL: "Violation proven", PASS: "Invariants held", INCONCLUSIVE: "Not enough evidence. This isn't a pass." }[r.verdict] || "No verdict";
@@ -169,7 +170,7 @@ function ticketProof(r) {
       <span class="proof-arrow">${I.arrow}</span>
       <div class="proof-step"><span class="pill pass">${I.check} Fix verified</span><span class="proof-big">${after.accepted} accepted</span><span class="fg2 small">${after.rejected} rejected, under the same workload</span></div>
     </div>
-    <div class="proof-f"><span class="muted small">${chosen.model || r.fix.model} wrote the fix on attempt ${chosen.attempt}, for ${usd(chosen.cost_usd)}.</span><button class="btn sm sp" data-act="replay" data-id="${r.id}">${I.play} Watch this run</button></div>
+    <div class="proof-f"><span class="muted small">${chosen.model || r.fix.model} wrote the fix on attempt ${chosen.attempt}, for ${usd(chosen.cost_usd)}.${list(chosen.regression).length ? "" : " It wasn't checked against other scenarios."}</span><button class="btn sm sp" data-act="replay" data-id="${r.id}">${I.play} Watch this run</button></div>
   </article>`;
 }
 function hostileProof(r) {
@@ -486,6 +487,7 @@ function attemptResult(a, more) {
   if (c && c.contrast && c.status === "completed") parts.push(`Same workload: ${c.contrast.accepted} accepted and ${c.contrast.rejected} rejected.`);
   if (c && list(c.violations).length) parts.push(`${plural(c.violations.length, "proven violation")}.`);
   const gates = list(a.gate_failed).map(g => GATE_TEXT[g]).filter(Boolean);
+  list(a.regression).filter(item => !item.passed).forEach(item => parts.push(`${item.scenario} didn't pass${list(item.failed_invariants).length ? `: ${list(item.failed_invariants).join("; ")}` : ""}.`));
   if (gates.length) parts.push(`It stopped because ${gates.join(", and ")}.`);
   return { headline: `Attempt ${a.attempt} rejected: ${a.failure_text || "this attempt failed."}`, detail: parts.join(" "), next: more ? "The agent gets this result and tries again." : "" };
 }
@@ -532,7 +534,7 @@ function workingCard(fix, st) {
   const started = list(st.events).find(e => e.name === "fix_started");
   const queued = fix.status === "queued";
   return h`<section class="attempt fade-in" id="agent-working" aria-live="polite"><div class="attempt-h"><b>${queued ? "Waiting for the sandbox" : `Attempt ${number} of ${fix.max_attempts}`}</b><span class="chip">${fix.model}</span><span class="pill info">${queued ? "Queued" : "In progress"}</span>${started && !queued ? h`<span class="sp muted small mono">started ${when(started.at)}</span>` : ""}</div>
-    <div class="wait"><p>${queued ? "The fix starts when the sandbox is free." : "Writing a fix from the failing evidence, then re-testing it in a new sandbox."}</p><div class="breath" aria-hidden="true"></div><p class="muted small">${started && !queued ? h`<span class="mono fg2" aria-hidden="true">${elapsed(started.at)} so far · </span>This usually takes 10 to 25 s. ` : ""}Nothing runs until the change is written and checked against the code rules.</p></div></section>`;
+    <div class="wait"><p>${queued ? "The fix starts when the sandbox is free." : "Writing a fix from the failing evidence, then re-testing it in a new sandbox."}</p><div class="breath" aria-hidden="true"></div><p class="muted small">${started && !queued ? h`<span class="mono fg2" aria-hidden="true">${elapsed(started.at)} so far · </span>This usually takes under a minute. ` : ""}Nothing runs until the change is written and checked against the code rules.</p></div></section>`;
 }
 function renderFixState(st) {
   const fix = st.fix;
@@ -555,15 +557,17 @@ const RUN_LIVE = target => nextStep("Run this yourself, live", "Everything above
 /* ---------- 6 · verification: "Fix verified" appears only when every part of the gate holds ---------- */
 function gateFor(baseline, fix, attempt) {
   const c = attempt.candidate;
-  if (!c) return { verified: false, workload: false, code: false, database: false };
+  if (!c) return { verified: false, workload: false, code: false, database: false, regression: false };
   const workload = Boolean(baseline.config_hash) && baseline.config_hash === c.config_hash;
   const code = attempt.code_changed === true && Boolean(baseline.deployed_code_sha256) && Boolean(c.deployed_code_sha256) && baseline.deployed_code_sha256 !== c.deployed_code_sha256;
   const database = Boolean(c.state_verification) && c.state_verification.status === "matched";
   const comparison = c.comparison;
-  const verified = fix.status === "verified" && attempt.passed === true && c.status === "completed" && c.verdict === "PASS"
+  // A run recorded before regression checks has none. A row for them appears only when they ran.
+  const regression = list(attempt.regression).every(item => item.passed === true);
+  const verified = regression && fix.status === "verified" && attempt.passed === true && c.status === "completed" && c.verdict === "PASS"
     && c.fix_verified === true && Boolean(comparison) && comparison.fix_verified === true && comparison.status === "COMPARABLE"
     && list(c.violations).length === 0 && workload && code && database;
-  return { verified, workload, code, database };
+  return { verified, workload, code, database, regression };
 }
 function databaseEvidence(c) {
   const sv = c.state_verification || { status: "unavailable", mismatches: [] };
@@ -580,11 +584,16 @@ function renderVerify(baseline, attempt, gate) {
     { ok: gate.workload, title: gate.workload ? "Same workload fingerprint" : "Workload fingerprint doesn't match", value: `${baseline.config_hash ? shortHash(baseline.config_hash) : "not recorded"} before, ${c.config_hash ? shortHash(c.config_hash) : "not recorded"} after` },
     { ok: gate.code, title: gate.code ? "New code deployed" : "No proof of new code", value: `Deployed code hash, by the host: ${baseline.deployed_code_sha256 ? shortHash(baseline.deployed_code_sha256) : "not recorded"} → ${c.deployed_code_sha256 ? shortHash(c.deployed_code_sha256) : "not recorded"}` },
     { ok: gate.database, title: gate.database ? "Database check matched" : "Database check did not match", value: databaseEvidence(c) },
+    list(attempt.regression).length ? {
+      ok: gate.regression,
+      title: gate.regression ? "Other scenarios still pass" : "It broke another scenario",
+      value: list(attempt.regression).map(item => `${item.scenario}: ${item.passed ? "passed" : `not passed${list(item.failed_invariants).length ? ` (${list(item.failed_invariants).join("; ")})` : ""}`}`).join(" · "),
+    } : { unchecked: true, ok: false, title: "Other scenarios weren't checked", value: "This fix wasn't run against any other scenario, so what it did elsewhere is unknown." },
   ];
-  const headline = verified ? `0 violations in ${n} trials under the same workload.` : sv === "mismatch" ? "The responses passed, but the database disagrees. This fix is not verified." : "The responses passed, but the gate didn't hold. This fix is not verified.";
-  const sub = verified ? "" : "Treat this as unfixed: a fix that changes what the service says without changing what it does can look exactly like this.";
+  const headline = verified ? `0 violations in ${n} trials under the same workload.` : !gate.regression ? "The main scenario passed, but the fix broke another one. This fix is not verified." : sv === "mismatch" ? "The responses passed, but the database disagrees. This fix is not verified." : "The responses passed, but the gate didn't hold. This fix is not verified.";
+  const sub = verified ? "" : !gate.regression ? "Treat this as unfixed: it trades one bug for another." : "Treat this as unfixed: a fix that changes what the service says without changing what it does can look exactly like this.";
   const badge = h`<section class="badge ${verified ? "" : "bad"}" id="fix-badge"><div class="seal">${verified ? I.check : I.x} ${verified ? "Fix verified" : "Not verified"}</div>
-    <div class="ev">${evidence.map(e => h`<div class="ev-row ${e.ok ? "" : "bad"}">${okMark(e.ok)}<b>${e.title}</b><span class="val">${e.value}</span></div>`)}</div></section>`;
+    <div class="ev">${evidence.map(e => h`<div class="ev-row ${e.ok || e.unchecked ? "" : "bad"}">${e.unchecked ? h`<span class="pill none">Not run</span>` : okMark(e.ok)}<b>${e.title}</b><span class="val">${e.value}</span></div>`)}</div></section>`;
   const before = baseline.contrast, after = c.contrast;
   const card = (verdict, label, contrast, extra) => h`<div class="cmp-card"><div class="v-block ${verdict} ${extra || ""}">${verdict}${extra ? h`<small>${I.x} Not verified</small>` : ""}</div><div class="body"><span class="role">${label}</span><span class="big">${contrast ? `${contrast.accepted} accepted` : ""}</span><span class="fg2 mono">${contrast ? `${contrast.rejected} rejected` : ""}</span></div></div>`;
   const beforeRows = invariantSummary(baseline), afterRows = invariantSummary(c);
