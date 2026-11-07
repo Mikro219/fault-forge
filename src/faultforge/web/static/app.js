@@ -40,6 +40,9 @@ const AGENT_OFF = {
   daily_token_cap: "Today's AI token limit is used up.",
   total_usd_cap: "The total AI budget is used up.",
   ledger_unavailable: "The AI budget can't be read, so the agent stays off.",
+  fix_ip_limit: "You've reached the hourly limit on fixes.",
+  fix_ip_daily_limit: "You've reached today's limit on fixes.",
+  fix_daily_limit: "Today's limit on fixes was reached.",
 };
 const CAUSE_LABEL = {
   check_then_act_race: "Check-then-act race",
@@ -628,7 +631,7 @@ function renderRunView(st) {
 function renderTop() {
   const status = S.status;
   const off = status && !status.agent_enabled, busy = status && status.busy;
-  const label = !status ? (S.statusFailed ? "Server unreachable" : "Connecting") : busy ? "Sandbox in use" : off ? "Live agent off" : "Live agent on";
+  const label = !status ? (S.statusFailed ? "Server unreachable" : "Connecting") : busy ? "Sandbox in use" : off ? (String(status.agent_disabled_reason).startsWith("fix_") ? "Fix limit reached" : "Live agent off") : "Live agent on";
   return h`<span class="status" id="server-status"><span class="dot ${!status || off ? "off" : busy ? "busy" : ""}" aria-hidden="true"></span>${label}</span>
     <button class="iconbtn" data-act="theme" aria-label="Toggle light and dark theme" title="Toggle theme">${I.sun}</button>`;
 }

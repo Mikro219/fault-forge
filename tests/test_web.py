@@ -23,7 +23,7 @@ from faultforge.lifecycle import RunOptions
 from faultforge.models import Comparison, InvariantComparison, RequestRecord, ViolationEvidence
 from faultforge.sandbox import ContainerFacts, ContainmentFacts, MountFact, SandboxResult, StateVerification, TargetSpec
 from faultforge.web import viewmodel
-from faultforge.web.app import SECURITY_HEADERS, create_app
+from faultforge.web.app import SECURITY_HEADERS, STATIC_DIR, create_app
 from faultforge.web.budget import BudgetLedger, LedgerBudget
 from faultforge.web.limits import client_key
 from faultforge.web.replays import ReplayStore, apply_retention
@@ -419,6 +419,21 @@ def test_global_hourly_cap(harness) -> None:
     assert refused.status_code == 429 and refused.json()["reason"] == "hourly_limit"
     clock.now += 3600
     assert h.post_run(ip="10.0.4.3").status_code == 202
+
+
+def test_one_visitor_cannot_use_up_the_hourly_runs(harness) -> None:
+    clock = Clock()
+    h = harness(clock=clock, runs_per_hour=3, runs_per_hour_per_ip=2)
+    h.wait(h.post_run(ip="10.0.4.1").json()["id"], "done")
+    h.wait(h.post_run(ip="10.0.4.1").json()["id"], "done")
+    refused = h.post_run(ip="10.0.4.1")
+    assert refused.status_code == 429 and refused.json()["reason"] == "run_ip_limit"
+    assert 3000 <= int(refused.headers["Retry-After"]) <= 3601
+    # The refusal took no global slot, so someone else still gets the last one.
+    h.wait(h.post_run(ip="10.0.4.2").json()["id"], "done")
+    assert h.post_run(ip="10.0.4.3").json()["reason"] == "hourly_limit"
+    clock.now += 3600
+    assert h.post_run(ip="10.0.4.1").status_code == 202
 
 
 def test_a_refused_request_does_not_use_up_a_limit(harness) -> None:
@@ -1122,10 +1137,66 @@ def test_fix_limit_global(harness) -> None:
     assert refused.status_code == 429 and refused.json()["reason"] == "fix_daily_limit"
 
 
+def test_one_visitor_cannot_use_up_the_daily_fixes(harness) -> None:
+    # Retention ages files by real time, so the clock starts now and retention is out of the way.
+    h = enabled_harness(
+        harness, clock=Clock(time.time()), retention_age_s=1e9,
+        fixes_per_day=2, fixes_per_day_per_ip=1, fixes_per_hour_per_ip=5,
+    )
+    first, second, third = (run_to_done(h, f"10.1.2.{n}") for n in (1, 2, 3))
+    mine, other = {"X-Forwarded-For": "10.1.2.8"}, {"X-Forwarded-For": "10.1.2.9"}
+    assert h.client.post(f"/api/runs/{first}/fix", headers=mine).status_code == 202
+    refused = h.client.post(f"/api/runs/{second}/fix", headers=mine)
+    assert refused.status_code == 429 and refused.json()["reason"] == "fix_ip_daily_limit"
+    assert 80000 <= int(refused.headers["Retry-After"]) <= 86401
+    # The refusal took no global slot, so someone else still gets the last one.
+    assert h.client.post(f"/api/runs/{second}/fix", headers=other).status_code == 202
+    h.wait(second, "done")
+    assert h.client.post(f"/api/runs/{third}/fix", headers=other).json()["reason"] == "fix_ip_daily_limit"
+    assert h.client.post(f"/api/runs/{third}/fix", headers={"X-Forwarded-For": "10.1.2.7"}).json()["reason"] == "fix_daily_limit"
+
+
+def test_the_page_is_not_offered_a_fix_the_limits_would_refuse(harness) -> None:
+    clock = Clock(time.time())
+    h = enabled_harness(harness, clock=clock, retention_age_s=1e9, fixes_per_hour_per_ip=1, fixes_per_day=2)
+    first, second, third = (run_to_done(h, f"10.1.3.{n}") for n in (1, 2, 3))
+    mine, other = {"X-Forwarded-For": "10.1.3.8"}, {"X-Forwarded-For": "10.1.3.9"}
+    assert h.client.post(f"/api/runs/{first}/fix", headers=mine).status_code == 202
+    h.wait(first, "done")
+
+    # Only the visitor at their limit is told so. The other is still offered a fix.
+    assert h.client.get(f"/api/runs/{second}", headers=mine).json()["fix_available"] is False
+    status = h.client.get("/api/status", headers=mine).json()
+    assert status["agent_enabled"] is False and status["agent_disabled_reason"] == "fix_ip_limit"
+    assert status["budget"]["exhausted"] is False
+    assert h.client.get(f"/api/runs/{second}", headers=other).json()["fix_available"] is True
+    assert h.client.get("/api/status", headers=other).json()["agent_enabled"] is True
+
+    # At the global limit, nobody is.
+    assert h.client.post(f"/api/runs/{second}/fix", headers=other).status_code == 202
+    h.wait(second, "done")
+    new = {"X-Forwarded-For": "10.1.3.7"}
+    assert h.client.get(f"/api/runs/{third}", headers=new).json()["fix_available"] is False
+    status = h.client.get("/api/status", headers=new).json()
+    assert status["agent_enabled"] is False and status["agent_disabled_reason"] == "fix_daily_limit"
+
+    # A day later the limits have expired, for everyone.
+    clock.now += 86400
+    assert h.client.get(f"/api/runs/{third}", headers=new).json()["fix_available"] is True
+    assert h.client.get("/api/status", headers=mine).json()["agent_enabled"] is True
+
+
+def test_the_page_explains_every_fix_limit() -> None:
+    source = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    for reason in ("fix_ip_limit", "fix_ip_daily_limit", "fix_daily_limit"):
+        assert f"{reason}:" in source
+
+
 def test_defaults_match_the_limits_asked_for(tmp_path: Path) -> None:
     settings = WebSettings(data_dir=tmp_path)
-    assert (settings.queue_limit, settings.cooldown_s, settings.runs_per_hour) == (3, 30.0, 60)
-    assert (settings.fixes_per_hour_per_ip, settings.fixes_per_day) == (3, 20)
+    assert (settings.queue_limit, settings.cooldown_s) == (3, 30.0)
+    assert (settings.runs_per_hour, settings.runs_per_hour_per_ip) == (120, 20)
+    assert (settings.fixes_per_hour_per_ip, settings.fixes_per_day_per_ip, settings.fixes_per_day) == (3, 6, 60)
     assert (settings.daily_usd_cap, settings.total_usd_cap) == (2.0, 15.0)
     assert (settings.records_limit, settings.retention_keep) == (50, 20)
     assert settings.agent_enabled is False

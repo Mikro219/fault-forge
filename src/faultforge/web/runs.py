@@ -159,7 +159,9 @@ class RunManager:
         self._records: dict[str, RunRecord] = {}
         self._cooldowns: dict[str, float] = {}
         self._runs_window = SlidingWindow(settings.runs_per_hour, 3600.0)
+        self._run_ip_windows = KeyedWindows(settings.runs_per_hour_per_ip, 3600.0)
         self._fix_ip_windows = KeyedWindows(settings.fixes_per_hour_per_ip, 3600.0)
+        self._fix_ip_day_windows = KeyedWindows(settings.fixes_per_day_per_ip, 86400.0)
         self._fix_day_window = SlidingWindow(settings.fixes_per_day, 86400.0)
         self._stopping = False
         self._thread: threading.Thread | None = None
@@ -220,6 +222,9 @@ class RunManager:
             wait = self._cooldowns.get(client, 0.0) - now
             if wait > 0:
                 raise Refused(429, "cooldown", "Please wait before starting another run.", wait)
+            wait = self._run_ip_windows.retry_after(client, now)
+            if wait > 0:
+                raise Refused(429, "run_ip_limit", "You've reached the hourly limit on runs. Replays still work.", wait)
             wait = self._runs_window.retry_after(now)
             if wait > 0:
                 raise Refused(429, "hourly_limit", "The hourly run limit was reached. Replays still work.", wait)
@@ -233,6 +238,7 @@ class RunManager:
             self._cooldowns = {key: until for key, until in self._cooldowns.items() if until > now}
             self._cooldowns[client] = now + self.settings.cooldown_s
             self._runs_window.hit(now)
+            self._run_ip_windows.hit(client, now)
             self._queue.append(_Job("run", record))
             self._evict_records()
             self._condition.notify_all()
@@ -257,14 +263,13 @@ class RunManager:
                 raise Refused(409, "fix_already_started", "A fix was already started for this run.")
             if not self._can_fix(record):
                 raise Refused(409, "not_fixable", "Only a finished ticket-api run with a proven failure can be fixed.")
-            wait = self._fix_ip_windows.retry_after(client, now)
-            if wait > 0:
-                raise Refused(429, "fix_ip_limit", "You've reached the hourly limit on fixes.", wait)
-            wait = self._fix_day_window.retry_after(now)
-            if wait > 0:
-                raise Refused(429, "fix_daily_limit", "Today's limit on fixes was reached.", wait)
+            limit = self._fix_limit(client, now)
+            if limit is not None:
+                reason, message, wait = limit
+                raise Refused(429, reason, message, wait)
             self._refuse_if_queue_full()
             self._fix_ip_windows.hit(client, now)
+            self._fix_ip_day_windows.hit(client, now)
             self._fix_day_window.hit(now)
             record.stage = "fix_queued"
             record.fix_status = "queued"
@@ -272,6 +277,20 @@ class RunManager:
             self._queue.append(_Job("fix", record))
             self._condition.notify_all()
             return record
+
+    def _fix_limit(self, client: str, now: float) -> tuple[str, str, float] | None:
+        """The fix limit that would refuse this visitor now. One place, so that what the page is
+        offered and what submit_fix accepts can't disagree."""
+        wait = self._fix_ip_windows.retry_after(client, now)
+        if wait > 0:
+            return "fix_ip_limit", "You've reached the hourly limit on fixes.", wait
+        wait = self._fix_ip_day_windows.retry_after(client, now)
+        if wait > 0:
+            return "fix_ip_daily_limit", "You've reached today's limit on fixes.", wait
+        wait = self._fix_day_window.retry_after(now)
+        if wait > 0:
+            return "fix_daily_limit", "Today's limit on fixes was reached.", wait
+        return None
 
     def _refuse_if_stopping(self) -> None:
         if self._stopping or not self.worker_alive():
@@ -468,7 +487,7 @@ class RunManager:
             total_cost_usd=round(sum(item.cost_usd for item in record.fix_attempts), 6),
         )
 
-    def run_state(self, run_id: str) -> RunStateView | None:
+    def run_state(self, run_id: str, client: str) -> RunStateView | None:
         with self._condition:
             record = self._records.get(run_id)
             if record is None:
@@ -485,7 +504,12 @@ class RunManager:
                 events=list(record.events),
                 result=record.result,
                 fix=self._fix_view(record),
-                fix_available=self._agent_disabled_reason() is None and record.fix_status is None and self._can_fix(record),
+                fix_available=(
+                    self._agent_disabled_reason() is None
+                    and self._fix_limit(client, self._clock()) is None
+                    and record.fix_status is None
+                    and self._can_fix(record)
+                ),
             )
 
     def _reserve(self) -> tuple[float, int]:
@@ -513,10 +537,13 @@ class RunManager:
                 self._vm_cached = (now, self._vm_probe(self.settings.data_dir))
             return self._vm_cached[1]
 
-    def status(self) -> StatusView:
+    def status(self, client: str) -> StatusView:
         vm = self._vm()
         with self._condition:
             disabled = self._agent_disabled_reason()
+            if disabled is None:
+                limit = self._fix_limit(client, self._clock())
+                disabled = limit[0] if limit is not None else None
             budget_reason = self.ledger.blocked_reason(*self._reserve())
             return StatusView(
                 busy=self._current is not None or bool(self._queue),

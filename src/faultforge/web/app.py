@@ -141,8 +141,8 @@ def create_app(manager: RunManager) -> FastAPI:
         return JSONResponse({"status": "ok"})
 
     @app.get("/api/status")
-    def status() -> JSONResponse:
-        return _view(manager.status())
+    def status(request: Request) -> JSONResponse:
+        return _view(manager.status(_client(request)))
 
     @app.post("/api/runs", status_code=202)
     def create_run(body: RunRequest, request: Request) -> JSONResponse:
@@ -150,8 +150,8 @@ def create_app(manager: RunManager) -> FastAPI:
         return JSONResponse({"id": record.id, "stage": "queued", "target": body.target}, status_code=202)
 
     @app.get("/api/runs/{run_id}")
-    def get_run(run_id: str) -> JSONResponse:
-        state = manager.run_state(run_id) if _valid_id(run_id) else None
+    def get_run(run_id: str, request: Request) -> JSONResponse:
+        state = manager.run_state(run_id, _client(request)) if _valid_id(run_id) else None
         if state is None:
             return error_response(404, "not_found", "There's no such run. Only recent runs are kept.")
         return _view(state)

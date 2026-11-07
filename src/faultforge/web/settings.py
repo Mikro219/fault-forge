@@ -22,9 +22,11 @@ class WebSettings:
     agent_enabled: bool = False
     queue_limit: int = 3
     cooldown_s: float = 30.0
-    runs_per_hour: int = 60
+    runs_per_hour: int = 120
+    runs_per_hour_per_ip: int = 20
     fixes_per_hour_per_ip: int = 3
-    fixes_per_day: int = 20
+    fixes_per_day_per_ip: int = 6
+    fixes_per_day: int = 60
     daily_usd_cap: float = 2.0
     total_usd_cap: float = 15.0
     daily_token_cap: int = 1_000_000

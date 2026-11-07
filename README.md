@@ -14,7 +14,7 @@ Entry for the Vultr Agent Rush hackathon, Blast Radius Zero track.
 2. Click **Let the agent fix it**. The fix is written live and tested in a new sandbox. Allow 10 to 25 s. Read the **Fix verified** badge and its evidence rows.
 3. Click **Start a new run**, choose **Hostile build** and click **Run**. Each attack is listed with its result and what the host verified. The verdict is `INCONCLUSIVE`, never `PASS`.
 
-Visitors can only choose fixed targets. There are no uploads and no free-text prompts. The limits are a 30 s cooldown between runs and 3 fixes per hour per visitor. Recorded runs under **Past runs** always carry a Replay label.
+Visitors can only choose fixed targets. There are no uploads and no free-text prompts. The limits are a 30 s cooldown between runs, 20 runs per hour per visitor, and 3 fixes per hour and 6 per day per visitor. Recorded runs under **Past runs** always carry a Replay label.
 
 ## Vultr services and infrastructure used
 

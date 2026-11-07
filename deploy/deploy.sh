@@ -17,6 +17,7 @@ rsync_command=(
     rsync -az --delete
     --exclude .git/ --exclude .venv/ --exclude .tools/ --exclude .faultforge/
     --exclude .claude/ --exclude .pytest_cache/ --exclude __pycache__/ --exclude '*.pyc'
+    --exclude plans/ --exclude docs/SUBMISSION.md
     --exclude .env --exclude '.env.*' --exclude '*.env' --exclude '*.pem' --exclude '*.key' --exclude 'id_rsa*' --exclude 'id_ed25519*'
     "$root/" "$remote:/opt/faultforge/"
 )
