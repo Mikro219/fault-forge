@@ -146,7 +146,9 @@ class RunManager:
         self._clock = clock
 
         self.projects_dir = settings.data_dir / "projects"
-        self.replays = ReplayStore(settings.data_dir / "replays", settings.replays_per_kind)
+        self.replays = ReplayStore(
+            settings.data_dir / "replays", settings.replays_per_kind, recorded_dir=settings.recorded_replays_dir,
+        )
         self.ledger = BudgetLedger(
             settings.data_dir / "budget.json",
             daily_usd_cap=settings.daily_usd_cap, total_usd_cap=settings.total_usd_cap,

@@ -61,6 +61,11 @@ SAFE_POLICY_LINE = re.compile(r"line \d{1,7}: must [ -~]{1,400}")
 UNPRINTABLE = re.compile(r"[^\x20-\x7e\n\t]")
 
 SHARED_KERNEL = "Sandboxes are containers, so they share this VM's kernel. gVisor isn't in use."
+OFF_SITE = [
+    "Sandboxes are containers, so they share the host's kernel. gVisor isn't in use.",
+    "Recorded on a development machine, not this server. Fixing this app runs AI-written code during its build, so it doesn't run on the public site.",
+    "FaultForge's checks found this bug and checked this fix, but they only cover the scenarios defined for this app.",
+]
 
 # The notes lifecycle.py adds to every report. tests/test_web.py keeps the two in step.
 LIFECYCLE_DISCLOSURES = frozenset({
@@ -184,6 +189,7 @@ class ContrastView(View):
     stock_before: int | None
     stock_after: int | None
     orders: int | None = Field(description="Orders added during the trial")
+    unit: Literal["ticket", "refresh token"] = "ticket"
     counts_source: Literal["measured_by_runner"] = "measured_by_runner"
     state_source: Literal["reported_by_target"] = "reported_by_target"
 
@@ -441,6 +447,7 @@ class ReplaySummaryView(View):
     fix_verified: bool
     has_fix: bool
     regression_checked: bool = False
+    recorded_on: Literal["dev_machine"] | None = None
 
 
 class ReplayView(View):
@@ -452,6 +459,8 @@ class ReplayView(View):
     target: TargetId
     result: RunView
     fix: FixView | None = None
+    # Set for a run recorded elsewhere. The page must then say this server didn't run it.
+    recorded_on: Literal["dev_machine"] | None = None
 
 
 class BudgetView(View):
@@ -538,7 +547,7 @@ def _orders(before: Mapping[str, int] | None, after: Mapping[str, int] | None) -
     return end - start if start is not None and end is not None else None
 
 
-def _trial_view(trial, names: Collection[str]) -> TrialView:
+def _trial_view(trial, names: Collection[str], capacity_field: str = "stock") -> TrialView:
     return TrialView(
         trial=trial.trial,
         kind=trial.kind,
@@ -551,8 +560,8 @@ def _trial_view(trial, names: Collection[str]) -> TrialView:
         rejected=trial.client.rejected,
         unexpected=trial.client.unexpected,
         transport_error=trial.client.transport_error,
-        stock_before=_int((trial.state_before or {}).get("stock")),
-        stock_after=_int((trial.state_after or {}).get("stock")),
+        stock_before=_int((trial.state_before or {}).get(capacity_field)),
+        stock_after=_int((trial.state_after or {}).get(capacity_field)),
         orders=_orders(trial.state_before, trial.state_after),
         invariants=[TrialInvariantView(name=_known(item.name, names), result=item.result) for item in trial.invariants],
     )
@@ -565,7 +574,7 @@ def _headline_trial(report: Report):
     return (completed or concurrent or [None])[0]
 
 
-def _contrast(report: Report) -> ContrastView | None:
+def _contrast(report: Report, capacity_field: str = "stock", unit: str = "ticket") -> ContrastView | None:
     trial = _headline_trial(report)
     if trial is None:
         return None
@@ -575,9 +584,10 @@ def _contrast(report: Report) -> ContrastView | None:
         rejected=trial.client.rejected,
         unexpected=trial.client.unexpected,
         transport_error=trial.client.transport_error,
-        stock_before=_int((trial.state_before or {}).get("stock")),
-        stock_after=_int((trial.state_after or {}).get("stock")),
+        stock_before=_int((trial.state_before or {}).get(capacity_field)),
+        stock_after=_int((trial.state_after or {}).get(capacity_field)),
         orders=_orders(trial.state_before, trial.state_after),
+        unit=unit,
     )
 
 
@@ -790,10 +800,10 @@ def build_run_view(result: SandboxResult, target: FixedTarget, project_dir: Path
         verdict=report.verdict if report else None,
         verdict_summary=_verdict_summary(report) if report else failure.message if failure else "No report.",
         completeness=CompletenessView(**report.completeness.model_dump()) if report else None,
-        contrast=_contrast(report) if report else None,
+        contrast=_contrast(report, target.capacity_field, target.unit) if report else None,
         violations=[_violation_view(item, names) for item in report.violations] if report else [],
         suspected_causes=[_cause_view(item) for item in report.hypotheses] if report else [],
-        trials=[_trial_view(item, names) for item in report.trials] if report else [],
+        trials=[_trial_view(item, names, target.capacity_field) for item in report.trials] if report else [],
         timeline=read_timeline(project_dir, report, headline.trial) if report and headline else None,
         performance=_performance_view(report) if report else None,
         comparison=_comparison_view(report, names) if report else None,
@@ -805,7 +815,7 @@ def build_run_view(result: SandboxResult, target: FixedTarget, project_dir: Path
         requests_sent=report.budget.requests_sent if report else None,
         probes=probes,
         host_verified=_host_verified(result),
-        disclosures=[*disclosures, SHARED_KERNEL],
+        disclosures=[*disclosures, *(OFF_SITE if target.off_site else [SHARED_KERNEL])],
     )
 
 

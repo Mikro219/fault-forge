@@ -1293,6 +1293,66 @@ def test_deploying_refuses_anything_but_a_clean_main(tmp_path: Path) -> None:
     assert other.returncode == 2 and "'feature'" in other.stderr
 
 
+def test_sportsdeck_can_be_watched_but_never_run_here(harness) -> None:
+    h = harness()
+    assert "sportsdeck" not in h.manager.targets
+    assert h.client.post("/api/runs", json={"target": "sportsdeck"}).status_code == 422
+    assert all(item["id"] != "sportsdeck" for item in h.client.get("/api/status").json()["targets"])
+
+
+def test_recorded_replays_on_disk_are_real_labelled_and_hold_nothing_private() -> None:
+    directory = ROOT / "demo" / "sportsdeck" / "replays"
+    for path in sorted(directory.glob("*.json")):
+        text = path.read_text(encoding="utf-8")
+        replay = ReplayView.model_validate_json(text)
+        assert replay.replay is True and replay.target == "sportsdeck" and replay.recorded_on == "dev_machine"
+        assert replay.result.verdict == "FAIL" and replay.fix is not None
+        assert any("development machine" in item for item in replay.result.disclosures)
+        assert not any("this VM" in item for item in replay.result.disclosures)
+        for forbidden in ("s3cr3t", "/home/", "/mnt/", "/tmp/", "sandbox-only-"):
+            assert forbidden not in text
+        passed = [item for item in replay.fix.attempts if item.passed]
+        if replay.fix.status == "verified":
+            assert passed and all(item.passed for item in passed[0].regression) and passed[0].regression
+        else:
+            assert not passed
+
+
+def test_a_recorded_replay_is_served_and_says_where_it_came_from(tmp_path: Path) -> None:
+    recorded = tmp_path / "recorded"
+    recorded.mkdir()
+    source = fixtures_replay("sportsdeck", "dev_machine")
+    (recorded / f"{source['id']}.json").write_text(json.dumps(source), encoding="utf-8")
+    store = ReplayStore(tmp_path / "stored", 5, recorded_dir=recorded)
+    store.load()
+    assert store.get(source["id"]).recorded_on == "dev_machine"
+    assert next(item for item in store.summaries() if item.id == source["id"]).recorded_on == "dev_machine"
+    assert not list((tmp_path / "stored").glob("*.json"))
+
+
+def test_the_real_server_loads_the_recordings_and_a_plain_one_doesnt(harness, tmp_path: Path) -> None:
+    settings = WebSettings.from_env({"FF_DATA_DIR": str(tmp_path)})
+    assert settings.recorded_replays_dir == ROOT / "demo" / "sportsdeck" / "replays"
+    shipped = {path.stem for path in settings.recorded_replays_dir.glob("*.json")}
+    assert shipped
+    store = ReplayStore(tmp_path / "replays", 5, recorded_dir=settings.recorded_replays_dir)
+    store.load()
+    assert {item.id for item in store.summaries()} == shipped
+    assert all(item.recorded_on == "dev_machine" and item.target == "sportsdeck" for item in store.summaries())
+    assert harness().client.get("/api/replays").json()["replays"] == []
+
+
+def fixtures_replay(target: str, recorded_on: str | None) -> dict:
+    spec = importlib.util.spec_from_file_location("web_states_for_replay", ROOT / "tests" / "fixtures" / "web_states.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return {
+        "id": "r_" + "9" * 16, "replay": True, "recorded_at": "2026-11-07T00:00:00+00:00", "target": target, "recorded_on": recorded_on,
+        "result": {**module.run_view(), "target": target},
+        "fix": module.fix("verified", [module.attempt(1, True, None)], "fix_verified", "FaultForge verified the fix."),
+    }
+
+
 def test_defaults_match_the_limits_asked_for(tmp_path: Path) -> None:
     settings = WebSettings(data_dir=tmp_path)
     assert (settings.queue_limit, settings.cooldown_s) == (3, 30.0)

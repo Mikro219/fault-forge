@@ -279,6 +279,20 @@ def states() -> dict:
             {"scenario": "sold-out", "passed": True, "verdict": "PASS", "state_verification": "matched", "failure_reason": None, "failed_invariants": []},
         ],
     )
+    def token_view(view: dict) -> dict:
+        changed = copy.deepcopy(view)
+        changed["target"] = "sportsdeck"
+        changed["contrast"]["unit"] = "refresh token"
+        changed["disclosures"] = ["Recorded on a development machine, not this server."]
+        return changed
+
+    stack_attempt = attempt(1, True, None, candidate=token_view(candidate()))
+    stack_replay = {
+        "id": "r_" + "3" * 16, "replay": True, "recorded_at": "2026-11-07T08:00:00+00:00", "target": "sportsdeck", "recorded_on": "dev_machine",
+        "result": token_view(run_view()), "fix": fix("verified", [attempt(1, False, "regression_failed", regression=[
+            {"scenario": "forged-signature-rejected", "passed": False, "verdict": "FAIL", "state_verification": "matched", "failure_reason": "candidate_fail", "failed_invariants": ["The stored token isn't consumed"]},
+        ], candidate=token_view(candidate()), gate_failed=["regression_suite"]), {**stack_attempt, "attempt": 2}], "fix_verified", "FaultForge verified the fix."),
+    }
     budget = copy.deepcopy(status(agent_enabled=False, agent_disabled_reason="daily_usd_cap"))
     budget["budget"]["exhausted"] = True
     result = {
@@ -307,6 +321,7 @@ def states() -> dict:
         "hostile": {**base, "run": run_state(result=hostile_result())},
         "failed": {**base, "run": run_state("failed", failed, names=("queued", "sandbox_started", "failed"))},
         "replay": {**base, "replay": replay},
+        "stack-replay": {**base, "replay": stack_replay},
         "replay-budget": {**base, "status": budget, "replay": replay},
     }
     result["hostile-strings"] = {

@@ -14,6 +14,7 @@ AGENT_REASONING_EFFORT = "low"
 # USD per 1M tokens, from https://api.vultrinference.com/docs/models. Confirm in the console (V3.9).
 AGENT_PRICES = {AGENT_MODEL: ModelPrice(0.75, 3.00)}
 DEFAULT_DATA_DIR = Path(".faultforge") / "web"
+DEMO_ROOT = Path(__file__).resolve().parents[3] / "demo"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -38,6 +39,8 @@ class WebSettings:
     maintenance_interval_s: float = 60.0
     shutdown_timeout_s: float = 120.0
     health_ttl_s: float = 5.0
+    # Replays recorded on a development machine and shipped with the code. Only ever read.
+    recorded_replays_dir: Path | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "WebSettings":
@@ -51,6 +54,7 @@ class WebSettings:
             daily_token_cap=int(_number(env, "FF_DAILY_TOKEN_CAP", cls.daily_token_cap)),
             retention_age_s=_number(env, "FF_RETENTION_AGE_S", cls.retention_age_s),
             retention_keep=int(_number(env, "FF_RETENTION_KEEP", cls.retention_keep)),
+            recorded_replays_dir=DEMO_ROOT / "sportsdeck" / "replays",
         )
 
 

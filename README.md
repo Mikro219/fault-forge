@@ -106,11 +106,19 @@ The fourth exists because a fix can create a new bug. A fix that sets stock to 0
 | Live agent on the public site, `glm-5.3@low`, before regression checks existed | The first 3 live fixes passed the three-condition gate on attempt 1, at $0.005 to $0.009 each. Two were timed: 8.5 s and 15.5 s |
 | Forged fix | Fooled the report alone; the database check caught it (reported 0 orphaned holds, database had 19) |
 | Hostile build on the VM, 9 attacks | 8 blocked, absent or stopped by a limit; CPU limited, not blocked. `INCONCLUSIVE`, server healthy, 0 containers left |
-| Tests and review | 960 tests pass. Independent reviews found a blocker and serious issues, which were fixed |
+| Tests and review | 964 tests pass. Independent reviews found a blocker and serious issues, which were fixed |
 
 **Model trial** on a dev machine, before regression checks existed, fixes that passed the three-condition gate out of 10 tries each, $0.12 for all 60: `glm-5.3@low` 10; `mimo-v2.6-pro@none` 8; `deepseek-v4.1-flash-1017@none` 8; `glm-5.3-flash@low` 7; `qwen3.8-flash-next@none` 6; `qwen3.8-27b@none` 5.
 
 [docs/VERIFIED.md](docs/VERIFIED.md) records how tools and limits behaved when tested.
+
+## On a real app
+
+`demo/sportsdeck` runs the same loop on a course project, a Next.js, Postgres and Redis service with no test hooks of its own. Its refresh-token route let one token be redeemed several times under concurrent requests: 2 to 20 accepted per trial, against 1 when the same requests are sent one at a time. In 14 real tries, `glm-5.3` got a fix verified in every one, sometimes after retries.
+
+The gate is only as good as its scenarios, and this showed it. One model fix solved the race but dropped the signature check, and passed, because nothing covered that. After a scenario was added for it, that scenario caught a different model fix that consumed a token before checking its signature, and the model corrected it on its next attempt.
+
+The site shows these as replays labelled as recorded on a development machine, and every recorded try is listed. Visitors can't run this target: `next build` runs AI-written code, and that doesn't belong on a host whose app user can control Docker. A full cycle also takes about 4 minutes. See [docs/VERIFIED.md](docs/VERIFIED.md).
 
 ## Honest limits
 
@@ -119,6 +127,7 @@ The fourth exists because a fix can create a new bug. A fix that sets stock to 0
 - **The payment provider is a stub:** in-process, with a fixed 50 ms delay, which widens the race window.
 - **State comes from the target's own hook.** The direct database check covers the final trial only, and hostile code could edit its own database, which the check would then agree with.
 - **The AST code rules are defence in depth,** not proof.
+- **Code written to cheat could still pass.** A fix owns its own database, so it could also fake the state the host reads, for example by keeping real state in memory. The gate is strong evidence against honest bugs, not proof against an adversary.
 - **`fix_verified` is narrow.** It means the invariants held for this workload, these trials and this code, not that the race can never happen.
 - **Fixed targets only.** Visitors can't upload code, so this demo doesn't test arbitrary applications.
 - **FaultForge doesn't judge design quality.** In the model trial, some passing fixes from other models used an in-process lock, which wouldn't hold across workers.

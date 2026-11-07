@@ -9,7 +9,7 @@ from typing import Literal, get_args
 from faultforge import config as config_module, fix_agent
 from faultforge.sandbox import TICKET_API_STATE_VERIFIER, TargetSpec
 
-TargetId = Literal["ticket-api", "hostile-build"]
+TargetId = Literal["ticket-api", "hostile-build", "sportsdeck"]
 TARGET_IDS: tuple[str, ...] = get_args(TargetId)
 DEMO_ROOT = Path(__file__).resolve().parents[3] / "demo"
 
@@ -36,12 +36,29 @@ class FixedTarget:
     invariant_names: frozenset[str]
     disclosures: frozenset[str]
     agent: AgentInputs | None = None
+    # The state field that limits what can be accepted, and what it counts, for the page's headline.
+    capacity_field: str = "stock"
+    unit: str = "ticket"
+    # True for a run recorded on a development machine and only ever shown as a replay.
+    off_site: bool = False
 
 
 def _trusted_config_text(config_path: Path, scenario_id: str) -> tuple[frozenset[str], frozenset[str]]:
     config = config_module.parse_config(config_path.read_text(encoding="utf-8"))
     scenario = config_module.find_scenario(config, scenario_id)
     return frozenset(item.name for item in scenario.invariants), frozenset(scenario.disclosures)
+
+
+def sportsdeck_replay_target(demo_root: Path = DEMO_ROOT) -> FixedTarget:
+    """For recording replays. It isn't in load_targets, so no request can ever run it on the server:
+    its builds run AI-written code, which doesn't belong on a host whose app user controls Docker."""
+    config = demo_root / "sportsdeck" / "faultforge.yaml"
+    names, disclosures = _trusted_config_text(config, "refresh-token-race")
+    return FixedTarget(
+        id="sportsdeck", title="SportsDeck", description="A real Next.js app with a token race.",
+        scenario_id="refresh-token-race", spec=TargetSpec(app_source=b"", config_path=config),
+        invariant_names=names, disclosures=disclosures, capacity_field="live_tokens", unit="refresh token", off_site=True,
+    )
 
 
 def load_targets(demo_root: Path = DEMO_ROOT) -> MappingProxyType:

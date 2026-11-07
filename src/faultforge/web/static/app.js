@@ -105,11 +105,14 @@ const statusPill = s => s === "fail" ? h`<span class="pill fail">${I.x} Failed</
 const okMark = b => b ? h`<span class="pill pass">${I.check} Yes</span>` : h`<span class="pill fail">${I.x} No</span>`;
 const step = (no, title, aside) => h`<div class="step"><span class="no">Step ${no}</span><h2>${title}</h2>${aside ? h`<span class="aside">${aside}</span>` : ""}</div>`;
 const trialsLine = result => result.completeness ? `${result.completeness.trials_completed}/${result.completeness.trials_planned} trials complete` : "No trials complete";
-const targetName = id => (S.status && list(S.status.targets).find(t => t.id === id) || {}).title || id;
+const REPLAY_ONLY_TITLES = { sportsdeck: "SportsDeck" };
+const targetName = id => (S.status && list(S.status.targets).find(t => t.id === id) || {}).title || REPLAY_ONLY_TITLES[id] || id;
+const unitOf = c => (c && c.unit) || "ticket";
+const EDITED_FILE = { sportsdeck: "src/app/api/auth/refresh/route.ts" };
 
 /* ---------- state ---------- */
 const S = {
-  status: null, statusFailed: false, replays: [], proofs: { ticket: null, hostile: null }, target: null,
+  status: null, statusFailed: false, replays: [], proofs: { ticket: null, hostile: null, stack: null }, target: null,
   view: "start", current: null, replayMode: false,
   notice: null, cooldownUntil: 0, fixNotice: null, pollNote: null,
 };
@@ -157,20 +160,21 @@ function replaySummary(r) {
   return { FAIL: "Violation proven", PASS: "Invariants held", INCONCLUSIVE: "Not enough evidence. This isn't a pass." }[r.verdict] || "No verdict";
 }
 /* The start page's proof: real recorded runs, drawn only if they hold up. There's no placeholder. */
-function ticketProof(r) {
+function ticketProof(r, id, extra) {
   if (!r || !r.result || !r.fix) return "";
   const chosen = list(r.fix.attempts).find(a => a.passed);
   if (!chosen || !gateFor(r.result, r.fix, chosen).verified) return "";
   const before = r.result.contrast, after = chosen.candidate.contrast;
   if (!before || !after || before.stock_before == null) return "";
-  return h`<article class="proof" id="proof-ticket">
-    <div class="proof-h"><span class="pill info">Replay</span><b>${targetName(r.target)}</b><span class="sp muted small mono">${when(r.recorded_at)}</span></div>
+  const earlier = list(r.fix.attempts).filter(a => a !== chosen && list(a.regression).some(item => !item.passed)).length;
+  return h`<article class="proof ${extra || ""}" id="${id || "proof-ticket"}">
+    <div class="proof-h"><span class="pill info">Replay</span><b>${targetName(r.target)}</b>${r.recorded_on === "dev_machine" ? h`<span class="chip">Recorded on a development machine</span>` : ""}<span class="sp muted small mono">${when(r.recorded_at)}</span></div>
     <div class="proof-flow">
-      <div class="proof-step"><span class="pill fail">${I.x} FAIL</span><span class="proof-big bad">${before.accepted} accepted</span><span class="fg2 small">for ${plural(num(before.stock_before), "ticket")}${num(before.rejected) || num(before.unexpected) || num(before.transport_error) ? "" : ", and every response said success"}</span></div>
+      <div class="proof-step"><span class="pill fail">${I.x} FAIL</span><span class="proof-big bad">${before.accepted} accepted</span><span class="fg2 small">for ${plural(num(before.stock_before), unitOf(before))}${num(before.rejected) || num(before.unexpected) || num(before.transport_error) ? "" : ", and every response said success"}</span></div>
       <span class="proof-arrow">${I.arrow}</span>
       <div class="proof-step"><span class="pill pass">${I.check} Fix verified</span><span class="proof-big">${after.accepted} accepted</span><span class="fg2 small">${after.rejected} rejected, under the same workload</span></div>
     </div>
-    <div class="proof-f"><span class="muted small">${chosen.model || r.fix.model} wrote the fix on attempt ${chosen.attempt}, for ${usd(chosen.cost_usd)}.${list(chosen.regression).length ? "" : " It wasn't checked against other scenarios."}</span><button class="btn sm sp" data-act="replay" data-id="${r.id}">${I.play} Watch this run</button></div>
+    <div class="proof-f"><span class="muted small">${chosen.model || r.fix.model} wrote the fix on attempt ${chosen.attempt}, for ${usd(chosen.cost_usd)}.${list(chosen.regression).length ? (earlier ? ` A regression scenario caught ${plural(earlier, "earlier attempt")}.` : "") : " It wasn't checked against other scenarios."}</span><button class="btn sm sp" data-act="replay" data-id="${r.id}">${I.play} Watch this run</button></div>
   </article>`;
 }
 function hostileProof(r) {
@@ -188,8 +192,12 @@ function hostileProof(r) {
 function renderProofs() {
   const ticket = ticketProof(S.proofs.ticket), hostile = hostileProof(S.proofs.hostile);
   if (!ticket && !hostile) return "";
-  return h`<section class="proofs" aria-label="Recorded runs"><div class="proof-title"><span class="eyebrow">What a real run found</span><span class="muted small">Recorded on this server. Nothing here is live until you press Run.</span></div>
+  return h`<section class="proofs" aria-label="Recorded runs"><div class="proof-title"><span class="eyebrow">What a real run found</span><span class="muted small">Recordings of real runs. Nothing here is live until you press Run.</span></div>
     <div class="proof-grid">${ticket}${hostile}</div></section>`;
+}
+function renderRealApp() {
+  const stack = ticketProof(S.proofs.stack, "proof-stack", "wide");
+  return stack ? h`<section class="panel real-app"><div class="ph"><h2>On a real app</h2><span class="sp muted small">the same find, fix and prove loop on a Next.js, Postgres and Redis service</span></div><div class="pb">${stack}</div></section>` : "";
 }
 function renderStart() {
   const status = S.status;
@@ -215,11 +223,12 @@ function renderStart() {
     ${startNotices(status)}
     <div class="start-actions">${btn}${hasReplays && (cooling || full || (status && status.budget.exhausted)) ? h`<button class="runbtn alt" data-act="replay" data-id="${S.replays[0].id}">${I.play} Watch a replay</button>` : ""}<span class="muted small">You can't upload code or change settings.</span></div>
   </section>
+  ${renderRealApp()}
   ${hasReplays ? h`<section class="panel">
     <div class="ph"><h2>Past runs</h2><span class="sp muted small">recorded real runs, played back as replays</span></div>
     <div class="replays">${S.replays.map(r => h`<div class="replay-row">
       <span class="pill info">Replay</span><span class="hide-sm">${pillFor(r.verdict)}</span>
-      <span><b>${targetName(r.target)}</b> <span class="fg2">· ${replaySummary(r)}</span></span>
+      <span><b>${targetName(r.target)}</b> <span class="fg2">· ${replaySummary(r)}${r.recorded_on === "dev_machine" ? ", recorded on a development machine" : ""}</span></span>
       <span class="mono muted small hide-sm">${when(r.recorded_at)}</span>
       <button class="btn sm" data-act="replay" data-id="${r.id}" aria-label="Watch the replay of ${targetName(r.target)}, ${when(r.recorded_at)}">Watch</button></div>`)}</div>
   </section>` : ""}`;
@@ -291,7 +300,8 @@ function stockFor(result, tl) {
   const c = result.contrast;
   return c && c.trial === tl.trial && c.stock_before != null ? num(c.stock_before) : null;
 }
-function timelineChart(tl, stock, sharedEnd) {
+function timelineChart(tl, stock, sharedEnd, unit) {
+  const noun = unit || "ticket";
   const rows = list(tl.points);
   if (!rows.length) return "";
   const maxEnd = Math.max(1, sharedEnd || 0, ...rows.map(pointEnd));
@@ -311,18 +321,18 @@ function timelineChart(tl, stock, sharedEnd) {
     const y = top + i * (rh + gap);
     const cls = beyond.has(r) ? "t-over" : r.outcome === "accepted" ? "t-acc" : r.outcome === "rejected" ? "t-rej" : "t-unx";
     if (!dense) parts.push(h`<text class="t-lbl" x="${L - 8}" y="${y + rh - 2}" text-anchor="end">#${String(i + 1).padStart(2, "0")}</text>`);
-    parts.push(h`<rect class="${cls}" x="${f1(x(r.offset_ms))}" y="${y}" width="${f1(Math.max(2, x(pointEnd(r)) - x(r.offset_ms)))}" height="${rh}"><title>request ${i + 1} · ${beyond.has(r) ? "accepted with no ticket behind it" : r.outcome} · ${r.duration_ms} ms</title></rect>`);
+    parts.push(h`<rect class="${cls}" x="${f1(x(r.offset_ms))}" y="${y}" width="${f1(Math.max(2, x(pointEnd(r)) - x(r.offset_ms)))}" height="${rh}"><title>request ${i + 1} · ${beyond.has(r) ? `accepted with no ${noun} behind it` : r.outcome} · ${r.duration_ms} ms</title></rect>`);
   });
   const ok = accepted.length, over = beyond.size, rej = rows.filter(r => r.outcome === "rejected").length, other = rows.length - ok - rej;
   return h`<div class="legend">
-      <span class="lg"><span class="sw acc"></span>${stock == null ? `Accepted (${ok})` : `Accepted, within stock (${ok - over})`}</span>
-      ${over ? h`<span class="lg"><span class="sw over"></span>Accepted, no ticket behind it (${over})</span>` : ""}
+      <span class="lg"><span class="sw acc"></span>${stock == null ? `Accepted (${ok})` : `Accepted, within the limit (${ok - over})`}</span>
+      ${over ? h`<span class="lg"><span class="sw over"></span>Accepted, no ${noun} behind it (${over})</span>` : ""}
       <span class="lg"><span class="sw rej"></span>Rejected, expected (${rej})</span>
       ${other ? h`<span class="lg"><span class="sw unx"></span>Unexpected or transport error (${other})</span>` : ""}
       ${overlap && overlap.peak >= 2 ? h`<span class="lg"><span class="sw win"></span>${overlap.peak} in flight at once</span>` : ""}
     </div>
     <div class="tl-wrap" tabindex="0" aria-label="Request timeline, scrollable"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Request timeline: ${ok} accepted, ${rej} rejected, ${other} other">${parts}</svg></div>
-    ${over ? h`<p class="muted small">Bars are marked in the order requests finished. Which request "got" the ticket doesn't matter: the proof is the count.</p>` : ""}
+    ${over ? h`<p class="muted small">Bars are marked in the order requests finished. Which request "got" the ${noun} doesn't matter: the proof is the count.</p>` : ""}
     ${tl.truncated ? h`<p class="muted small">An evenly spaced sample of ${rows.length} of ${tl.total_requests} requests.</p>` : ""}`;
 }
 function latencyText(performance) {
@@ -333,7 +343,7 @@ function timeline(result) {
   const tl = result.timeline;
   if (!list(tl.points).length) return "";
   return h`<section class="panel" id="timeline"><div class="ph"><h2>Request timeline · trial ${tl.trial}</h2><span class="sp lat">${latencyText(result.performance)}</span></div>
-    <div class="pb stack">${timelineChart(tl, stockFor(result, tl))}</div></section>`;
+    <div class="pb stack">${timelineChart(tl, stockFor(result, tl), 0, unitOf(result.contrast))}</div></section>`;
 }
 function timelineBeforeAfter(baseline, candidate) {
   const before = baseline.timeline, after = candidate.timeline;
@@ -342,8 +352,8 @@ function timelineBeforeAfter(baseline, candidate) {
   const sharedEnd = Math.max(...list(before.points).map(pointEnd), ...list(after.points).map(pointEnd));
   return h`<section class="panel" id="timeline"><div class="ph"><h2>Request timeline · before and after</h2><span class="sp lat">same time scale · latency doesn't affect the verdict</span></div>
     <div class="pb stack">
-      <div class="eyebrow">Before the fix · trial ${before.trial}</div>${timelineChart(before, stockFor(baseline, before), sharedEnd)}
-      <div class="eyebrow tl-next">After the fix · trial ${after.trial}</div>${timelineChart(after, stockFor(candidate, after), sharedEnd)}
+      <div class="eyebrow">Before the fix · trial ${before.trial}</div>${timelineChart(before, stockFor(baseline, before), sharedEnd, unitOf(baseline.contrast))}
+      <div class="eyebrow tl-next">After the fix · trial ${after.trial}</div>${timelineChart(after, stockFor(candidate, after), sharedEnd, unitOf(candidate.contrast))}
     </div></section>`;
 }
 
@@ -352,19 +362,20 @@ function renderLedger(result) {
   if (!c) return "";
   const n = num(c.accepted), known = c.stock_before != null, stock = num(c.stock_before), oversold = known && n > stock;
   const shown = Math.min(n, 200);
-  const stubs = Array.from({ length: shown }, (_, i) => i < stock ? h`<span class="stub real">Ticket</span>` : h`<span class="stub over" aria-hidden="true">×</span>`);
+  const noun = unitOf(c), token = noun !== "ticket";
+  const stubs = Array.from({ length: shown }, (_, i) => i < stock ? h`<span class="stub real">${token ? "Token" : "Ticket"}</span>` : h`<span class="stub over" aria-hidden="true">×</span>`);
   const countsSource = c.counts_source === "measured_by_runner" ? "measured by the runner" : c.counts_source;
   const stateSource = c.state_source === "reported_by_target" ? "reported by the target" : c.state_source;
   const others = [plural(num(c.rejected), "rejection"), `${num(c.unexpected)} unexpected`, plural(num(c.transport_error), "transport error")].join(", ");
   return h`<section class="panel" id="contrast"><div class="ph"><h2>What the app said vs. what happened</h2><span class="sp muted small">trial ${c.trial}</span></div>
   <div class="pb ledger">
-    ${known ? h`<div class="ledger-head"><span class="big">${n} accepted${oversold ? h`<span class="ne" aria-label="but only">≠</span>` : h`<span class="muted"> · </span>`}${stock} in stock</span></div>
-    <div class="stubs" role="img" aria-label="${n} confirmations: ${Math.min(n, stock)} backed by a real ticket, ${Math.max(0, n - stock)} with no ticket behind them">${stubs}</div>
+    ${known ? h`<div class="ledger-head"><span class="big">${n} accepted${oversold ? h`<span class="ne" aria-label="but only">≠</span>` : h`<span class="muted"> · </span>`}${stock} ${token ? "valid" : "in stock"}</span></div>
+    <div class="stubs" role="img" aria-label="${n} confirmations: ${Math.min(n, stock)} backed by a real ${noun}, ${Math.max(0, n - stock)} with no ${noun} behind them">${stubs}</div>
     ${n > shown ? h`<p class="muted small">Showing ${shown} of ${n}.</p>` : ""}
-    <div class="stub-key"><span><span class="stub real key"></span>backed by stock (${Math.min(n, stock)})</span><span><span class="stub over key"></span>confirmed with no ticket behind it (${Math.max(0, n - stock)})</span></div>` : ""}
+    <div class="stub-key"><span><span class="stub real key"></span>${token ? "the one valid redemption" : "backed by stock"} (${Math.min(n, stock)})</span><span><span class="stub over key"></span>confirmed with no ${noun} behind it (${Math.max(0, n - stock)})</span></div>` : ""}
     <div class="facts">
       <div class="fact"><span class="k">Accepted</span><span class="v ${oversold ? "bad" : ""}">${n}</span><span class="n">requests accepted, with ${others}</span><span><span class="chip src">${countsSource}</span></span></div>
-      ${known ? h`<div class="fact"><span class="k">In stock</span><span class="v">${stock}</span><span class="n">before the trial</span><span><span class="chip src">${stateSource}</span></span></div>` : ""}
+      ${known ? h`<div class="fact"><span class="k">${token ? "Valid" : "In stock"}</span><span class="v">${stock}</span><span class="n">before the trial</span><span><span class="chip src">${stateSource}</span></span></div>` : ""}
       ${c.orders != null ? h`<div class="fact"><span class="k">Recorded</span><span class="v">${plural(num(c.orders), "order")}</span><span class="n">${c.stock_after != null ? `stock reads ${c.stock_after} afterwards` : "during the trial"}</span><span><span class="chip src">${stateSource}</span></span></div>` : ""}
     </div>
   </div></section>`;
@@ -426,13 +437,13 @@ function renderDisclosures(result) {
 /* ---------- 3 · FAIL ---------- */
 function failHeadline(result) {
   const c = result.contrast;
-  if (c && c.stock_before != null && num(c.accepted) > num(c.stock_before)) return `${c.accepted} requests were accepted for ${plural(num(c.stock_before), "ticket")}.`;
+  if (c && c.stock_before != null && num(c.accepted) > num(c.stock_before)) return `${c.accepted} requests were accepted for ${plural(num(c.stock_before), unitOf(c))}.`;
   return result.verdict_summary;
 }
 function failSub(result) {
   const c = result.contrast;
   if (!c || num(c.rejected) || num(c.unexpected) || num(c.transport_error)) return "";
-  return `Every request got a success response${c.stock_after != null && num(c.stock_after) >= 0 ? `, and the stock counter reads ${c.stock_after}` : ""}, so the app looks healthy. It wasn't.`;
+  return `Every request got a success response${c.stock_after != null && num(c.stock_after) >= 0 && unitOf(c) === "ticket" ? `, and the stock counter reads ${c.stock_after}` : ""}, so the app looks healthy. It wasn't.`;
 }
 function renderTrialStrip(result) {
   const finished = list(result.trials).filter(t => t.status === "completed");
@@ -475,7 +486,7 @@ function costLine(a, model, solo) {
 }
 function diffView(a, model) {
   const d = parseDiff(a.diff);
-  return h`<div class="diff"><div class="diff-h"><span>app.py</span><span class="pass-t">+${d.adds}</span><span class="fail-t">−${d.dels}</span><span class="sp"><span class="chip ai">AI-written code. Runs only in the sandbox.</span></span></div>
+  return h`<div class="diff"><div class="diff-h"><span>${(S.current && EDITED_FILE[S.current.target]) || "app.py"}</span><span class="pass-t">+${d.adds}</span><span class="fail-t">−${d.dels}</span><span class="sp"><span class="chip ai">AI-written code. Runs only in the sandbox.</span></span></div>
     <div class="diff-body" tabindex="0" aria-label="Diff of attempt ${a.attempt}"><table><tbody>${d.rows.map(([k, code]) => h`<tr class="${k === "+" ? "add" : k === "-" ? "del" : k === "@" ? "hunk" : ""}"><td class="g">${k === "+" || k === "-" ? k : ""}<span class="sr">${k === "+" ? "added" : k === "-" ? "removed" : ""}</span></td><td>${code}</td></tr>`)}</tbody></table></div>
     ${a.diff_truncated ? h`<div class="diff-note">The diff is cut off here because it's very long.</div>` : ""}
     ${costLine(a, model)}</div>`;
@@ -552,7 +563,7 @@ function renderFixState(st) {
 }
 const backRow = () => h`<div><button class="btn" data-act="home">Start a new run</button></div>`;
 const nextStep = (title, body, label, target) => h`<section class="panel next" id="next-step"><div class="next-b"><span class="eyebrow">Next</span><b>${title}</b><span class="fg2">${body}</span></div><button class="runbtn" data-act="go" data-target="${target}">${I.play} ${label}</button></section>`;
-const RUN_LIVE = target => nextStep("Run this yourself, live", "Everything above was recorded. This starts a new sandbox now, with the same fixed target.", "Run it live", target);
+const RUN_LIVE = target => REPLAY_ONLY_TITLES[target] ? nextStep("Try a live run on this server", `${REPLAY_ONLY_TITLES[target]} only appears here as a recording. The Ticket API goes through the same find, fix and prove loop, live.`, "Run the Ticket API", "ticket-api") : nextStep("Run this yourself, live", "Everything above was recorded. This starts a new sandbox now, with the same fixed target.", "Run it live", target);
 
 /* ---------- 6 · verification: "Fix verified" appears only when every part of the gate holds ---------- */
 function gateFor(baseline, fix, attempt) {
@@ -761,7 +772,7 @@ function render() {
   }
   mount("topRight", renderTop());
   const replay = S.view === "run" && S.current && S.current.replay;
-  mount("replayBanner", replay ? h`<div class="replay" role="note" id="replay-banner"><div class="replay-in"><b>Replay, not live</b><span class="mono">Recorded ${when(S.current.recorded_at)} · run ${S.current.id}</span><span class="small">Nothing on this page is happening now.</span></div></div>` : "");
+  mount("replayBanner", replay ? h`<div class="replay" role="note" id="replay-banner"><div class="replay-in"><b>Replay, not live</b><span class="mono">Recorded ${when(S.current.recorded_at)} · run ${S.current.id}</span><span class="small">${S.current.recorded_on === "dev_machine" ? "Recorded on a development machine, not this server. Nothing on this page is happening now." : "Nothing on this page is happening now."}</span></div></div>` : "");
   if (main === lastHtml) return;
   lastHtml = main;
   const open = [...document.querySelectorAll("details[data-key][open]")].map(d => d.dataset.key);
@@ -791,6 +802,7 @@ async function refreshProofs() {
   const latest = {
     ticket: S.replays.find(r => r.target === "ticket-api" && r.fix_verified && r.has_fix),
     hostile: S.replays.find(r => r.target === "hostile-build"),
+    stack: S.replays.find(r => r.target === "sportsdeck" && r.fix_verified && r.regression_checked),
   };
   for (const kind of Object.keys(latest)) {
     const item = latest[kind];

@@ -20,6 +20,7 @@ from faultforge.web.viewmodel import ReplaySummaryView, ReplayView
 logger = logging.getLogger("faultforge.web")
 SAFE_ID = re.compile(r"r_[a-f0-9]{16}")
 MAX_REPLAY_BYTES = 4 * 1024 * 1024
+MAX_RECORDED_LOADED = 16
 MAX_REPLAYS_LOADED = 500
 
 
@@ -31,15 +32,20 @@ class ReplayStore:
     """Replays are never deleted, so growth is bounded by storing only the first few of each kind:
     a target, a verdict, and whether a fix ran. A stored run gains its fix if that kind has room."""
 
-    def __init__(self, directory: Path, per_kind: int):
+    def __init__(self, directory: Path, per_kind: int, recorded_dir: Path | None = None):
         self.directory = directory
         self.per_kind = per_kind
+        # Runs recorded on a development machine, shipped with the code. Only ever read.
+        self.recorded_dir = recorded_dir
         self._lock = threading.Lock()
         self._replays: dict[str, ReplayView] = {}
 
     def load(self) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
-        for path in sorted(self.directory.glob("*.json"))[:MAX_REPLAYS_LOADED]:
+        paths = sorted(self.directory.glob("*.json"))[:MAX_REPLAYS_LOADED]
+        if self.recorded_dir is not None:
+            paths += sorted(self.recorded_dir.glob("*.json"))[:MAX_RECORDED_LOADED]
+        for path in paths:
             try:
                 if path.is_symlink() or path.stat().st_size > MAX_REPLAY_BYTES:
                     raise ValueError("not a plain, small file")
@@ -86,6 +92,7 @@ class ReplayStore:
                 fix_verified=any(attempt.passed for attempt in item.fix.attempts) if item.fix else False,
                 has_fix=item.fix is not None,
                 regression_checked=_regression_checked(item),
+                recorded_on=item.recorded_on,
             )
             for item in replays
         ]

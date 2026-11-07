@@ -206,7 +206,7 @@ details.evidence>.stack{margin-top:16px}
 
 /* ---------- proven / suspected ---------- */
 .ps{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:16px;align-items:start}
-.inv-row{display:grid;grid-template-columns:84px minmax(0,1fr) auto;gap:4px 14px;padding:13px 16px;border-bottom:1px solid var(--line);align-items:start;border-left:3px solid transparent}
+.inv-row{display:grid;grid-template-columns:84px minmax(0,1fr) minmax(0,1fr);gap:4px 14px;padding:13px 16px;border-bottom:1px solid var(--line);align-items:start;border-left:3px solid transparent}
 .inv-row:last-child{border-bottom:0}
 .inv-row.fail{border-left-color:var(--fail)}
 .inv-row.pass{border-left-color:var(--pass)}
@@ -413,6 +413,7 @@ details.attempt:not([open])>summary{border-bottom:0}
 .proofs{display:grid;gap:10px}
 .proof-title{display:flex;gap:6px 12px;flex-wrap:wrap;align-items:baseline}
 .proof-grid{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:12px}
+.proof.wide{grid-column:1 / -1}
 .proof{display:grid;gap:12px;align-content:space-between;background:var(--sunk);border:1px solid var(--line);padding:14px 16px;min-width:0}
 .proof-h,.proof-f{display:flex;align-items:center;gap:8px 10px;flex-wrap:wrap}
 .proof-h .sp,.proof-f .sp{margin-left:auto}

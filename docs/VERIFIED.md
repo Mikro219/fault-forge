@@ -131,6 +131,8 @@ Third trial, with that scenario, $0.0340: all 3 tries were verified. **In try 1 
 - The route's `build` script sets its own `NODE_OPTIONS`, so the 2560 MB heap setting has no effect. The 3 GB container limit still applies.
 - Everything ran on the dev machine. The 4 GB VM hasn't been tried.
 
+**The recorded replays:** 5 tries, $0.0239, all kept in `demo/sportsdeck/replays`. All 5 were verified on the first attempt, with the signature rule now in the business rules, so these recordings don't show a regression catch. Unfixed, the first trial of each accepted 2 or 20 requests, and later trials 4 to 19. A verified attempt took about 230 s.
+
 ## Sealed builds (2026-11-07, local only)
 
 `next build` does run AI-written code. A hostile route, with the rule check skipped on purpose, reported what it could reach from inside a real build: writes to `/app` and `/etc` failed, a connection to `1.1.1.1:443` failed, it ran as uid 1000, no secret-like variable names were present, there was no Docker socket, and `DATABASE_URL` held only the image's `localhost:5432` placeholder.
