@@ -38,7 +38,7 @@ Then run `systemctl restart faultforge`. Confirm the model's price in the Vultr 
 
 ## Checklist on the VM
 
-Nothing here has been run on a VM yet, so check each one.
+These were checked on the first deployment on 2026-11-06. Repeat them on any new VM.
 
 - [ ] `docker info --format '{{.SecurityOptions}}'` lists `apparmor`, as well as `seccomp` and `cgroupns`. This couldn't be checked under WSL2.
 - [ ] A run's container uses the profile: during a run, `docker ps -q --filter label=faultforge.sandbox | xargs docker inspect --format '{{.AppArmorProfile}}'` prints `docker-default`.

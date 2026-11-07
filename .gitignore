@@ -6,5 +6,9 @@ __pycache__/
 .pytest_cache/
 .env
 
+# Local working notes, not published
+plans/
+docs/SUBMISSION.md
+
 # Clanker local config
 .claude/clanker.local.md

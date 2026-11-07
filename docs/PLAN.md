@@ -1,6 +1,6 @@
 # FaultForge — Plan v3 (Vultr Agent Rush: Blast Radius Zero)
 
-Status: **M0 done. v3 milestones awaiting approval.** Team: one person plus Claude Code.
+Status: **M0 to M6 done and live on a Vultr VM. M7 (submission) in progress.** Team: one person plus Claude Code.
 
 This section **overrides** the v2.1 plan below wherever they conflict. The contracts (§4), verdict rules, budgets, comparison rules and demo target (M1) still apply. Claude Code and MCP are no longer the product interface.
 

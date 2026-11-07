@@ -66,8 +66,16 @@ Each try sent the buggy `app.py`, the support code, the business rules and a rea
 - The verdict doesn't judge design quality: some passing fixes from other models used an in-process lock, which wouldn't hold across workers. All 10 `glm-5.3` fixes used the atomic claim.
 - The demo default is `glm-5.3@low`, for reliability over speed. A first-attempt failure is unlikely with it, so a retry can't be scripted.
 
-## Still to verify
+## On the Vultr VM (2026-11-06)
 
+- `docker-default` AppArmor is applied to both containers, and `docker info` lists AppArmor. WSL2 couldn't test this.
+- Network none on the target, read-only root, non-root users, and memory and process limits, read with `docker inspect` during real runs.
+- Only ports 22, 80 and 443 are allowed. 8080, 2375 and 6565 don't respond from outside. SSH accepts keys only.
+- Ticket API: `FAIL` with 20 of 20 accepted. Hostile build: `INCONCLUSIVE` in 26.5 s, with 0 containers left.
+- The hostile CPU attack stops itself after 10 s. It's throttled, not blocked, so only the wall limit bounds code that doesn't stop.
+
+## Not tested
+
+- The bridge-gateway egress test and the rest of `tests/test_sandbox.py` ran on the dev machine, not the VM.
+- Race reliability on the VM over many runs: only a few runs so far.
 - `MCP_TOOL_TIMEOUT`: not relevant while MCP is cut from the MVP.
-- All of the above on the Vultr VM, which won't have Docker Desktop's VM between the host and the bridge (M5).
-- `docker-default` AppArmor confinement: AppArmor is absent under WSL2 (`docker info` lists only seccomp and cgroupns), so it must be checked on the VM in M5.
