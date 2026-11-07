@@ -197,6 +197,7 @@ def config_hash(
         "k6_version": k6_version,
         # Left out when unset, so that a scenario without one keeps its fingerprint.
         **({"scenario_reset": scenario.reset_json} if scenario.reset_json is not None else {}),
+        **({"hooks_origin": target.hooks_origin} if target.hooks_origin is not None else {}),
     }
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
     return f"sha256:{hashlib.sha256(encoded.encode()).hexdigest()}"

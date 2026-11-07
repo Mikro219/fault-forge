@@ -1,0 +1,10 @@
+--- a/src/app/api/auth/refresh/route.ts
++++ b/src/app/api/auth/refresh/route.ts
+@@
+-    // Rotate: revoke old token, issue new pair
+-    await revokeRefreshToken(refreshToken);
++    // Rotate: the delete is atomic, so only one concurrent request can redeem this token.
++    const { count } = await prisma.refreshToken.deleteMany({ where: { token: refreshToken } });
++    if (count !== 1) {
++      return errorResponse("Invalid or expired refresh token", 401);
++    }

@@ -231,6 +231,7 @@ class ContainmentFacts(Contract):
         default_factory=list, description="Started but never finished: killed, or removed with the container"
     )
     target_log_tail: str = Field(default="", description="Untrusted text from the target")
+    services: list[ContainerFacts] = Field(default_factory=list, description="A stack's other containers, read by the host")
     state_verification: StateVerification | None = Field(default=None, description="None if not requested")
 
 
@@ -758,6 +759,7 @@ class _Session:
     target_facts: ContainerFacts | None = None
     runner_facts: ContainerFacts | None = None
     containers_left: int | None = None
+    service_facts: list[ContainerFacts] = field(default_factory=list)
 
     @property
     def target_name(self) -> str:
@@ -828,7 +830,9 @@ class _Session:
             if error.reason == "runner_start_failed" and not self._target_is_running():
                 raise SandboxError("target_exited", error.detail) from error
             raise
+        return self._await_runner()
 
+    def _await_runner(self) -> Report:
         try:
             waited = _docker(self.policy, ["wait", self.runner_name], self._remaining_s())
         except _DockerTimeout as error:
@@ -954,7 +958,12 @@ def run_sandboxed(
     policy: SandboxPolicy = DEFAULT_POLICY,
 ) -> SandboxResult:
     """Returns a result for every failure, rather than raising. A failed result has no report."""
-    session = _Session(spec, Path(project_dir).resolve(), scenario_id, options, policy, time.monotonic())
+    return run_session(_Session(spec, Path(project_dir).resolve(), scenario_id, options, policy, time.monotonic()))
+
+
+def run_session(session: _Session) -> SandboxResult:
+    """Everything after the session's own start-up is shared, so every kind of target ends the same way."""
+    policy = session.policy
     report: Report | None = None
     failure: SandboxError | None = None
     try:
@@ -982,5 +991,6 @@ def run_sandboxed(
             probes_without_result=unfinished_probes(probes),
             target_log_tail=session.target_log_tail,
             state_verification=session.state_verification(report),
+            services=session.service_facts,
         ),
     )

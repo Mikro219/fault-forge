@@ -85,6 +85,8 @@ def parse_config(text: str) -> ProjectConfig:
         raise _invalid(f"{CONFIG_NAME} is invalid: {error}") from error
 
     config.target.origin = safety.validate_origin(config.target.origin)
+    if config.target.hooks_origin is not None:
+        config.target.hooks_origin = safety.validate_origin(config.target.hooks_origin)
     safety.validate_path(config.target.health)
     safety.validate_path(config.target.state)
     if config.target.reset is not None:

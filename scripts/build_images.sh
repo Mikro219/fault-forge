@@ -11,3 +11,4 @@ fi
 
 docker build --quiet --file "$root/docker/target.Dockerfile" --tag faultforge-target:dev "$root"
 docker build --quiet --file "$root/docker/runner.Dockerfile" --tag faultforge-runner:dev "$root"
+docker build --quiet --file "$root/docker/stack-hooks.Dockerfile" --tag faultforge-stack-hooks:dev "$root"

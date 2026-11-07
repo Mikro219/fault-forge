@@ -109,6 +109,8 @@ The internal target is **submission-ready by the end of 7 November UTC**, which 
 - **Scenario reset.** `reset_json` replaces the reset body for one scenario. It's left out of the workload fingerprint when unset, so existing scenarios keep theirs.
 - **Bring-your-own repo stays owner-only.** The app's user can control Docker, so the public API still takes no code. A repo is imported by the owner at a pinned commit, then appears as a fixed target.
 
+- **Stack targets.** A pre-built app image, Postgres and Redis share a namespace owned by a no-network Postgres, in `stack.py`. A trusted helper answers health, state and reset from SQL in the stack's definition (`target.hooks_origin`), because such an app has no hooks. The image ID is the deployed-code hash and the host reads the database with `psql`, so the gate means the same thing.
+
 ### M4 decisions
 
 AI-written `app.py` shares a process with the hooks, so the state and `build_id` it reports could be forged. `report.json` is unchanged; these checks sit in `SandboxResult` and the fix gate.

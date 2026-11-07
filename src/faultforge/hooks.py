@@ -90,7 +90,7 @@ class TargetHooks:
     def _call(self, method: str, path: str, body: dict | None = None) -> bytes:
         """timeout_s is a hard limit on the whole call. httpx timeouts apply per read, so on
         their own they can't stop a server that drips one byte at a time."""
-        url = safety.build_url(self.target.origin, path)
+        url = safety.build_url(self.target.hooks_origin or self.target.origin, path)
         label = f"{method} {path}"
         # trust_env=False: proxy settings in the environment must never redirect these calls.
         client = httpx.Client(timeout=self.timeout_s, follow_redirects=False, trust_env=False)

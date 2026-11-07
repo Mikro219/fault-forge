@@ -1,0 +1,26 @@
+# How to run SportsDeck in a sealed stack. Every value here is a fixed test value for a throwaway
+# sandbox. A repo's own env files are never read.
+postgres_image: postgres:16-alpine
+redis_image: redis:7-alpine
+database_user: sportsdeck
+database_name: sportsdeck
+app_port: 8000
+app_user: "1001:1001"
+app_health_path: /api/tags
+app_writable: [/app/.next/cache]
+hooks_port: 8001
+env:
+  NODE_ENV: production
+  JWT_SECRET: sandbox-only-access-secret-not-a-real-key
+  JWT_REFRESH_SECRET: sandbox-only-refresh-secret-not-a-real-key
+reset_sql:
+  - DELETE FROM "RefreshToken"
+  - >-
+    INSERT INTO "User" (id, email, username, password, "updatedAt")
+    VALUES (900001, 'sandbox@example.invalid', 'faultforge-sandbox', 'not-a-password-hash', now())
+    ON CONFLICT (id) DO NOTHING
+  - >-
+    INSERT INTO "RefreshToken" (token, "userId", "expiresAt")
+    VALUES ('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjkwMDAwMSwianRpIjoiZmF1bHRmb3JnZS1zYW5kYm94IiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQwNzA5MDg4MDB9.saHixTTLdj39WofQKSkm8vyL3-V1mmruW1lzyQqjlsM', 900001, now() + interval '1 day')
+state_sql:
+  live_tokens: SELECT COUNT(*) FROM "RefreshToken"

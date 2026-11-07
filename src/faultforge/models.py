@@ -77,6 +77,8 @@ class TargetConfig(Contract):
     health: str
     state: str
     reset: ResetHook | None = None
+    # Where health, state and reset live, for an app that has no test hooks of its own.
+    hooks_origin: str | None = None
 
 
 class RequestTemplate(Contract):

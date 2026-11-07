@@ -81,7 +81,9 @@ A candidate that passes the gate also runs `plenty-of-stock` (20 tickets, 20 buy
 - The reference fix passes both, at about 7 s per scenario.
 - `false_fixes/wipes_stock` sets stock to 0 instead of subtracting 1. It gets `PASS` and `fix_verified` on the race with a matching database, then `FAIL` on `plenty-of-stock` with 1 accepted.
 
-Regression runs only check the scenarios defined in the config, so they can't find a bug in behaviour no scenario covers. No model has been run against them yet.
+Regression runs only check the scenarios defined in the config, so they can't find a bug in behaviour no scenario covers.
+
+**With a real model:** `glm-5.3@low`, one attempt per try, 10 tries, $0.059. 9 passed the full gate, including both regression scenarios, in 21 to 28 s per try. The other returned more than one code block, so it never ran; a retry would have covered it in real use. No model fix was blocked by a regression scenario in this sample, so `wipes_stock` remains the only evidence that the check catches anything.
 
 ## SportsDeck spike (2026-11-07, local only)
 
@@ -100,6 +102,18 @@ Commit `065e475` of a Next.js, Postgres and Redis app, run on the dev machine in
 - The committed lockfile doesn't match `package.json`, so `npm ci` and the repo's own `docker build` fail. The spike used `npm install` in a scratch copy, so its dependency versions aren't pinned by the repo.
 - The race is real but varies: after the first trial, overlap was 52 to 93 ms and 3 to 5 requests got through. A verdict needs "more than 1", not an exact count.
 - A rebuild can't fit inside the 100 s sandbox limit, so a target like this needs a separate build phase with its own limit.
+
+## SportsDeck through FaultForge's sealed stack (2026-11-07, local only)
+
+`tests/test_stack.py`, with images from `demo/sportsdeck/build.sh` at commit `065e475`. Postgres owns a namespace with no network, and Redis, the app, a trusted hooks helper and the runner join it. All are read-only, with all capabilities dropped and non-root users.
+
+| Run | Verdict | Detail |
+|---|---|---|
+| `refresh-token-race`, unfixed | `FAIL` | 20, 6 and 7 accepted across 3 trials; serial control 1 |
+| The same, reference fix, compared with that run | `PASS` | Gate holds: comparison verified, direct `psql` check matched, image changed |
+| `garbage-tokens-rejected`, reference fix | `PASS` | No token accepted, database matched |
+
+Each run took about 26 s, with 0 containers left. The hand-written fix isn't a model's: this doesn't show that a model can fix this app. The hooks helper can't count the app's in-flight requests, so state read at the end of a trial relies on the settle wait. The token and its signing secret are fixed test values.
 
 ## Not tested
 

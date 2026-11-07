@@ -1,0 +1,57 @@
+version: 1
+target:
+  origin: http://127.0.0.1:8000
+  hooks_origin: http://127.0.0.1:8001
+  health: /__ff/health
+  reset: { method: POST, path: /__ff/reset, json: {} }
+  state: /__ff/state
+
+scenarios:
+  - id: refresh-token-race
+    description: 20 requests race to redeem one refresh token
+    mutates_data: true
+    user_confirmed: true
+    script: burst_request
+    request:
+      method: POST
+      path: /api/auth/refresh
+      json: { refreshToken: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjkwMDAwMSwianRpIjoiZmF1bHRmb3JnZS1zYW5kYm94IiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQwNzA5MDg4MDB9.saHixTTLdj39WofQKSkm8vyL3-V1mmruW1lzyQqjlsM" }
+    outcomes:
+      accepted_status: [200]
+      rejected_status: [401]
+    load: { vus: 20, iterations: 20, max_duration_s: 10, min_peak_in_flight: 10 }
+    invariants:
+      - name: A refresh token is redeemed at most once
+        type: capacity
+        check: client.accepted <= before.live_tokens
+      - name: A valid refresh token can be redeemed
+        type: liveness
+        check: client.accepted >= before.live_tokens
+      - name: Rotation leaves exactly one live token
+        type: accounting
+        check: after.live_tokens == before.live_tokens
+    disclosures:
+      - The token and its signing secret are fixed test values for this sandbox.
+      - The hooks helper can't count the app's in-flight requests.
+  - id: garbage-tokens-rejected
+    description: 20 requests with a token that was never issued must all be refused
+    mutates_data: true
+    user_confirmed: true
+    script: burst_request
+    request:
+      method: POST
+      path: /api/auth/refresh
+      json: { refreshToken: "not-a-token" }
+    outcomes:
+      accepted_status: [200]
+      rejected_status: [401]
+    load: { vus: 20, iterations: 20, max_duration_s: 10, min_peak_in_flight: 2 }
+    invariants:
+      - name: A token that was never issued is refused
+        type: capacity
+        check: client.accepted <= before.live_tokens - 1
+      - name: Refusals don't create tokens
+        type: accounting
+        check: after.live_tokens == before.live_tokens
+    disclosures:
+      - The hooks helper can't count the app's in-flight requests.
