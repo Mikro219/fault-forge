@@ -304,7 +304,7 @@ class PreviousAttempt:
 
 
 def _previous_attempts_section(
-    previous_attempts: Sequence[PreviousAttempt], invariant_names: Collection[str]
+    previous_attempts: Sequence[PreviousAttempt], invariant_names: Collection[str], language: str = "python",
 ) -> list[str]:
     if not previous_attempts:
         return []
@@ -317,7 +317,7 @@ def _previous_attempts_section(
         if attempt.failure_detail:
             parts.append(attempt.failure_detail)
         if index == last_with_code:
-            parts.append(_fenced(attempt.code, "python"))
+            parts.append(_fenced(attempt.code, language))
         if attempt.report is not None:
             summary = summarize_report(attempt.report, invariant_names)
             parts.append(_fenced(json.dumps(summary, indent=1), "json"))
@@ -403,8 +403,8 @@ def _fenced_blocks(text: str) -> list[tuple[str, str]]:
     return blocks
 
 
-def extract_app_source(response_text: str | bytes) -> str:
-    """Returns the code or raises OutputRejected. Compiles it but never executes or imports it."""
+def extract_source(response_text: str | bytes, languages: Collection[str], wrong_language: str) -> str:
+    """The one fenced block in a model's answer, or raises OutputRejected. Never executes it."""
     if isinstance(response_text, bytes):
         try:
             response_text = response_text.decode("utf-8")
@@ -417,8 +417,8 @@ def extract_app_source(response_text: str | bytes) -> str:
     if len(blocks) > 1:
         raise OutputRejected("multiple_blocks", f"the output has {len(blocks)} fenced code blocks, not one")
     language, code = blocks[0]
-    if language.lower() not in ("python", "py", "python3"):
-        raise OutputRejected("not_python", "the fenced code block isn't tagged python")
+    if language.lower() not in languages:
+        raise OutputRejected(wrong_language, "the fenced code block is tagged with the wrong language")
     if not code.strip():
         raise OutputRejected("empty_block", "the fenced code block is empty")
     code += "\n"
@@ -428,6 +428,12 @@ def extract_app_source(response_text: str | bytes) -> str:
         raise OutputRejected("invalid_utf8", "the code isn't valid UTF-8") from None
     if size > MAX_APP_BYTES:
         raise OutputRejected("oversized", f"the code is {size} bytes; the limit is {MAX_APP_BYTES}")
+    return code
+
+
+def extract_app_source(response_text: str | bytes) -> str:
+    """Returns the code or raises OutputRejected. Compiles it but never executes or imports it."""
+    code = extract_source(response_text, ("python", "py", "python3"), "not_python")
     _require_compiles(code)
     return code
 
@@ -831,6 +837,7 @@ def propose_fix(
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
     url: str = CHAT_COMPLETIONS_URL,
+    extract: Callable[[str], str] = extract_app_source,
 ) -> Proposal:
     """One model call, with retries only on 429. Every failure of the call is a Proposal, never a
     traceback. Without a reasoning_effort, the request leaves the setting to the provider."""
@@ -917,7 +924,7 @@ def propose_fix(
             raw_output=content,
         )
     try:
-        return done(code=extract_app_source(content))
+        return done(code=extract(content))
     except OutputRejected as error:
         return done(failure_reason=error.reason, failure_detail=error.detail, raw_output=content)
 

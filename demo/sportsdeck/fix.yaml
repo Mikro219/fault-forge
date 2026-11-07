@@ -1,0 +1,20 @@
+# What the fix agent may read and change. A model can replace only `editable`.
+editable: src/app/api/auth/refresh/route.ts
+context:
+  - src/lib/auth.ts
+  - src/lib/prisma.ts
+  - src/lib/utils.ts
+allowed_imports:
+  - next/server
+  - "@/lib/prisma"
+  - "@/lib/auth"
+  - "@/lib/utils"
+required_export: POST
+business_rules: BUSINESS_RULES.md
+builder_image: faultforge-sportsdeck:builder
+base_image: faultforge-sportsdeck:buggy
+# Sends no fallback secret to the model provider, whatever its value.
+redact:
+  - '(?<=process\.env\.JWT_SECRET \|\| )"[^"]*"'
+  - '(?<=process\.env\.JWT_REFRESH_SECRET \|\| )"[^"]*"'
+  - '(?<=\n  )"sportsdeck-[^"]*"'

@@ -35,4 +35,8 @@ if ! build; then
         exit 1
     fi
 fi
+# The fix agent compiles candidates in this stage, sealed, with its dependencies already installed.
+if [[ -z "$fix" ]]; then
+    docker build --quiet --target builder --label faultforge.spike=1 --tag faultforge-sportsdeck:builder . >/dev/null
+fi
 echo "built faultforge-sportsdeck:$tag from $commit"

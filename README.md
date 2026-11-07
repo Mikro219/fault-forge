@@ -106,7 +106,7 @@ The fourth exists because a fix can create a new bug. A fix that sets stock to 0
 | Live agent on the public site, `glm-5.3@low`, before regression checks existed | The first 3 live fixes passed the three-condition gate on attempt 1, at $0.005 to $0.009 each. Two were timed: 8.5 s and 15.5 s |
 | Forged fix | Fooled the report alone; the database check caught it (reported 0 orphaned holds, database had 19) |
 | Hostile build on the VM, 9 attacks | 8 blocked, absent or stopped by a limit; CPU limited, not blocked. `INCONCLUSIVE`, server healthy, 0 containers left |
-| Tests and review | 924 tests pass. Independent reviews found a blocker and serious issues, which were fixed |
+| Tests and review | 960 tests pass. Independent reviews found a blocker and serious issues, which were fixed |
 
 **Model trial** on a dev machine, before regression checks existed, fixes that passed the three-condition gate out of 10 tries each, $0.12 for all 60: `glm-5.3@low` 10; `mimo-v2.6-pro@none` 8; `deepseek-v4.1-flash-1017@none` 8; `glm-5.3-flash@low` 7; `qwen3.8-flash-next@none` 6; `qwen3.8-27b@none` 5.
 

@@ -110,6 +110,8 @@ The internal target is **submission-ready by the end of 7 November UTC**, which 
 - **Bring-your-own repo stays owner-only.** The app's user can control Docker, so the public API still takes no code. A repo is imported by the owner at a pinned commit, then appears as a fixed target.
 
 - **Stack targets.** A pre-built app image, Postgres and Redis share a namespace owned by a no-network Postgres, in `stack.py`. A trusted helper answers health, state and reset from SQL in the stack's definition (`target.hooks_origin`), because such an app has no hooks. The image ID is the deployed-code hash and the host reads the database with `psql`, so the gate means the same thing.
+- **TypeScript fixes.** `next build` imports route modules, so AI-written code runs while building. It compiles with no network, no secrets, all capabilities dropped and hard limits, and its output reaches the candidate image through a Dockerfile with no RUN step. A regular-expression rule check runs first, as defence in depth. The gate and regression scenarios are the same as for Python targets.
+- **Not for a public site yet.** The compile runs AI-written code on the same kernel as a host whose app user controls Docker, so a kernel escape means root on the VM. A public version needs its builds on a throwaway VM or under gVisor, or the page should show labelled replays of runs made elsewhere. Visitors still can't submit code either way.
 
 ### M4 decisions
 

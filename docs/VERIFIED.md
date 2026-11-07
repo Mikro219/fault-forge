@@ -113,7 +113,29 @@ Commit `065e475` of a Next.js, Postgres and Redis app, run on the dev machine in
 | The same, reference fix, compared with that run | `PASS` | Gate holds: comparison verified, direct `psql` check matched, image changed |
 | `garbage-tokens-rejected`, reference fix | `PASS` | No token accepted, database matched |
 
-Each run took about 26 s, with 0 containers left. The hand-written fix isn't a model's: this doesn't show that a model can fix this app. The hooks helper can't count the app's in-flight requests, so state read at the end of a trial relies on the settle wait. The token and its signing secret are fixed test values.
+Each run took about 26 s, with 0 containers left. The hooks helper can't count the app's in-flight requests, so state read at the end of a trial relies on the settle wait. The token and its signing secret are fixed test values.
+
+## A real model fixing SportsDeck (2026-11-07, local only)
+
+`scripts/stack_fix_trial.py`, `glm-5.3@low`, up to 3 attempts per try. The model saw the route, the read-only helpers with fallback secrets redacted, the business rules and the report, and returned one replacement file. Each candidate was compiled in a sealed container, then tested in a new stack.
+
+First trial, before hardening, $0.0277: all 3 tries were verified, with 1 first attempt failing to compile and 1 breaking a code rule. Those prompts included the helpers' fallback secrets unredacted. Second trial, on the hardened path, $0.0277: all 3 tries were verified, with 1 first attempt breaking a code rule and 1 returning 2 code blocks.
+
+- **The gate verified a bad fix.** Read by hand, 1 of those 6 verified fixes dropped the signature check and trusted any token found in the database. No scenario covered that, so it passed. `forged-signature-rejected` now covers it, using that model's own code as a false fix (`FAIL` on that scenario, in real containers), and the rule was added to the business rules. Other behaviour no scenario covers can still regress unseen.
+
+Third trial, with that scenario, $0.0340: all 3 tries were verified. **In try 1 the regression step caught a real model fix:** attempt 1 passed the race, but it deleted the token before checking its signature, so a forged token consumed a stored row. `forged-signature-rejected` failed on "The stored token isn't consumed", that went back to the model, and attempt 2 checked the signature first and passed everything.
+
+- A verified attempt took about 200 to 245 s: about 140 s to build, 4 to 18 s for the model, and the rest in the stacks. That's too slow to feel live on a page.
+- All 9 tries across the three trials ended verified, and the model's reliability on a first attempt was lower: 4 of 9 first attempts passed the checks in place at the time. 9 tries is a small sample, and only this one route has been tried.
+- The checks can only be as good as the scenarios, which is what the bad fix above shows.
+- The route's `build` script sets its own `NODE_OPTIONS`, so the 2560 MB heap setting has no effect. The 3 GB container limit still applies.
+- Everything ran on the dev machine. The 4 GB VM hasn't been tried.
+
+## Sealed builds (2026-11-07, local only)
+
+`next build` does run AI-written code. A hostile route, with the rule check skipped on purpose, reported what it could reach from inside a real build: writes to `/app` and `/etc` failed, a connection to `1.1.1.1:443` failed, it ran as uid 1000, no secret-like variable names were present, there was no Docker socket, and `DATABASE_URL` held only the image's `localhost:5432` placeholder.
+
+Build output is rebuilt on the host by a validator that refuses links out of the tree, hard links, devices and traversal, and drops setuid bits. These are tested with crafted archives. These sandboxes still share the host's kernel, and a kernel escape from a build isn't something these tests exercise.
 
 ## Not tested
 

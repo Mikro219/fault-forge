@@ -3,8 +3,14 @@
 Postgres owns a network namespace with no network, and everything else joins it, so 127.0.0.1 reaches
 the other services and nothing else exists. Every container has the same limits as a Python target's.
 Secrets are random for each run, or fixed test values in the stack's definition. Nothing is read
-from a repo's own env files. Facts come from the host: the deployed-code hash is the image's ID,
-and the database is read directly with psql, so the fix gate means the same thing as for app.py.
+from a repo's own env files. The deployed-code hash is the image's ID, and the host reads the database
+with psql as an administrator the app can't log in as, and the hooks helper starts before the app, so
+it can't take the helper's port. A run where a trusted service died can't pass the gate.
+
+The app owns its own database, so like any Python target it can still edit its data, including
+replacing a table with a view. Client counts are measured by the runner, but a cheating app could
+also keep its state in memory. So a verified fix is strong evidence against honest bugs, and not
+proof against code written to fool the check.
 
 The image is built beforehand, because a real build doesn't fit in a sandbox's wall limit. It's
 only as trustworthy as that build, and the app is untrusted here.
@@ -35,6 +41,7 @@ from faultforge.sandbox import (
     SandboxError,
     SandboxPolicy,
     SandboxResult,
+    StateVerification,
     _common_args,
     _docker,
     _env_args,
@@ -52,6 +59,9 @@ HOOKS_IMAGE = "faultforge-stack-hooks:dev"
 POSTGRES_USER = "70:70"
 REDIS_USER = "999:1000"
 HOOKS_USER = "65534:65534"
+ADMIN_ROLE = "faultforge_admin"
+READY_WAIT_S = 30.0
+READY_POLL_S = 0.25
 
 # Measured in the SportsDeck spike: 114 MiB, 108 MiB and 15 MiB after load. Start-up runs migrations,
 # so the app's limit leaves room for those too.
@@ -83,6 +93,9 @@ class StackConfig(Contract):
     state_sql: dict[str, str] = Field(min_length=1)
 
 
+_PORT_BOUND = "import socket; socket.create_connection(('127.0.0.1', {port}), 1).close()"
+
+
 def load_stack(path: Path) -> StackConfig:
     return StackConfig.model_validate(yaml.safe_load(Path(path).read_text(encoding="utf-8")))
 
@@ -102,9 +115,20 @@ def psql_state_argv(container: str, stack: StackConfig, queries: Mapping[str, st
     """One statement, so the values are read together. Names were checked as plain lowercase names."""
     fields = ", ".join(f"'{name}', ({sql})" for name, sql in queries.items())
     return [
-        "exec", container, "psql", "-U", stack.database_user, "-d", stack.database_name,
+        "exec", container, "psql", "-X", "-U", ADMIN_ROLE, "-d", stack.database_name,
         "-tA", "-v", "ON_ERROR_STOP=1", "-c", f"SELECT json_build_object({fields})",
     ]
+
+
+def setup_role_sql(stack: StackConfig, password: str) -> str:
+    """The app gets an ordinary role that owns only its own database, so it has no superuser powers
+    such as COPY FROM PROGRAM. The names were checked as plain lowercase, and the password is hex."""
+    role, database = stack.database_user, stack.database_name
+    return (
+        f"CREATE ROLE {role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '{password}'; "
+        f"ALTER DATABASE {database} OWNER TO {role}; "
+        f"ALTER SCHEMA public OWNER TO {role};"
+    )
 
 
 @dataclass
@@ -132,7 +156,7 @@ class StackSession(_Session):
             raise SandboxError("image_missing", f"{image} isn't built")
         return result.stdout.decode("ascii", "replace").strip()
 
-    def argv(self, password: str, expires_at: int) -> dict[str, list[str]]:
+    def argv(self, password: str, expires_at: int, admin_password: str = "") -> dict[str, list[str]]:
         stack = self.spec.stack
         namespace = ["--network", f"container:{self.postgres_name}"]
         database_url = f"postgresql://{stack.database_user}:{password}@127.0.0.1:5432/{stack.database_name}"
@@ -141,7 +165,7 @@ class StackSession(_Session):
             "--network", "none", "--user", POSTGRES_USER,
             "--tmpfs", "/var/lib/postgresql/data:rw,uid=70,gid=70,mode=0700,size=256m",
             "--tmpfs", "/var/run/postgresql:rw,uid=70,gid=70,size=1m",
-            *_env_args({"POSTGRES_PASSWORD": password, "POSTGRES_USER": stack.database_user, "POSTGRES_DB": stack.database_name}),
+            *_env_args({"POSTGRES_PASSWORD": admin_password, "POSTGRES_USER": ADMIN_ROLE, "POSTGRES_DB": stack.database_name}),
             stack.postgres_image,
         ]
         redis = [
@@ -161,7 +185,7 @@ class StackSession(_Session):
             self.spec.app_image,
         ]
         hooks_spec = {
-            "port": stack.hooks_port, "database_user": stack.database_user, "database_name": stack.database_name,
+            "port": stack.hooks_port, "database_user": ADMIN_ROLE, "database_name": stack.database_name,
             "app_health_url": f"http://127.0.0.1:{stack.app_port}{stack.app_health_path}",
             "reset_sql": stack.reset_sql, "state_sql": dict(stack.state_sql),
             "build_id": self.deployed_code_sha256, "instance_id": self.instance_id,
@@ -170,7 +194,7 @@ class StackSession(_Session):
         hooks = [
             *_common_args(self.hooks_name, self.sandbox_id, "hooks", HOOKS_LIMITS, expires_at),
             *namespace, "--user", HOOKS_USER,
-            *_env_args({"FF_STACK_HOOKS": json.dumps(hooks_spec), "FF_DATABASE_PASSWORD": password, "PYTHONDONTWRITEBYTECODE": "1"}),
+            *_env_args({"FF_STACK_HOOKS": json.dumps(hooks_spec), "FF_DATABASE_PASSWORD": admin_password, "PYTHONDONTWRITEBYTECODE": "1"}),
             HOOKS_IMAGE, "python", "-I", "/opt/stack_hooks.py",
         ]
         return {"postgres": postgres, "redis": redis, "app": app, "hooks": hooks}
@@ -191,14 +215,26 @@ class StackSession(_Session):
         # What the host knows ran: the image's own ID, which the app can't change.
         self.deployed_code_sha256 = hashlib.sha256(self._image_id(self.spec.app_image).encode()).hexdigest()
         self.instance_id = secrets.token_hex(8)
-        argv = self.argv(secrets.token_hex(16), expires_at)
+        password = secrets.token_hex(16)
+        argv = self.argv(password, expires_at, secrets.token_hex(16))
         runner_args = runner_argv(
             self.runner_name, self.sandbox_id, self.postgres_name, self.project_dir, self.scenario_id,
             self.options, self.policy, expires_at,
         )
         self.containers_started = True
-        for name in ("postgres", "redis", "app", "hooks"):
-            self._start(argv[name])
+        self._start(argv["postgres"])
+        self._await(["exec", self.postgres_name, "pg_isready", "-h", "127.0.0.1", "-U", ADMIN_ROLE], "postgres")
+        setup = _docker(self.policy, [
+            "exec", self.postgres_name, "psql", "-X", "-U", ADMIN_ROLE, "-d", stack.database_name, "-v", "ON_ERROR_STOP=1",
+            "-c", setup_role_sql(stack, password),
+        ], STATE_EXEC_TIMEOUT_S)
+        if setup.returncode != 0:
+            raise SandboxError("target_start_failed", "the database role couldn't be set up")
+        self._start(argv["redis"])
+        # Before the app, so that the app can't bind the helper's port first.
+        self._start(argv["hooks"])
+        self._await(["exec", self.hooks_name, "python", "-I", "-c", _PORT_BOUND.format(port=stack.hooks_port)], "hooks")
+        self._start(argv["app"])
         try:
             self._within_wall(runner_args, "runner_start_failed")
         except SandboxError as error:
@@ -206,6 +242,22 @@ class StackSession(_Session):
                 raise SandboxError("target_exited", error.detail) from error
             raise
         return self._await_runner()
+
+    def _await(self, args: list[str], name: str) -> None:
+        deadline = time.monotonic() + READY_WAIT_S
+        while time.monotonic() < deadline:
+            if _docker(self.policy, args, STATE_EXEC_TIMEOUT_S).returncode == 0:
+                return
+            time.sleep(READY_POLL_S)
+        raise SandboxError("target_start_failed", f"{name} didn't become ready")
+
+    def state_verification(self, report: Report | None) -> StateVerification | None:
+        """A run where a trusted service died can't pass, because the hooks' answers mean nothing."""
+        names = {POSTGRES_USER, HOOKS_USER}
+        trusted = [facts for facts in self.service_facts if facts.user in names]
+        if len(trusted) != len(names) or not all(facts.running_when_inspected for facts in trusted):
+            return StateVerification(status="unavailable", reason="trusted_service_not_running")
+        return super().state_verification(report)
 
     def _query_database(self, queries: Mapping[str, str]) -> dict[str, int] | None:
         timeout_s = min(self.policy.docker_timeout_s, STATE_EXEC_TIMEOUT_S)

@@ -55,3 +55,27 @@ scenarios:
         check: after.live_tokens == before.live_tokens
     disclosures:
       - The hooks helper can't count the app's in-flight requests.
+  - id: forged-signature-rejected
+    description: 20 requests with a stored token whose signature is wrong must all be refused
+    mutates_data: true
+    user_confirmed: true
+    script: burst_request
+    request:
+      method: POST
+      path: /api/auth/refresh
+      json: { refreshToken: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjkwMDAwMSwianRpIjoiZmF1bHRmb3JnZS1mb3JnZWQiLCJpYXQiOjE3OTAwMDAwMDAsImV4cCI6NDA3MDkwODgwMH0.DlEHxxt7PVZPJtbB-MFBuXwSdZSV51bjb_eh81vfpTE" }
+    outcomes:
+      accepted_status: [200]
+      rejected_status: [401]
+    load: { vus: 20, iterations: 20, max_duration_s: 10, min_peak_in_flight: 2 }
+    invariants:
+      - name: A stored token with a bad signature is refused
+        type: capacity
+        check: client.accepted <= before.forged_tokens - 1
+      - name: The stored token isn't consumed
+        type: accounting
+        check: after.forged_tokens == before.forged_tokens
+    disclosures:
+      - The token and its signing secret are fixed test values for this sandbox.
+      - The hooks helper can't count the app's in-flight requests.
+

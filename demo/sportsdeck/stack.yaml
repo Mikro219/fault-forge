@@ -14,13 +14,18 @@ env:
   JWT_SECRET: sandbox-only-access-secret-not-a-real-key
   JWT_REFRESH_SECRET: sandbox-only-refresh-secret-not-a-real-key
 reset_sql:
-  - DELETE FROM "RefreshToken"
+  - DELETE FROM public."RefreshToken"
   - >-
-    INSERT INTO "User" (id, email, username, password, "updatedAt")
+    INSERT INTO public."User" (id, email, username, password, "updatedAt")
     VALUES (900001, 'sandbox@example.invalid', 'faultforge-sandbox', 'not-a-password-hash', now())
     ON CONFLICT (id) DO NOTHING
   - >-
-    INSERT INTO "RefreshToken" (token, "userId", "expiresAt")
+    INSERT INTO public."RefreshToken" (token, "userId", "expiresAt")
     VALUES ('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjkwMDAwMSwianRpIjoiZmF1bHRmb3JnZS1zYW5kYm94IiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQwNzA5MDg4MDB9.saHixTTLdj39WofQKSkm8vyL3-V1mmruW1lzyQqjlsM', 900001, now() + interval '1 day')
+  # In the table, but signed with the wrong secret. A redeemable-looking row must not be enough.
+  - >-
+    INSERT INTO public."RefreshToken" (token, "userId", "expiresAt")
+    VALUES ('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjkwMDAwMSwianRpIjoiZmF1bHRmb3JnZS1mb3JnZWQiLCJpYXQiOjE3OTAwMDAwMDAsImV4cCI6NDA3MDkwODgwMH0.DlEHxxt7PVZPJtbB-MFBuXwSdZSV51bjb_eh81vfpTE', 900001, now() + interval '1 day')
 state_sql:
-  live_tokens: SELECT COUNT(*) FROM "RefreshToken"
+  live_tokens: SELECT COUNT(*) FROM public."RefreshToken" WHERE token <> 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjkwMDAwMSwianRpIjoiZmF1bHRmb3JnZS1mb3JnZWQiLCJpYXQiOjE3OTAwMDAwMDAsImV4cCI6NDA3MDkwODgwMH0.DlEHxxt7PVZPJtbB-MFBuXwSdZSV51bjb_eh81vfpTE'
+  forged_tokens: SELECT COUNT(*) FROM public."RefreshToken" WHERE token = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjkwMDAwMSwianRpIjoiZmF1bHRmb3JnZS1mb3JnZWQiLCJpYXQiOjE3OTAwMDAwMDAsImV4cCI6NDA3MDkwODgwMH0.DlEHxxt7PVZPJtbB-MFBuXwSdZSV51bjb_eh81vfpTE'
