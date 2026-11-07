@@ -1,0 +1,14 @@
+# deploy.sh replaces __HOSTNAME__ with <ip-with-dashes>.sslip.io. Caddy gets the certificate itself.
+#
+# With no trusted_proxies set, Caddy ignores any X-Forwarded-For from the client and sends the
+# connection's own address, which is the only value the app relies on.
+__HOSTNAME__ {
+	request_body {
+		max_size 16KB
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+	reverse_proxy 127.0.0.1:8080
+}

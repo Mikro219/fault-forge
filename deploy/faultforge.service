@@ -1,0 +1,62 @@
+# The FaultForge web app. The docker group is root-equivalent, so the options below reduce what a
+# bug in the app can do directly, and aren't a boundary against someone who controls the app.
+[Unit]
+Description=FaultForge web control plane
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=exec
+User=faultforge
+Group=faultforge
+SupplementaryGroups=docker
+WorkingDirectory=/opt/faultforge
+ExecStartPre=-/usr/bin/find /var/lib/faultforge/tmp -mindepth 1 -maxdepth 1 -name faultforge-code-* -mmin +60 -exec rm -rf {} +
+ExecStart=/opt/faultforge/.venv/bin/python -m faultforge.web
+Restart=on-failure
+RestartSec=5
+# Long enough for a run to finish and remove its containers.
+TimeoutStopSec=140
+
+# systemd gives a service a clean environment, so these and the optional file are all it gets.
+# The app removes the key from its own environment when it starts.
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=FF_WEB_HOST=127.0.0.1
+Environment=FF_WEB_PORT=8080
+Environment=FF_DATA_DIR=/var/lib/faultforge/data
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+# Code directories are bind-mounted by the Docker daemon, which can't see a private /tmp. So they
+# go here, and PrivateTmp below can stay on.
+Environment=TMPDIR=/var/lib/faultforge/tmp
+EnvironmentFile=-/etc/faultforge/inference.env
+
+# Creates /var/lib/faultforge and tmp under it, owned by the user, and the only writable paths.
+StateDirectory=faultforge faultforge/tmp
+StateDirectoryMode=0750
+UMask=0077
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+# AF_UNIX reaches the Docker socket. Connecting to a socket works on a read-only mount.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

@@ -87,6 +87,12 @@ dependencies = [
     { name = "pyyaml" },
 ]
 
+[package.optional-dependencies]
+web = [
+    { name = "fastapi" },
+    { name = "uvicorn" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "fastapi" },
@@ -96,10 +102,13 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "fastapi", marker = "extra == 'web'", specifier = ">=0.162.0,<1" },
     { name = "httpx", specifier = ">=0.28.1,<1" },
     { name = "pydantic", specifier = ">=2.7,<3" },
     { name = "pyyaml", specifier = ">=6,<7" },
+    { name = "uvicorn", marker = "extra == 'web'", specifier = ">=0.54.0,<1" },
 ]
+provides-extras = ["web"]
 
 [package.metadata.requires-dev]
 dev = [

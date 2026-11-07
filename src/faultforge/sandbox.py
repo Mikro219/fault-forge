@@ -285,6 +285,11 @@ def _list_labelled(policy: SandboxPolicy, label_filter: str) -> list[str]:
     return result.stdout.decode("ascii", "replace").split()
 
 
+def count_labelled(policy: SandboxPolicy = DEFAULT_POLICY) -> int:
+    """How many sandbox containers exist now, in any state. Raises SandboxError if docker can't be used."""
+    return len(_list_labelled(policy, LABEL))
+
+
 def _created_at(text: str) -> datetime | None:
     """Docker's timestamps have nanoseconds, which datetime can't hold."""
     trimmed = re.sub(r"(\.\d{6})\d*", r"\1", text.strip()).replace("Z", "+00:00")
@@ -588,10 +593,11 @@ def _refuse_constant(name: str) -> None:
 
 def unfinished_probes(probes: list[dict[str, object]]) -> list[str]:
     """Probes that printed started but no result. The process was killed or removed during them."""
-    results = {probe.get("probe") for probe in probes if probe.get("phase") == "result"}
+    named = [probe for probe in probes if isinstance(probe.get("probe"), str)]
+    results = {probe["probe"] for probe in named if probe.get("phase") == "result"}
     return sorted({
-        str(probe.get("probe")) for probe in probes
-        if probe.get("phase") == "started" and probe.get("probe") not in results
+        probe["probe"] for probe in named
+        if probe.get("phase") == "started" and probe["probe"] not in results
     })
 
 

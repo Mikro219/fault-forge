@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FaultForge</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <!-- A placeholder until the designed page arrives. Everything shown comes from the API. -->
+  <header>
+    <h1>FaultForge</h1>
+    <p>Runs real load in a disposable sandbox, checks business rules, and shows the evidence.</p>
+  </header>
+  <main>
+    <section><h2>Server</h2><div id="status">Loading…</div></section>
+    <section><h2>Run a target</h2><div id="targets"></div><p id="notice" role="status"></p></section>
+    <section><h2>Current run</h2><div id="run">No run yet.</div></section>
+    <section><h2>Stored real runs</h2><div id="replays">Loading…</div><div id="replay"></div></section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

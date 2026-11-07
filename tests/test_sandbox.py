@@ -1528,3 +1528,12 @@ def test_reaper_falls_back_to_age(own_containers, tmp_path: Path, expires: str |
     assert _exists(older_style)
     assert sandbox.reap_stale(policy, max_age_s=0) == 1
     assert not _exists(older_style)
+
+
+def test_hostile_probe_names_cannot_crash_the_manager():
+    probes = sandbox.parse_probes(
+        b'FF_PROBE {"probe": ["a"], "phase": "started"}\n'
+        b'FF_PROBE {"probe": {"b": 1}, "phase": "result"}\n'
+        b'FF_PROBE {"probe": "real", "phase": "started"}\n'
+    )
+    assert sandbox.unfinished_probes(probes) == ["real"]
