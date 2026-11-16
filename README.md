@@ -8,7 +8,7 @@ Entry for the Vultr Agent Rush hackathon, Blast Radius Zero track.
 
 ## Live demo
 
-**https://155-138-147-248.sslip.io/**
+The hackathon demo ran at `https://155-138-147-248.sslip.io/` and was taken down after judging. To run it yourself, see **Setup** below: `uv run python -m faultforge.web` serves the same page at `http://127.0.0.1:8080`, with the recorded runs under **Past runs**.
 
 1. Leave **Ticket API** selected and click **Run**. In about 2 s the page shows `FAIL`: 20 of 20 requests accepted for 1 ticket. See **What the app said vs. what happened**, then **Proven** and **Suspected · not proven**.
 2. Click **Let the agent fix it**. The fix is written live and tested in new sandboxes. Allow up to a minute. Read the **Fix verified** badge and its evidence rows.
