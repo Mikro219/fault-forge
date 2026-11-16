@@ -1,3 +1,98 @@
+# FaultForge — Plan v4 (MCP server for Claude Code)
+
+Status: **Draft for the owner's review. Nothing built yet.** Branch `feature/mcp`, from `feature/sportsdeck`. `main` and the live hackathon site stay as submitted.
+
+This section **overrides** v3 wherever they conflict. The contracts (§4), verdict rules, budgets, comparison rules, sandbox policy (V3.3), the stack runtime and the regression gate all still apply. The product interface goes back to MCP (v2.1 §3), with sealed sandboxes, fix modes and a credit floor added.
+
+## V4.1 Product
+
+FaultForge is an MCP server that Claude Code starts in a project such as JADE. Claude asks it to prove a business-rule bug under real concurrent load, in a sandbox with no network. Claude then asks it to judge a fix. FaultForge's gate decides whether a fix holds, never a model.
+
+First target, later: JADE's `p2-redeem` ("concurrent redemption of the same code succeeds exactly once"), `p6-ingest` (idempotent events) and `p6-nolog-invariant` (no-log mode stores nothing, under load too).
+
+## V4.2 Owner's decisions (2026-11-15)
+
+1. **Fix modes.**
+   - Both stay available.
+   - `vultr`: glm-5.3 on Vultr Serverless Inference writes the candidate, as in the demo.
+   - `client`: Claude Code edits the working tree and FaultForge only verifies.
+   - `auto` uses `vultr` while Vultr credit is at least $10, then switches to `client`.
+2. **Runtimes.**
+   - Both stay available.
+   - `local`: Docker on this WSL machine.
+   - `remote`: a Vultr VM.
+   - `auto` may use `remote` only while credit is at least $10. Otherwise it uses `local`.
+3. **JADE waits.** FaultForge is built and tested against its own demos first. JADE gets `.mcp.json` and `faultforge.yaml` through a JADE bead, once `p2-redeem` exists. FaultForge never edits the JADE repo.
+4. **Branching.** Work happens on `feature/mcp`, which is based on `feature/sportsdeck`.
+
+## V4.3 Credit floor
+
+- **Credit** = `-balance - pending_charges` from Vultr `GET /v2/account`. On 2026-11-15 it was 200 − 8.04 = **$191.96**.
+- **The floor.** A paid operation (a `vultr` fix attempt or a `remote` run) is allowed only if `credit - worst_case_cost(op) >= $10`.
+  - The worst case for a fix attempt is the existing per-call cap.
+  - The worst case for a remote run is the VM's hourly rate times the run's wall limit, rounded up to one hour.
+- **It fails closed.** These all count as below the floor:
+  - no key;
+  - an HTTP error or timeout;
+  - an unparseable reply;
+  - a balance older than 10 minutes.
+  
+  `auto` then picks `client` and `local`. An explicit `vultr` or `remote` request returns `error_class: credit_floor`, with the reason.
+- **A second bound.** A local ledger (`~/.local/state/faultforge/spend.jsonl`) adds up FaultForge's own inference spend. If the API looks stale, the ledger keeps the floor honest. The existing $2 a day and $15 total inference caps stay.
+- **The key.**
+  - A Vultr API key that only needs to read the account, kept in `~/.config/faultforge/vultr.env` with mode 0600.
+  - It is never passed to a sandbox, never logged and never returned by a tool.
+  - The account's own keys carry full `root` ACLs, so the owner should make a sub-user with only the `billing` view and use its key. **(Owner action.)**
+- **Every tool result reports** `credit_usd` (rounded to the dollar), `floor_usd` and the effective modes, so Claude can tell the user why a mode changed.
+
+## V4.4 MCP tools (stdio)
+
+These are a superset of v2.1 §3. Every tool returns structured errors, never exceptions, and its output is capped (about 60 lines, with paging through `faultforge_get_run`).
+
+| Tool | Input | What it does |
+|---|---|---|
+| `faultforge_status` | none | Shows Docker and k6 health, which runtimes and fix modes are available, the credit and floor, and the allowed project roots. |
+| `faultforge_list_scenarios` | `project_dir` | Reads `faultforge.yaml` and `stack.yaml`. Sends no load. |
+| `faultforge_validate_scenario` | `project_dir`, `scenario_id?` | Checks the schema, safety and expressions, and that the state hooks exist. Sends no load. |
+| `faultforge_run_scenario` | `project_dir`, `scenario_id`, `source: "commit:<sha>" \| "worktree"`, `runtime?`, `compare_to?` | Snapshots the source, builds a sealed image, runs the load and returns the verdict, evidence and `run_id`. |
+| `faultforge_get_run` | `run_id`, `section`, paging | Returns the report sections and paged evidence. |
+| `faultforge_propose_fix` | `run_id`, `mode?` | `vultr` writes a candidate, verifies it through the full gate, and returns a **diff plus the gate result. It never writes to the repo.** `client` returns a fix brief: the failing evidence, the business rules and the files in scope. |
+| `faultforge_verify_fix` | `run_id`, `source: "worktree" \| "commit:<sha>" \| "candidate:<id>"` | Rebuilds the code and reruns the failing scenario, then all the other scenarios. Applies the full gate: `fix_verified`, the database check, the code hash changing, and the regression suite. |
+
+**Still not exposed:** arbitrary URLs, arbitrary scripts, cancel, and any write to the user's repo.
+
+## V4.5 Safety additions
+
+- **Project roots.** `project_dir` must resolve, after symlinks, inside an allowlist from `~/.config/faultforge/mcp.toml`. The default is empty. The owner would add `~/projects/jade` later.
+- **Source snapshots.**
+  - `commit:<sha>` uses `git archive`.
+  - `worktree` copies tracked files plus untracked files that aren't ignored, from the git index. No symlinks leave the snapshot.
+  - `.env*`, `*.pem` and the `fix.yaml` redact patterns are dropped before anything is built, or sent to a model in `vultr` mode.
+- **Builds.**
+  - They're sealed as in `stack_fix.py`: non-root, a read-only root, no network, and the output tar is validated on the host.
+  - Installing dependencies is the one step that needs network. It runs in a separate trusted step with `--ignore-scripts`, from the lockfile only, before any project code runs.
+  - A project that needs install scripts gets `INCONCLUSIVE: unsupported_build`. It is never quietly given network.
+- **Remote runtime.** JADE's source leaves this machine only in `remote` mode, and the tool output says so. It never shares the public hackathon VM, because that VM's app user is Docker-root and its site is public.
+
+## V4.6 Milestones
+
+Each one stops for the owner's review. Paid steps show their price first.
+
+- **M8: MCP core.** A stdio server using the official `mcp` Python SDK, with `status`, `list_scenarios`, `validate_scenario`, `run_scenario` and `get_run` on the `local` runtime, for the existing Ticket API and SportsDeck stack targets. It adds the project-root allowlist and source snapshots, and an `.mcp.json` example. Tests drive the server over stdio. **$0.**
+- **M9: client fixes.** `propose_fix` in `client` mode, and `verify_fix` from the worktree, with the regression gate. A Claude Code session in a scratch copy of the demo proves the loop end to end. **$0.**
+- **M10: Vultr fixes and the credit floor.** `CreditGuard` with the API check, the ledger and fail-closed behaviour; `vultr` mode, which returns a diff and never writes; and `auto` switching, with tests that fake the balance either side of the floor. **About $0.05 of real inference to confirm it, shown before spending.**
+- **M11: a SvelteKit and Postgres demo.** `demo/redeem-code/` is shaped like `p2-redeem`: a read-then-update with no row lock, so one code is redeemed many times under load. Invariants: `redemptions_per_code <= 1`, `audit_rows == redemptions`, and every loser gets a distinct "already redeemed" reply. A generic Node stack builder replaces SportsDeck's `build.sh`. This also checks that the build fits JADE's stack (Node 24, pnpm, adapter-node). **$0.**
+- **M12: remote runtime.** A dedicated runner VM, used over SSH with a pinned host key. Snapshots are uploaded and removed after the run. It needs a price and the owner's approval before it's created. The cheapest 2 vCPU/4 GB plan is about $0.036/h, the same as the current VM.
+- **Then JADE.** A JADE bead adds the FaultForge config once `p2-redeem` exists, and that goes through JADE's own planloop.
+
+## V4.7 Open questions for the owner
+
+1. **The hackathon VM** (`155.138.147.248`) still bills about $0.036/h, roughly $26 a month. $8.04 is pending since 2026-11-06. Keep it running for judging, or snapshot and destroy it?
+2. **Should the SportsDeck replays** (`feature/sportsdeck`) be merged and deployed to the live site now that the deadline has passed?
+3. **A read-only billing key:** will you create a Vultr sub-user with only `billing` view for the credit check? Without one, `auto` stays in `client` and `local`.
+
+---
+
 # FaultForge — Plan v3 (Vultr Agent Rush: Blast Radius Zero)
 
 Status: **M0 to M6 done and live on a Vultr VM. M7 (submission) in progress.** Team: one person plus Claude Code.
