@@ -11,6 +11,16 @@ ErrorClass = Literal[
     "busy",
     "engine_failed",
     "run_not_found",
+    # The MCP server's own failures (docs/PLAN.md V4.4 and V4.5).
+    "invalid_argument",
+    "project_not_allowed",
+    "not_a_git_repo",
+    "snapshot_too_large",
+    "snapshot_failed",
+    "unsupported_build",
+    "runtime_unavailable",
+    "not_comparable",
+    "sandbox_failed",
 ]
 
 

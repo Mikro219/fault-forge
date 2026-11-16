@@ -81,6 +81,8 @@ class StackConfig(Contract):
 
     postgres_image: str
     redis_image: str
+    # The prebuilt app image the MCP server runs for this stack. The CLI and tests pass their own.
+    app_image: str | None = None
     database_user: str = Field(pattern=r"^[a-z][a-z0-9_]{0,30}$")
     database_name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,30}$")
     app_port: int = 8000
