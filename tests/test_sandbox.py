@@ -151,9 +151,30 @@ def labelled_ids() -> set[str]:
     return set(docker("ps", "-aq", "--no-trunc", "--filter", f"label={LABEL}").stdout.split())
 
 
-def unlabelled_ids() -> set[str]:
-    """IDs only: nothing about the owner's other containers is inspected."""
-    return set(docker("ps", "-aq", "--no-trunc").stdout.split()) - labelled_ids()
+BYSTANDER_LABEL = "faultforge.test=bystander"
+
+
+def start_bystander() -> str:
+    """A container FaultForge didn't make: it has no faultforge.sandbox label. It stands in for the
+    owner's other containers, so the check proves cleanup is scoped to the label without depending on
+    what other projects start or stop on the same machine while the tests run."""
+    started = docker(
+        "run", "-d", "--pull", "never", "--network", "none", "--label", BYSTANDER_LABEL,
+        "faultforge-target:dev", "sleep", "7200",
+    )
+    assert started.returncode == 0, started.stderr
+    return started.stdout.strip()
+
+
+def bystander_state(container: str) -> str:
+    """Running, when it started and how often it restarted: a stop, kill, restart or removal changes it."""
+    inspected = docker("inspect", "--format", "{{.State.Running}} {{.State.StartedAt}} {{.RestartCount}}", container)
+    return inspected.stdout.strip() if inspected.returncode == 0 else "gone"
+
+
+def assert_untouched(container: str, state: str) -> None:
+    assert state.startswith("true "), state
+    assert bystander_state(container) == state, "FaultForge touched a container it didn't create"
 
 
 def report_files(project: Path) -> list[Path]:
@@ -177,19 +198,24 @@ def images() -> Iterator[None]:
         ["bash", str(ROOT / "scripts" / "build_images.sh")], capture_output=True, text=True, timeout=600, check=False
     )
     assert built.returncode == 0, built.stderr
-    others = unlabelled_ids()
-    yield
-    assert unlabelled_ids() == others, "the owner's other containers changed during the session"
+    bystander = start_bystander()
+    state = bystander_state(bystander)
+    try:
+        yield (bystander, state)
+        assert_untouched(bystander, state)
+    finally:
+        # By the ID this fixture was handed when it created it.
+        docker("rm", "-f", bystander)
 
 
 @pytest.fixture
-def contained(images: None) -> Iterator[None]:
-    """Every docker test ends with no labelled containers, and the owner's others untouched."""
-    others = unlabelled_ids()
+def contained(images: tuple[str, str]) -> Iterator[None]:
+    """Every docker test ends with no labelled containers, and the session's bystander, a container
+    without the label, untouched."""
     assert labelled_ids() == set()
     yield
     assert labelled_ids() == set()
-    assert unlabelled_ids() == others
+    assert_untouched(*images)
 
 
 def show(capsys: pytest.CaptureFixture, message: str) -> None:
@@ -1002,16 +1028,16 @@ def test_the_hostile_build_refuses_without_permission(contained: None, tmp_path:
 def test_reap_stale_removes_only_labelled_containers(contained: None) -> None:
     command = ("--pull", "never", "--network", "none", "faultforge-target:dev", "sleep", "120")
     labelled = docker("run", "-d", "--label", f"{LABEL}=test-reap", *command).stdout.strip()
-    bystander = docker("run", "-d", "--label", "faultforge.test=bystander", *command).stdout.strip()
+    bystander = docker("run", "-d", "--label", BYSTANDER_LABEL, *command).stdout.strip()
     try:
         assert labelled and bystander
         assert sandbox.reap_stale(max_age_s=3600) == 0
         assert labelled in labelled_ids()
-        before = unlabelled_ids()
+        state = bystander_state(bystander)
         assert sandbox.reap_stale(max_age_s=0) == 1
         assert labelled not in labelled_ids()
-        assert unlabelled_ids() == before
-        assert bystander in before
+        # Old enough to reap, but not FaultForge's: it must be left exactly as it was.
+        assert_untouched(bystander, state)
     finally:
         # Each by the ID that this test was handed when it created it.
         docker("rm", "-f", labelled)

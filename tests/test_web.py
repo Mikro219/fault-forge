@@ -1508,8 +1508,27 @@ def test_real_runs_through_http(tmp_path: Path) -> None:
     assert built.returncode == 0, built.stderr
     labelled = "label=faultforge.sandbox"
     assert docker_ids("--filter", labelled) == set()
-    everything = docker_ids()
+    # A container FaultForge didn't make (no faultforge.sandbox label), standing in for the owner's
+    # others, so the check doesn't depend on what other projects run on the machine meanwhile.
+    started = subprocess.run(
+        ["docker", "run", "-d", "--pull", "never", "--network", "none", "--label", "faultforge.test=bystander",
+         "faultforge-target:dev", "sleep", "1800"], capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert started.returncode == 0, started.stderr
+    bystander = started.stdout.strip()
+    state_format = ["docker", "inspect", "--format", "{{.State.Running}} {{.State.StartedAt}} {{.RestartCount}}", bystander]
+    state = subprocess.run(state_format, capture_output=True, text=True, timeout=30, check=True).stdout.strip()
+    assert state.startswith("true ")
+    try:
+        _real_runs(tmp_path)
+        assert docker_ids("--filter", labelled) == set()
+        after = subprocess.run(state_format, capture_output=True, text=True, timeout=30, check=False).stdout.strip()
+        assert after == state, "FaultForge touched a container it didn't create"
+    finally:
+        subprocess.run(["docker", "rm", "-f", bystander], capture_output=True, timeout=60, check=False)
 
+
+def _real_runs(tmp_path: Path) -> None:
     manager = RunManager(WebSettings(data_dir=tmp_path / "data", cooldown_s=0.0), TARGETS)
     with TestClient(create_app(manager), client=LOOPBACK) as client:
         def finish(target: str) -> dict:
@@ -1545,5 +1564,3 @@ def test_real_runs_through_http(tmp_path: Path) -> None:
 
         replays = client.get("/api/replays").json()["replays"]
         assert {item["target"] for item in replays} == {"ticket-api", "hostile-build"}
-    assert docker_ids("--filter", labelled) == set()
-    assert docker_ids() == everything
