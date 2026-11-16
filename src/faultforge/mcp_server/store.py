@@ -4,8 +4,14 @@ A run lives in <state>/runs/<run_id>/: the runner's report.json, report.md, requ
 files, plus run.json with what the server knows about how it ran. Every view stays short: about 60
 lines, with the rest paged through faultforge_get_run. Text the target could influence, such as a
 captured response field or a probe's detail, is cleaned and cut short.
+
+A run also keeps pinned/: the faultforge.yaml it ran with, BUSINESS_RULES.md if the snapshot had
+one, and for a Python target the support package beside app.py. A fix is judged against those copies
+only, never against the config or the package in a candidate's tree, so an edit that weakens a rule
+or rewrites a test hook alongside the code can't pass the gate.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -17,14 +23,19 @@ from typing import Literal
 
 from pydantic import Field, ValidationError
 
-from faultforge import report as report_module, safety
+from faultforge import config as config_module, report as report_module, safety
 from faultforge.errors import FaultForgeError
 from faultforge.mcp_server.settings import private_dir
 from faultforge.models import Contract, Report, RequestRecord
-from faultforge.sandbox import SandboxResult
+from faultforge.sandbox import SandboxResult, code_dir_sha256
 
 RUN_META_NAME = "run.json"
 SANDBOX_NAME = "sandbox.json"
+PINNED_DIR = "pinned"
+PACKAGE_DIR = "package"
+RULES_NAME = "BUSINESS_RULES.md"
+MAX_RULES_BYTES = 64 * 1024
+MAX_SCOPE_FILES = 200
 MAX_META_BYTES = 256 * 1024
 MAX_REPORT_BYTES = 16 * 1024 * 1024
 MAX_EVIDENCE_LINES = 100_000
@@ -57,6 +68,20 @@ class RunMeta(Contract):
     limits_applied: bool | None = None
     state_verification: str | None = None
     notes: list[str] = Field(default_factory=list)
+    # sha256 of pinned/faultforge.yaml. None for a run stored before configs were pinned.
+    pinned_config_sha256: str | None = None
+    # The support package pinned with a Python run, and the hash of pinned/package (sandbox.py's
+    # code_dir_sha256). The hash is None for a stack run and for a run stored before packages were
+    # pinned; the name is None when the project has no package beside app.py.
+    pinned_package: str | None = None
+    pinned_package_sha256: str | None = None
+    # The files the host deployed for a Python target, relative to the project, each with its sha256.
+    scope: dict[str, str] = Field(default_factory=dict, max_length=MAX_SCOPE_FILES)
+    # "run" for faultforge_run_scenario. The runs faultforge_verify_fix stores are "verify" (the main
+    # scenario) and "regression"; neither can be the baseline of a fix.
+    role: Literal["run", "verify", "regression"] = "run"
+    # Set on the run faultforge_verify_fix stores: the whole gate's answer, not the comparison alone.
+    fix_gate: dict[str, object] | None = None
 
 
 def clean(value: object, limit: int = MAX_TEXT) -> str:
@@ -87,8 +112,62 @@ def _regular_file(path: Path, limit: int) -> Path:
     return path
 
 
-def store_run(state: Path, work_dir: Path, report: Report, meta: RunMeta, result: SandboxResult) -> Path:
-    """Moves the runner's run directory out of the throwaway work dir, then records how it ran."""
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _pin(destination: Path, source_dir: Path) -> None:
+    """Copies the config a run used, and its business rules if there are any, into the run."""
+    pinned = destination / PINNED_DIR
+    pinned.mkdir(mode=0o700)
+    for name, limit, required in (
+        (config_module.CONFIG_NAME, config_module.MAX_CONFIG_BYTES, True), (RULES_NAME, MAX_RULES_BYTES, False),
+    ):
+        source = source_dir / name
+        try:
+            info = source.lstat()
+        except FileNotFoundError:
+            info = None
+        if info is None or not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            if required:
+                raise FaultForgeError("engine_failed", f"{name} can't be pinned for this run")
+            continue
+        shutil.copyfile(source, pinned / name, follow_symlinks=False)
+        os.chmod(pinned / name, 0o600)
+
+
+def _pin_package(destination: Path, package: Path | None) -> tuple[str | None, str]:
+    """Copies the support package a Python run deployed into pinned/package/<name>/ and returns its
+    name and the hash of pinned/package. The source is a snapshot or another run's pinned copy, so
+    it holds regular files only, with secrets already dropped; anything else is refused. Bytecode is
+    left out, as sandbox.py leaves it out of what it deploys."""
+    root = destination / PINNED_DIR / PACKAGE_DIR
+    root.mkdir(mode=0o700)
+    if package is not None:
+        if package.is_symlink() or not package.is_dir() or not package.name.isidentifier():
+            raise FaultForgeError("engine_failed", "the support package can't be pinned for this run")
+        for directory, subdirs, files in os.walk(package, followlinks=False):
+            subdirs[:] = sorted(name for name in subdirs if name != "__pycache__")
+            target = root / package.name / Path(directory).relative_to(package)
+            target.mkdir(mode=0o700)
+            for name in [*subdirs, *files]:
+                info = (Path(directory) / name).lstat()
+                if not (stat.S_ISDIR(info.st_mode) if name in subdirs else stat.S_ISREG(info.st_mode)):
+                    raise FaultForgeError("engine_failed", "the support package holds a link or special file")
+            for name in files:
+                if not name.endswith(".pyc"):
+                    shutil.copyfile(Path(directory) / name, target / name, follow_symlinks=False)
+                    os.chmod(target / name, 0o600)
+    return (package.name if package is not None else None), code_dir_sha256(root)
+
+
+def store_run(
+    state: Path, work_dir: Path, report: Report, meta: RunMeta, result: SandboxResult, pin_from: Path | None = None,
+    package_from: Path | None = None,
+) -> Path:
+    """Moves the runner's run directory out of the throwaway work dir, then records how it ran.
+    pin_from is the directory holding the faultforge.yaml the run used. For a Python run,
+    package_from is the support package it deployed, or None if it has none."""
     source = report_module.run_dir(work_dir, report.run_id)
     destination = run_path(state, report.run_id)
     # mkdir is exclusive, so a second server with the same state dir can't merge two runs into one.
@@ -97,6 +176,11 @@ def store_run(state: Path, work_dir: Path, report: Report, meta: RunMeta, result
     except FileExistsError as error:
         raise FaultForgeError("engine_failed", f"{report.run_id} is already stored") from error
     os.rename(source, destination)
+    if pin_from is not None:
+        _pin(destination, pin_from)
+        if meta.kind == "python":
+            name, digest = _pin_package(destination, package_from)
+            meta = meta.model_copy(update={"pinned_package": name, "pinned_package_sha256": digest})
     report_module.write_json(destination / RUN_META_NAME, meta.model_dump(mode="json"))
     report_module.write_json(destination / SANDBOX_NAME, result.model_dump(mode="json", exclude={"report"}))
     return destination
@@ -108,6 +192,56 @@ def stage_baseline(state: Path, work_dir: Path, run_id: str) -> None:
     destination = report_module.run_dir(work_dir, run_id)
     destination.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, destination / report_module.REPORT_NAME, follow_symlinks=False)
+
+
+def pinned_config(state: Path, meta: RunMeta) -> Path:
+    """The config a run was stored with, checked against the hash recorded beside it. Fails closed:
+    without it a fix can't be judged against this run."""
+    hint = "Call faultforge_run_scenario again to make a new baseline, then fix against that run."
+    if meta.pinned_config_sha256 is None:
+        raise FaultForgeError("not_comparable", f"{meta.run_id} was stored without a pinned {config_module.CONFIG_NAME}", hint)
+    path = run_path(state, meta.run_id) / PINNED_DIR / config_module.CONFIG_NAME
+    try:
+        info = path.lstat()
+        usable = stat.S_ISREG(info.st_mode) and info.st_size <= config_module.MAX_CONFIG_BYTES
+        usable = usable and file_sha256(path) == meta.pinned_config_sha256
+    except OSError:
+        usable = False
+    if not usable:
+        raise FaultForgeError("not_comparable", f"the pinned {config_module.CONFIG_NAME} of {meta.run_id} is missing or changed", hint)
+    return path
+
+
+def pinned_package(state: Path, meta: RunMeta) -> Path | None:
+    """The support package a run deployed, checked against the hash recorded beside it, or None if
+    the project had none. Fails closed like pinned_config: a fix deploys this copy, never the
+    candidate's."""
+    hint = "Call faultforge_run_scenario again to make a new baseline, then fix against that run."
+    if meta.pinned_package_sha256 is None:
+        raise FaultForgeError("not_comparable", f"{meta.run_id} was stored without a pinned support package", hint)
+    root = run_path(state, meta.run_id) / PINNED_DIR / PACKAGE_DIR
+    try:
+        entries = sorted(entry.name for entry in root.iterdir())
+        usable = not root.is_symlink() and entries == ([meta.pinned_package] if meta.pinned_package else [])
+        usable = usable and not any(path.is_symlink() for path in root.rglob("*"))
+        usable = usable and code_dir_sha256(root) == meta.pinned_package_sha256
+    except OSError:
+        usable = False
+    if not usable:
+        raise FaultForgeError("not_comparable", f"the pinned support package of {meta.run_id} is missing or changed", hint)
+    return root / meta.pinned_package if meta.pinned_package else None
+
+
+def pinned_rules(state: Path, run_id: str) -> str | None:
+    """The business rules pinned with a run, or None. Written by the project, so untrusted text."""
+    path = run_path(state, run_id) / PINNED_DIR / RULES_NAME
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_RULES_BYTES:
+            return None
+        return path.read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return None
 
 
 def read_meta(state: Path, run_id: object) -> RunMeta:
@@ -234,6 +368,13 @@ def summary(state: Path, run_id: str) -> dict[str, object]:
     probes = _probe_lines(state, run_id)
     if probes:
         result["probes"] = probes
+    if meta.fix_gate is not None:
+        # The comparison above is one gate of four; this is the whole answer, on one line.
+        failed = meta.fix_gate.get("failed")
+        names = ", ".join(clean(name, 40) for name in failed) if isinstance(failed, list) and failed else "none"
+        result["fix_gate"] = (
+            f"verified={meta.fix_gate.get('verified') is True} against {clean(meta.fix_gate.get('baseline_run_id'), 40)}; failed gates: {names}"
+        )
     return result
 
 

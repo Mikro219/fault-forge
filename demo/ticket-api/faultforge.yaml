@@ -4,6 +4,17 @@ target:
   health: /health
   reset: { method: POST, path: /__ff/reset, json: { stock: 1 } }
   state: /__ff/state
+  # Read-only SQL the sandbox host runs against the target's SQLite file after a run, to check the
+  # state above against the database itself. Kept equal to TICKET_API_STATE_VERIFIER in sandbox.py.
+  state_queries:
+    stock: SELECT COALESCE(SUM(stock), 0) FROM items
+    orders_confirmed: SELECT COUNT(*) FROM orders
+    payments_unattached: >-
+      SELECT COUNT(*) FROM payments WHERE status IN ('authorized', 'void_pending')
+      AND id NOT IN (SELECT payment_id FROM orders WHERE payment_id IS NOT NULL)
+    orders_without_payment: >-
+      SELECT COUNT(*) FROM orders WHERE payment_id IS NULL
+      OR payment_id NOT IN (SELECT id FROM payments WHERE status = 'authorized')
 
 scenarios:
   - id: last-ticket-rush

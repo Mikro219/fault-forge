@@ -5,6 +5,7 @@ enforce the verdict rules, so a report that claims more than its evidence suppor
 can't be constructed.
 """
 
+import re
 from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -12,6 +13,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 SCHEMA_VERSION = "2.1"
 MAX_SAMPLES_PER_VIOLATION = 10
 MAX_STATUSES = 32
+# The same bounds as sandbox.py's state verifier; tests/test_mcp.py keeps the two in step.
+MAX_STATE_QUERIES = 32
+MAX_STATE_QUERY_CHARS = 2000
+STATE_QUERY_NAME = r"[a-z][a-z0-9_]{0,47}"
 
 Verdict = Literal["PASS", "FAIL", "INCONCLUSIVE", "ERROR"]
 Outcome = Literal["accepted", "rejected", "unexpected", "transport_error"]
@@ -79,6 +84,23 @@ class TargetConfig(Contract):
     reset: ResetHook | None = None
     # Where health, state and reset live, for an app that has no test hooks of its own.
     hooks_origin: str | None = None
+    # State field name to one read-only SQL query that returns its value as an integer. The sandbox
+    # host runs them against the target's database, so a state the target reports through its hooks
+    # can be checked directly. They are only as trustworthy as the project that declares them.
+    state_queries: dict[str, str] | None = None
+
+    @model_validator(mode="after")
+    def state_queries_are_plain(self) -> Self:
+        if self.state_queries is None:
+            return self
+        if not 1 <= len(self.state_queries) <= MAX_STATE_QUERIES:
+            raise ValueError(f"state_queries needs 1 to {MAX_STATE_QUERIES} fields")
+        for name, sql in self.state_queries.items():
+            if not re.fullmatch(STATE_QUERY_NAME, name):
+                raise ValueError("a state_queries field name must be a plain lowercase name such as orders_confirmed")
+            if not sql.strip() or len(sql) > MAX_STATE_QUERY_CHARS or "\0" in sql:
+                raise ValueError(f"state_queries.{name} must be SQL of 1 to {MAX_STATE_QUERY_CHARS} characters")
+        return self
 
 
 class RequestTemplate(Contract):

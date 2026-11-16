@@ -1219,6 +1219,13 @@ def _regression_detail(records: Sequence[RegressionRecord], config_path: Path) -
     return "\n".join(lines)
 
 
+# The gate's steps under public names, for the other callers that judge a candidate with them
+# (the MCP server's faultforge_verify_fix). One definition, so every caller applies the same gate.
+run_candidate = _run_candidate
+run_regression = _run_regression
+regression_detail = _regression_detail
+
+
 def _record(
     number: int, proposal: Proposal, result: SandboxResult | None, failure: str | None, detail: str | None,
     violations: tuple[str, ...], baseline_code_sha256: str | None, wall_seconds: float,

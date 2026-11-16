@@ -21,6 +21,9 @@ ErrorClass = Literal[
     "runtime_unavailable",
     "not_comparable",
     "sandbox_failed",
+    # Fixes (docs/PLAN.md V4.4): a mode that isn't built, and a run with nothing to fix.
+    "mode_unavailable",
+    "nothing_to_fix",
 ]
 
 
