@@ -230,9 +230,13 @@ def _link_stays_inside(link: Path, target: str) -> bool:
     return True
 
 
-def extract_output(stream, destination: Path, max_bytes: int = MAX_BUILD_OUTPUT_BYTES, max_members: int = MAX_OUTPUT_MEMBERS) -> int:
+def extract_output(
+    stream, destination: Path, max_bytes: int = MAX_BUILD_OUTPUT_BYTES, max_members: int = MAX_OUTPUT_MEMBERS,
+    tops: Sequence[str] | None = None,
+) -> int:
     """Rebuilds a hostile tar stream as plain files under destination. Checks each header before
-    writing, so a huge or sparse file is refused without writing it. Returns the bytes written."""
+    writing, so a huge or sparse file is refused without writing it. Returns the bytes written.
+    With tops, every member must sit under one of those names, the ones the caller asked tar for."""
     total = 0
     seen = 0
     links: list[tuple[Path, str]] = []
@@ -242,6 +246,8 @@ def extract_output(stream, destination: Path, max_bytes: int = MAX_BUILD_OUTPUT_
             if seen > max_members:
                 raise UnsafeOutput("too many files")
             relative = _safe_member_path(member.name)
+            if tops is not None and (not relative.parts or relative.parts[0] not in tops):
+                raise UnsafeOutput("the output holds something the caller didn't ask for")
             target = destination / relative
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True, mode=0o755)
@@ -301,16 +307,20 @@ def _wait_for_build(policy, name: str) -> int | None:
     return None
 
 
-def _copy_output(policy, name: str, destination: Path) -> None:
-    """tar runs in the container, which is hostile, so its output is only ever treated as data."""
+def _copy_output(
+    policy, name: str, destination: Path, root: str = "/app/.next", members: Sequence[str] = ("standalone", "static"),
+    max_bytes: int = MAX_BUILD_OUTPUT_BYTES,
+) -> None:
+    """tar runs in the container, which is hostile, so its output is only ever treated as data.
+    root and members are the caller's own fixed names, never the project's free text."""
     process = subprocess.Popen(
-        [policy.docker, "exec", name, "tar", "-C", "/app/.next", "-cf", "-", "standalone", "static"],
+        [policy.docker, "exec", name, "tar", "-C", root, "-cf", "-", *members],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=docker_env(),
     )
     timer = threading.Timer(COPY_TIMEOUT_S, process.kill)
     timer.start()
     try:
-        extract_output(process.stdout, destination)
+        extract_output(process.stdout, destination, max_bytes, tops=tuple(Path(member).parts[0] for member in members))
     finally:
         timer.cancel()
         process.kill()

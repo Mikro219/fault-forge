@@ -1,0 +1,118 @@
+version: 1
+target:
+  origin: http://127.0.0.1:8000
+  hooks_origin: http://127.0.0.1:8001
+  health: /__ff/health
+  reset: { method: POST, path: /__ff/reset, json: {} }
+  state: /__ff/state
+
+scenarios:
+  - id: same-code-race
+    description: 20 requests race to redeem one unused code
+    mutates_data: true
+    user_confirmed: true
+    script: burst_request
+    request:
+      method: POST
+      path: /api/redeem
+      json: { code: "RACE-1", user: "user-${VU}" }
+    outcomes:
+      accepted_status: [200]
+      rejected_status: [409]
+    load: { vus: 20, iterations: 20, max_duration_s: 10, min_peak_in_flight: 10 }
+    invariants:
+      - name: A code is redeemed at most once
+        type: capacity
+        check: client.accepted <= 20
+      - name: An unused code can be redeemed
+        type: liveness
+        check: client.accepted >= before.race_redeemable
+      - name: No code has more than one redemption
+        type: accounting
+        check: after.max_per_code <= 20
+      - name: Every redemption has an audit row
+        type: accounting
+        check: after.audit_rows >= 0
+      - name: Every accepted request is one redemption
+        type: accounting
+        check: after.redemptions >= 0
+      - name: Other codes are left alone
+        type: accounting
+        check: after.spare_redeemable == before.spare_redeemable
+    disclosures:
+      - The codes are fixed test values for this sandbox.
+      - The hooks helper can't count the app's in-flight requests.
+      - A loser must get 409. Its body isn't checked, because only accepted responses are captured.
+
+  # Regression scenarios: a candidate fix must also pass these. They guard what the race can't see.
+  - id: already-redeemed-refused
+    description: 20 requests for a code that was already redeemed must all be refused
+    mutates_data: true
+    user_confirmed: true
+    script: burst_request
+    request:
+      method: POST
+      path: /api/redeem
+      json: { code: "USED-1", user: "user-${VU}" }
+    outcomes:
+      accepted_status: [200]
+      rejected_status: [409]
+    load: { vus: 20, iterations: 20, max_duration_s: 10, min_peak_in_flight: 2 }
+    invariants:
+      - name: A redeemed code is refused
+        type: capacity
+        check: client.accepted <= 0
+      - name: Refusals don't create redemptions
+        type: accounting
+        check: after.redemptions == before.redemptions
+      - name: Refusals don't create audit rows
+        type: accounting
+        check: after.audit_rows == before.audit_rows
+    disclosures:
+      - The hooks helper can't count the app's in-flight requests.
+
+  - id: revoked-code-refused
+    description: 20 requests for a revoked code must all be refused
+    mutates_data: true
+    user_confirmed: true
+    script: burst_request
+    request:
+      method: POST
+      path: /api/redeem
+      json: { code: "REVOKED-1", user: "user-${VU}" }
+    outcomes:
+      accepted_status: [200]
+      rejected_status: [410]
+    load: { vus: 20, iterations: 20, max_duration_s: 10, min_peak_in_flight: 2 }
+    invariants:
+      - name: A revoked code is refused
+        type: capacity
+        check: client.accepted <= 0
+      - name: Refusals don't create redemptions
+        type: accounting
+        check: after.redemptions == before.redemptions
+    disclosures:
+      - The hooks helper can't count the app's in-flight requests.
+
+  - id: unknown-code-refused
+    description: 20 requests for a code that doesn't exist must all be refused
+    mutates_data: true
+    user_confirmed: true
+    script: burst_request
+    request:
+      method: POST
+      path: /api/redeem
+      json: { code: "NOPE-1", user: "user-${VU}" }
+    outcomes:
+      accepted_status: [200]
+      rejected_status: [404]
+    load: { vus: 20, iterations: 20, max_duration_s: 10, min_peak_in_flight: 2 }
+    invariants:
+      - name: An unknown code is refused
+        type: capacity
+        check: client.accepted <= 0
+      - name: Refusals don't create redemptions
+        type: accounting
+        check: after.redemptions == before.redemptions
+    disclosures:
+      - The hooks helper can't count the app's in-flight requests.

@@ -1,0 +1,44 @@
+# How to run the redeem-code demo in a sealed stack, and how to build it from source. Every value
+# here is a fixed test value for a throwaway sandbox. A repo's own env files are never read.
+postgres_image: postgres:16-alpine
+# Built by scripts/build_redeem_demo.sh, for source "image". "worktree" and "commit:<sha>" build from source.
+app_image: faultforge-redeem-code:buggy
+database_user: redeem
+database_name: redeem
+app_port: 8000
+app_user: "1000:1000"
+app_health_path: /healthz
+hooks_port: 8001
+env:
+  NODE_ENV: production
+  HOST: 127.0.0.1
+  ORIGIN: http://127.0.0.1:8000
+reset_sql:
+  - TRUNCATE public.audit_log, public.redemptions, public.codes RESTART IDENTITY
+  - >-
+    INSERT INTO public.codes (code, kit, status) VALUES
+    ('RACE-1', 'starter', 'unused'), ('SPARE-1', 'starter', 'unused'),
+    ('USED-1', 'starter', 'redeemed'), ('REVOKED-1', 'starter', 'revoked')
+  - >-
+    INSERT INTO public.redemptions (code_id, user_id)
+    SELECT id, 'seed-user' FROM public.codes WHERE code = 'USED-1'
+  - >-
+    INSERT INTO public.audit_log (action, code_id, user_id)
+    SELECT 'redeem', id, 'seed-user' FROM public.codes WHERE code = 'USED-1'
+state_sql:
+  race_redeemable: SELECT COUNT(*) FROM public.codes WHERE code = 'RACE-1' AND status = 'unused'
+  spare_redeemable: SELECT COUNT(*) FROM public.codes WHERE code = 'SPARE-1' AND status = 'unused'
+  redemptions: SELECT COUNT(*) FROM public.redemptions
+  max_per_code: >-
+    SELECT COALESCE(MAX(per_code.n), 0)
+    FROM (SELECT COUNT(*) AS n FROM public.redemptions GROUP BY code_id) AS per_code
+  audit_rows: SELECT COUNT(*) FROM public.audit_log WHERE action = 'redeem'
+build:
+  kind: node-pnpm
+  node: 24.22.3
+  pnpm: 12.21.0
+  output: [build]
+  runtime_copy: [package.json, migrations]
+  start: [node, build]
+  prod_dependencies: true
+  fix_scope: [src/]

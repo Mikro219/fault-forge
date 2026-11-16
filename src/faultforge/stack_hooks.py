@@ -6,8 +6,14 @@ reports can still be affected by what the app does to its own database. Standard
 pg8000 only: this file is copied alone into the image, and imports nothing from FaultForge.
 
 State has no in_flight count, because a separate process can't see the app's requests.
+
+Every call must carry the run's token, which the sandbox gives to this helper and to the runner
+only. That keeps an app that calls a /__ff/ path by accident from resetting the data. It is not a
+defence against a hostile app, which owns its schema and can act through it. Every admin session
+sets its search_path first, so built-in names can't be shadowed from the app's schema.
 """
 
+import hmac
 import json
 import os
 import urllib.error
@@ -16,6 +22,19 @@ from collections.abc import Callable, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MAX_BODY_BYTES = 4096
+TOKEN_ENV = "FF_HOOKS_TOKEN"
+TOKEN_HEADER = "X-FF-Hooks-Token"
+DEFAULT_SEARCH_PATH = "pg_catalog, public"
+
+
+def token_matches(expected: str, given: str | None) -> bool:
+    """False for a missing token on either side: a helper without one answers nobody."""
+    return bool(expected) and given is not None and hmac.compare_digest(expected.encode(), given.encode("utf-8", "replace"))
+
+
+def session_statements(search_path: str, sql: str) -> list[str]:
+    """What one admin session runs: the search_path first, then the statement."""
+    return [f"SET search_path = {search_path}", sql]
 
 
 def database_state(run: Callable[[str], Sequence], queries: dict[str, str]) -> dict[str, int]:
@@ -31,10 +50,16 @@ def state_body(values: dict[str, int], build_id: str, instance_id: str, started_
     }
 
 
-def make_handler(run: Callable[[str], Sequence], spec: dict, app_health_url: str) -> type[BaseHTTPRequestHandler]:
+def make_handler(run: Callable[[str], Sequence], spec: dict, app_health_url: str, token: str = "") -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_: object) -> None:
             pass
+
+        def _allowed(self) -> bool:
+            if token_matches(token, self.headers.get(TOKEN_HEADER)):
+                return True
+            self._send(403, {"error": "token_required"})
+            return False
 
         def _send(self, status: int, body: object) -> None:
             data = json.dumps(body).encode()
@@ -49,6 +74,8 @@ def make_handler(run: Callable[[str], Sequence], spec: dict, app_health_url: str
 
         def do_GET(self) -> None:
             try:
+                if not self._allowed():
+                    return
                 if self.path == "/__ff/health":
                     # Any answer below 500 means the app is up, and an error status isn't failure here.
                     try:
@@ -66,6 +93,8 @@ def make_handler(run: Callable[[str], Sequence], spec: dict, app_health_url: str
 
         def do_POST(self) -> None:
             try:
+                if not self._allowed():
+                    return
                 if self.path != "/__ff/reset":
                     self._send(404, {})
                     return
@@ -90,11 +119,15 @@ def main() -> None:
             database=spec["database_name"], timeout=2,
         )
         try:
-            return connection.run(sql) or ()
+            result: Sequence = ()
+            for statement in session_statements(spec.get("search_path", DEFAULT_SEARCH_PATH), sql):
+                result = connection.run(statement) or ()
+            return result
         finally:
             connection.close()
 
-    ThreadingHTTPServer((host, port), make_handler(run, spec, spec["app_health_url"])).serve_forever()
+    handler = make_handler(run, spec, spec["app_health_url"], os.environ.get(TOKEN_ENV, ""))
+    ThreadingHTTPServer((host, port), handler).serve_forever()
 
 
 if __name__ == "__main__":

@@ -85,6 +85,25 @@ Each one stops for the owner's review. Paid steps show their price first.
 - **M12: remote runtime.** A dedicated runner VM, used over SSH with a pinned host key. Snapshots are uploaded and removed after the run. It needs a price and the owner's approval before it's created. The cheapest 2 vCPU/4 GB plan is about $0.036/h, the same as the current VM.
 - **Then JADE.** A JADE bead adds the FaultForge config once `p2-redeem` exists, and that goes through JADE's own planloop.
 
+### M11 decisions (2026-11-16)
+
+The owner approved these before the build; the reviewed plan had them as D1 to D16, B1, B2 and I1 to I6.
+
+- **Network.** `registry.npmjs.org:443` only, on three occasions: the pnpm tarball for the toolchain image, the demo's lockfile, and one fetch per new lockfile through the egress proxy. $0. Never nodejs.org: a lockfile's Node runtime entry is not fetched.
+- **`allow_network_install`** in `mcp.toml`, default false. Only `faultforge_run_scenario` may fetch, on a cache miss. `faultforge_verify_fix` never does.
+- **The egress proxy** runs on networks made for the run: an internal one with no gateway to the host, and its own egress network, never the default bridge.
+- **Fix scope.** `src/` by default, declared in the pinned `stack.yaml`. Dependency files and FaultForge's own files can never be in scope. Edits outside it are ignored and reported, not refused.
+- **`code_changed`** for a stack built from source compares the host's hash of the assembled source, not image IDs.
+- **No `app_policy` row** for a stack fix. A per-run hooks token is added; it stops accidents, not hostile code.
+- **SportsDeck stays on `build.sh`** and `source: "image"`. This departs from the M11 line above: it uses npm with a lockfile that doesn't match, and Prisma, which needs install scripts, exactly what the builder refuses.
+- **`redis_image` is optional.** Install scripts are never run; a project that needs them is `unsupported_build`.
+- **`vultr` fixes for a stack** are `mode_unavailable`; `auto` picks `client`.
+- **Postgres** uses `--auth-host=scram-sha-256` for every stack, SportsDeck included (V3.3).
+- **Retention.** 5 install-cache volumes, least recently used first out. Built images are removed after each call. Pinned source is kept with its run.
+- **Deferred to the JADE bead:** a `prestart` step (migrations run as a separate owner role before the app); the redeem rate limit, which 20 requests from one address would trip; a `build_env` map of fixed test values if a later phase imports `$env/static/*` (none does today); and `postgres:16.16-bookworm`, because `stack.py` assumes the alpine image's uid 70.
+
+What the build found, and what changed because of it, is in `docs/VERIFIED.md` under M11.
+
 ## V4.7 Open questions for the owner
 
 1. **The hackathon VM** (`155.138.147.248`) still bills about $0.036/h, roughly $26 a month. $8.04 is pending since 2026-11-06. Keep it running for judging, or snapshot and destroy it?
@@ -138,6 +157,7 @@ Applied to both containers:
 | Code freshness | `PYTHONDONTWRITEBYTECODE=1` and a fresh code directory with no `__pycache__`, so a retest can't run stale bytecode (`docs/VERIFIED.md`) |
 | Lifetime | Wall-clock kill at the §4.6 budget; always removed afterwards |
 | Leftovers | Containers are labelled; a reaper removes strays at startup and on a timer |
+| Stack database (M11) | Postgres starts with `POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256`, so every TCP login needs a password and the app can't log in as the administrator over the loopback it shares. The host reads through the unix socket inside the postgres container. Admin sessions pin `search_path = pg_catalog, public`. The hooks helper answers only the holder of a per-run token |
 
 **Should have:** gVisor (`--runtime=runsc`) if it installs cleanly on the VM. Without it, containers share the VM's kernel, and the README says so.
 

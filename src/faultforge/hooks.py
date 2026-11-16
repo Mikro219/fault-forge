@@ -1,6 +1,7 @@
 """Calls the target's health, reset and state hooks. Responses are untrusted and size-limited."""
 
 import json
+import os
 import re
 import threading
 from dataclasses import dataclass, field
@@ -16,6 +17,11 @@ MAX_STATE_FIELDS = 128
 MAX_BUILD_VALUE_LENGTH = 128
 MAX_STATE_VALUE = 2**63
 BUILD_VALUE_PATTERN = re.compile(r"[\x20-\x7e]+")
+# A stack's hooks helper answers only a caller that holds the run's token. The sandbox gives it to
+# the runner alone, in this variable; it is sent only to a separate hooks origin, never to the target.
+HOOKS_TOKEN_ENV = "FF_HOOKS_TOKEN"
+HOOKS_TOKEN_HEADER = "X-FF-Hooks-Token"
+HOOKS_TOKEN_PATTERN = re.compile(r"[a-f0-9]{32}")
 
 
 class HookError(Exception):
@@ -66,8 +72,10 @@ def parse_snapshot(raw: dict) -> Snapshot:
     )
 
 
-def _fetch(client: httpx.Client, method: str, url: str, label: str, body: dict | None) -> bytes:
+def _fetch(client: httpx.Client, method: str, url: str, label: str, body: dict | None, token: str | None = None) -> bytes:
     headers = {"Accept-Encoding": "identity"}
+    if token is not None:
+        headers[HOOKS_TOKEN_HEADER] = token
     with client.stream(method, url, json=body, headers=headers) as response:
         if response.status_code != 200:
             raise HookError(f"{label} returned {response.status_code}")
@@ -86,6 +94,10 @@ class TargetHooks:
     def __init__(self, target: TargetConfig, timeout_s: float):
         self.target = target
         self.timeout_s = timeout_s
+        token = os.environ.get(HOOKS_TOKEN_ENV, "")
+        # Only for a hooks origin of its own: the token must never reach the target's own port.
+        separate = target.hooks_origin is not None and target.hooks_origin != target.origin
+        self.token = token if separate and HOOKS_TOKEN_PATTERN.fullmatch(token) else None
 
     def _call(self, method: str, path: str, body: dict | None = None) -> bytes:
         """timeout_s is a hard limit on the whole call. httpx timeouts apply per read, so on
@@ -98,7 +110,7 @@ class TargetHooks:
 
         def attempt() -> None:
             try:
-                outcome.append(_fetch(client, method, url, label, body))
+                outcome.append(_fetch(client, method, url, label, body, self.token))
             except Exception as error:
                 outcome.append(error)
 

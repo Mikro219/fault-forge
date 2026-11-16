@@ -13,8 +13,11 @@ With neither key file, the server makes no network call at all, `auto` is `clien
 
 ```bash
 uv sync                      # the dev group includes the mcp SDK; or: uv sync --extra mcp
-bash scripts/build_images.sh # faultforge-target:dev, faultforge-runner:dev, faultforge-stack-hooks:dev
+bash scripts/build_images.sh # faultforge-target:dev, faultforge-runner:dev, faultforge-stack-hooks:dev,
+                             # faultforge-egress-proxy:dev and the Node toolchain (24.22.3, pnpm 12.21.0)
 ```
+
+`build_images.sh` uses the network: PyPI for the Python images, and `registry.npmjs.org` once for the pnpm tarball, whose sha512 is checked against `docker/pnpm.lock` before it is installed. The server itself never pulls or builds an image.
 
 Allow the projects the server may touch. With no file, every project is refused.
 
@@ -22,6 +25,7 @@ Allow the projects the server may touch. With no file, every project is refused.
 # ~/.config/faultforge/mcp.toml
 allowed_roots = ["/home/mikep/projects/fault-forge/demo"]
 allowed_images = ["faultforge-sportsdeck:buggy"]
+allow_network_install = false   # the default; see "Building a stack from source"
 ```
 
 `project_dir` must resolve, with symlinks followed, inside one of these roots. A stack project may only run an `app_image` listed in `allowed_images`; the default is empty, so no image runs until the owner lists it. Set `FF_MCP_CONFIG` to use a different file, and `FF_MCP_STATE_DIR` to move the state directory (by default `~/.local/state/faultforge`).
@@ -58,7 +62,43 @@ Every failure is `{status: "error", error_class, message, fix_hint}`, never an e
 - **Python target.** `app.py` at the project root, served as `uvicorn app:app`, with at most one package beside it. Its `source` is one of:
   - `worktree`: tracked files plus untracked files that aren't ignored;
   - `commit:<sha>`: the commit's raw blobs, read with `git ls-tree` and `git cat-file`. `git archive` isn't used, because it runs the repo's filter drivers on the host.
-- **Stack target.** A project with `stack.yaml`. In M8 the only source is `image`: the prebuilt `app_image` that `stack.yaml` names, run as it is. The image must be listed in `allowed_images`, or the run is refused with `project_not_allowed` and a hint naming the config file. The result says the source wasn't rebuilt. Building from source arrives in M11.
+- **Stack target.** A project with `stack.yaml`: an app, Postgres and, if the stack names one, Redis. Its `source` is one of:
+  - `image`: the prebuilt `app_image` that `stack.yaml` names, run as it is. The image must be listed in `allowed_images`, or the run is refused with `project_not_allowed` and a hint naming the config file. The result says the source wasn't rebuilt. A run from `image` can't be fixed: there is no source to fix against.
+  - `worktree` or `commit:<sha>`, when `stack.yaml` has a `build:` section: the app is built from the snapshot (next section). Without a `build:` section these give `unsupported_build`.
+
+### Building a stack from source
+
+```yaml
+# stack.yaml
+build:
+  kind: node-pnpm            # the only kind
+  node: 24.22.3              # exact; must equal .nvmrc and engines.node where they exist
+  pnpm: 12.21.0              # exact; must equal package.json's packageManager
+  output: [build]            # directories the build produces
+  runtime_copy: [package.json, migrations]   # files and directories the image also needs
+  start: [node, build]       # the image's command; it must begin with node
+  prod_dependencies: true    # put a --prod node_modules in the image
+  fix_scope: [src/]          # what a fix may change; the default
+```
+
+There is no command field. The build is the package's own `build` script, run as `pnpm run build`, and the toolchain images are named from the two versions (`scripts/build_node_images.sh <node> <pnpm>`), never by the project. The steps:
+
+1. **Lint, on the host.** `package.json`, `pnpm-lock.yaml` and `pnpm-workspace.yaml` must have a shape the builder knows. Every lockfile package is `name@version` with a sha512 integrity and nothing else; the only exception is one `node@runtime:<build.node>` entry, which `devEngines.runtime` produces and which is never fetched. A pnpmfile, `.npmrc`, patches, a workspace, config dependencies, a `pnpm` field, any `link:`, `file:` or `workspace:` dependency, any resolution with a URL or a git repo, any snapshot, snapshot dependency or importer version that doesn't land on one of those checked registry packages, any unknown key, and a workspace file that asks for install scripts (`allowBuilds: true`, `onlyBuiltDependencies`) are all `unsupported_build`, with one fixed sentence. Nothing is ever given network as a fallback. `faultforge_validate_scenario` runs this lint on the dependency files and the pnpmfiles; it copies files only, so a root `node_modules/` or `patches/` directory is caught at run time instead. A project's `.npmrc` is a secret-looking file, dropped from every snapshot, so it never reaches the lint or the build.
+2. **Fetch, on a cache miss only: the one step with network.** See below.
+3. **Link, on a cache miss only, with no network.** The dev and prod `node_modules` are laid out in the cache volume. No install script runs, ever: a package that needs one simply doesn't get it, and if the build then fails the result says so.
+4. **The sealed build.** This is where project code runs, because a build imports what it bundles. It has no network, no secrets, no stack settings, a read-only root, a non-root user, 3 GB, 2 CPUs and an 8-minute limit. The dependency volume is mounted read-only, so a build can't change the cache.
+5. **The image.** The build's output and the prod `node_modules` are read as tar streams and rebuilt on the host by a validator (plain files, directories and links that stay inside; no hard links or devices), then copied into `faultforge-node-run:<node>` by a Dockerfile with no `RUN`. The stack runs it by image ID and it is removed after the call.
+
+The run's `deployed_code_sha256` is the host's hash of the source that was built, because every image build has a new ID. `source` in the result carries `rebuilt: true`, that hash and one line of build facts.
+
+**What `allow_network_install` permits.** The dependencies of each lockfile are fetched once and kept in a Docker volume (`ff-deps-<key>`, the 5 most recently used are kept). With `allow_network_install = false`, the default, a lockfile that isn't cached is `unsupported_build` and nothing is fetched. With `true`, `faultforge_run_scenario` may fetch on a miss:
+
+- A `worktree` baseline fetches whatever that working tree's `pnpm-lock.yaml` names, and a working tree is whatever was last edited, by a person or by Claude. So it can fetch **any package on the public npm registry, at any version, including a malicious one.** A `commit:<sha>` baseline fetches what that commit's lockfile names.
+- What bounds it: the fetch container holds pnpm, the lockfile and a workspace file the host rewrote, and nothing else of the project. Its network is internal, with no gateway to the host, and reaches only FaultForge's proxy, which forwards `registry.npmjs.org:443` and refuses every other host, port and method, and any answer that isn't a public address. It checks the name in the CONNECT request and the address it connects to, not the TLS inside: a client that sent another site's name inside the tunnel could reach another site on the same address. Only pnpm runs in the fetch step, so this isn't open to project code. pnpm checks each tarball against the lockfile's sha512. No install script runs. The packages' code runs only inside the sealed build and the sealed stack, with no network and no secrets, and none of it is executed on the host.
+- `faultforge_verify_fix` never fetches. A baseline pins its dependency files, so a candidate uses the baseline's cache entry or is refused.
+- `faultforge_status` shows `source_builds`: the toolchain images, the proxy image, the cache keys held and whether a fetch is allowed.
+
+Expect about 15 s for a build of the demo with a warm cache, about 25 s with a cold one, and about 20 s for each stack run. A `verify_fix` builds once and runs every scenario, so set the client's tool timeout for a few minutes.
 
 ## Fixing a failing run
 
@@ -94,7 +134,38 @@ The comparison, state and code rows and each regression run are judged by the sa
 
 - For the Ticket API's package the `app_policy` row refuses such a file before it runs.
 - For any other package there is no code policy. The brief and the verify result both say so in their `hooks` line, and the fix's diff has to be read.
-- M11 moves the hooks into a separate trusted container, and revisits fix scope for JADE-shaped projects, where a fix can't live in one file.
+- A stack target doesn't have this problem: its hooks run in a separate trusted container (next section).
+
+### Fixing a stack
+
+A stack baseline built from source pins more: `pinned/stack.yaml` (the hooks' SQL, the images, the whole `build:` section and so the fix scope) and `pinned/source/`, the snapshot it was built from. `verify_fix` builds **the pinned source with only the paths in the pinned `fix_scope` taken from the candidate**: files added, changed and deleted there. Everything else is the baseline's bytes.
+
+| Thing | From |
+|---|---|
+| `faultforge.yaml`, `BUSINESS_RULES.md` | the baseline |
+| `stack.yaml`: images, env, `reset_sql`, `state_sql`, the `build:` section and `fix_scope` | the baseline |
+| `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`, `.nvmrc` | the baseline, always: they can't be put in `fix_scope` |
+| Everything else outside `fix_scope` (build config, migrations, static files) | the baseline |
+| Paths inside `fix_scope`, by default `src/` | the candidate |
+| The hooks | FaultForge's own helper image, never the project |
+
+- `fix_scope` can't name a dependency file, `.npmrc`, a pnpmfile, `node_modules`, `stack.yaml`, `faultforge.yaml` or `BUSINESS_RULES.md`. A project may add paths such as `migrations/` or `vite.config.ts`. So a fix can never add or change a dependency; that needs a new baseline.
+- **A fix that changes the schema needs two things.** First, its migrations folder must be in `fix_scope` before the baseline is recorded, because the scope is pinned then. Second, something in the sandbox must apply the migrations. The stack has no pre-start step: the redeem demo applies its migration from `src/hooks.server.ts` when the app starts, but an app whose migrations run as a separate step (JADE's `node tools/db/migrate.ts`, under its own owner role) gets no migration in the sandbox. A unique index added there would never exist, and the fix would fail on the comparison row. A `prestart` step is planned with the JADE integration.
+- Edits outside the scope are never an error and never silent: `changed_files` names them and `not_deployed` or `fix_next` says they weren't deployed.
+- `code_changed` compares the source hash, and is checked **before any build**: a candidate whose scope is unchanged fails that row at once and nothing is built.
+- A candidate whose sealed build fails gives `verified: false` with `build_failed`, the end of the build's output in `build_log` (marked `[project]`: it is the project's text), every row "not run" and no stored run.
+- There is no `app_policy` row. That row exists to stop `app.py` wrapping hooks in its own process; a stack's hooks are in another container, and a text rule over TypeScript would only be theatre. The seal is what contains the code.
+- A verify with different toolchain images, or after the baseline's install cache entry is gone, is `not_comparable`: make a new baseline.
+- The `vultr` mode is `mode_unavailable` for a stack and `auto` picks `client`: a stack fix can span several files, and the model loop writes one `app.py`.
+
+**What a verified stack fix still doesn't prove.**
+
+- The app owns its own database and schema. It can replace a table with a view, and it can attach a trigger, a rule or a view over a function to a table the pinned SQL reads or resets. That code then runs **with the admin role's rights** when the helper or the host touches the object. So an app written to cheat can make the admin session do things, inside the sealed postgres container only, which has no network and is thrown away.
+- Admin sessions pin `search_path = pg_catalog, public`, so the app can't shadow a built-in such as `count` from its schema. That closes name shadowing, not the route above. `validate_scenario` warns when a `reset_sql` or `state_sql` statement names a table without a schema.
+- Postgres asks for a password on every TCP login (`--auth-host=scram-sha-256`), so the app can't log in as the administrator over the loopback it shares. The host reads through the unix socket inside the postgres container.
+- **The hooks token stops accidents, not hostile code.** The helper answers only a caller that holds a per-run token, which the runner has and the app doesn't. An app that calls a `/__ff/` path gets a 403 rather than a reset. It is not a security boundary against an app that owns its schema.
+- The app can keep state in memory. Client counts are measured by the runner regardless, so the capacity and liveness invariants don't depend on any of this.
+- A build runs project code on the host's kernel, in a container. A kernel escape isn't something these sandboxes stop. Local use only.
 
 ## Vultr fixes
 
@@ -171,7 +242,7 @@ Each file must be a regular file, not a symlink, owned by you, with mode 0600 (n
 - **The main account key works too,** and it carries every permission. FaultForge only ever reads `/v2/account` with it, and that is enforced in code, not by convention: the one HTTP client that carries the key sends through a transport that refuses any request except `GET https://api.vultr.com/v2/account` with no query string and no body, before it leaves. Another method, host, port, scheme, path or query is refused. Redirects are never followed, and a 3xx reply counts as a failed check.
 - **Either way, restrict the key to this machine's IP** under Vultr's API access control (Account, API, Access Control), so a copy of it is useless elsewhere.
 
-**Refusals.** A run that isn't FAIL gives `nothing_to_fix`. A run that `verify_fix` itself stored (the verify run or a regression run) gives `not_comparable`: a fix is judged against the run that proved the bug. The verify result shows `baseline_source`: `worktree, clean`, `worktree, with uncommitted changes` or `commit:<sha>`. A stack run gives `unsupported_build` until M11. The run's project must still be inside an allowed root, and still be the same directory, when the tool is called. A `candidate:<id>` that isn't 12 hex characters gives `invalid_argument`, one that isn't stored for that run gives `run_not_found`, and one whose bytes no longer match its id gives `not_comparable`.
+**Refusals.** A run that isn't FAIL gives `nothing_to_fix`. A run that `verify_fix` itself stored (the verify run or a regression run) gives `not_comparable`: a fix is judged against the run that proved the bug. The verify result shows `baseline_source`: `worktree, clean`, `worktree, with uncommitted changes` or `commit:<sha>`. A stack run of a prebuilt image gives `unsupported_build`: make a baseline from source first. The run's project must still be inside an allowed root, and still be the same directory, when the tool is called. A `candidate:<id>` that isn't 12 hex characters gives `invalid_argument`, one that isn't stored for that run gives `run_not_found`, and one whose bytes no longer match its id gives `not_comparable`.
 
 ### The direct database check: `target.state_queries`
 
@@ -188,7 +259,7 @@ target:
 - Each entry is a state field name (plain lowercase, at most 32 of them) and one SQL statement that returns a single integer.
 - `faultforge_run_scenario` and `faultforge_verify_fix` both run them. A run's summary shows `state_verification` as `matched`, `mismatch`, `unavailable` or `not requested`. With none declared it is `not requested`, which is not a pass, and a note says so.
 - **A declared query is only as trustworthy as the project that declares it.** FaultForge checks that the target's report agrees with what the queries return. It can't check that the queries measure the right thing. A fixer can't change them, because they're pinned at the baseline.
-- **SQLite only, at one path.** The verifier opens the file at the sandbox's database path (`/tmp/ticket.db`, passed to the target as `FF_DB_PATH`) read-only with `query_only` on. A target that keeps its state anywhere else gets `unavailable`, so its fixes can't be verified until M11.
+- **SQLite only, at one path.** The verifier opens the file at the sandbox's database path (`/tmp/ticket.db`, passed to the target as `FF_DB_PATH`) read-only with `query_only` on. A target that keeps its state anywhere else gets `unavailable`, so its fixes can't be verified; a stack target reads Postgres instead.
 - `demo/ticket-api/faultforge.yaml` declares the same four queries as `TICKET_API_STATE_VERIFIER`, the constant the web app trusts. A test keeps the two in step.
 - The field isn't part of a scenario's config fingerprint, so adding queries doesn't make an old run `NOT_COMPARABLE`. A stack target ignores it and uses `stack.yaml`'s `state_sql`.
 - The runner image parses `faultforge.yaml` too. Rebuild it with `scripts/build_images.sh` after updating FaultForge, or it refuses the new field.
@@ -204,9 +275,11 @@ target:
   - **The project's git metadata is untrusted.** Before the object store is read, the repository git resolves for the project must be the project's own: its top level is the project or a parent of it (a monorepo), and its git dir and common dir resolve, with symlinks followed, inside that top level or inside an allowed root. A `.git` file whose `gitdir:` points elsewhere, an `objects/info/alternates` or `http-alternates` file, and a partial (promisor) clone are refused with `project_not_allowed`. A plain repo and a `git worktree add` worktree whose main repo is in the root both work.
   - Leftover snapshots and work dirs older than two hours are swept at the next run.
   - The run uses the snapshot's `faultforge.yaml` (and `stack.yaml`), never the live repo's.
-- **The sandbox.** The sandbox policy is the same as the CLI's and the web app's (docs/PLAN.md V3.3): no network, a read-only root, non-root, all capabilities dropped and hard limits. Only containers labelled `faultforge.sandbox` are touched. The server never prunes.
+- **The sandbox.** The sandbox policy is the same as the CLI's and the web app's (docs/PLAN.md V3.3): no network, a read-only root, non-root, all capabilities dropped and hard limits. Only containers and networks labelled `faultforge.sandbox` are touched, and only cache volumes labelled `faultforge.depcache`, each by a name or ID FaultForge computed. The server never prunes anything.
 - **A project's `stack.yaml` is untrusted here.**
-  - The trusted services must be stock `postgres:<tag>` and `redis:<tag>` images.
+  - The trusted services must be stock `postgres:<tag>` and, if named, `redis:<tag>` images.
+  - `target.hooks_origin` must be the hooks helper's own port, so the runner's token never goes to the app.
+  - The `build:` section takes versions, plain names and a `node` command only: no image name and no build command.
   - The app may not run as root.
   - Writable paths must be plain paths.
 - **One run at a time.** A per-process lock and an `flock` on `<state>/run.lock` are both held for a run and for a `verify_fix`, so a second call, in this server or in another server process sharing the state directory, gets `busy`, while `status` (which reports `busy`), `get_run` and a client-mode `propose_fix` still answer. A client-mode `propose_fix` takes no lock: it sends no load and only reads a stored run, whose files are complete before its `run_id` is returned. A vultr fix holds both locks like a run, so `auto` returns `busy` when it would have picked `vultr` during a run. The kernel releases the file lock when the server exits, however it exits.
@@ -232,4 +305,6 @@ target:
 - Arbitrary URLs, arbitrary scripts, load overrides and cancel.
 - Any write to the user's repo.
 - Applying a vultr diff: FaultForge never does it.
-- The `vultr` fix mode for anything but a `ticket_support` project, fixes for stack targets (M11) and the `remote` runtime (M12).
+- The `vultr` fix mode for anything but a `ticket_support` project, and so for every stack, and the `remote` runtime (M12).
+- Install scripts, pnpmfiles, workspaces and any registry but `registry.npmjs.org` for a stack built from source.
+- A `prestart` step, a second database role and build-time env values for a stack: recorded for JADE in docs/PLAN.md.

@@ -10,6 +10,11 @@ one, and for a Python target the support package beside app.py. A fix is judged 
 only, never against the config or the package in a candidate's tree, so an edit that weakens a rule
 or rewrites a test hook alongside the code can't pass the gate.
 
+A stack run keeps pinned/stack.yaml too: the hooks' SQL, the images and the whole `build:` section,
+fix scope included. A stack baseline built from source also keeps pinned/source/, the snapshot it
+was built from. A fix to it is that tree with only the paths in the fix scope taken from the
+candidate (M11), so nothing outside the scope can change, the dependency files least of all.
+
 A baseline of a Python target also keeps pinned/app.py, the file a vultr fix starts from, and
 candidates/<id>/ for each app.py a model wrote for it (M10). A candidate's id is the start of its
 sha256, checked again whenever it is read. Candidates are model output: they are stored here and
@@ -39,6 +44,9 @@ RUN_META_NAME = "run.json"
 SANDBOX_NAME = "sandbox.json"
 PINNED_DIR = "pinned"
 PACKAGE_DIR = "package"
+STACK_NAME = "stack.yaml"
+SOURCE_DIR = "source"
+MAX_STACK_BYTES = 256_000
 APP_NAME = "app.py"
 CANDIDATES_DIR = "candidates"
 CANDIDATE_META_NAME = "candidate.json"
@@ -102,6 +110,15 @@ class RunMeta(Contract):
     role: Literal["run", "verify", "regression"] = "run"
     # Set on the run faultforge_verify_fix stores: the whole gate's answer, not the comparison alone.
     fix_gate: dict[str, object] | None = None
+    # A stack run: sha256 of pinned/stack.yaml. A stack baseline built from source: the hash of
+    # pinned/source (sandbox.py's code_dir_sha256), which is also its deployed_code_sha256.
+    pinned_stack_sha256: str | None = None
+    pinned_source_sha256: str | None = None
+    # For an image built from source: the toolchain image IDs, the built image's ID and one line
+    # of build facts. A fix is verified only with the same toolchain.
+    toolchain: dict[str, str] = Field(default_factory=dict)
+    image_id: str | None = None
+    build: str | None = None
 
 
 def clean(value: object, limit: int = MAX_TEXT) -> str:
@@ -181,14 +198,45 @@ def _pin_package(destination: Path, package: Path | None) -> tuple[str | None, s
     return (package.name if package is not None else None), code_dir_sha256(root)
 
 
+def _pin_stack(destination: Path, source: Path) -> str:
+    info = source.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_STACK_BYTES:
+        raise FaultForgeError("engine_failed", f"{STACK_NAME} can't be pinned for this run")
+    target = destination / PINNED_DIR / STACK_NAME
+    shutil.copyfile(source, target, follow_symlinks=False)
+    os.chmod(target, 0o600)
+    return file_sha256(target)
+
+
+def _pin_source(destination: Path, source: Path) -> str:
+    """Copies the snapshot a stack baseline was built from into pinned/source/ and returns its
+    hash. A snapshot holds regular files only, with secrets already dropped; a link is refused."""
+    root = destination / PINNED_DIR / SOURCE_DIR
+    root.mkdir(mode=0o700)
+    for directory, subdirs, files in os.walk(source, followlinks=False):
+        subdirs.sort()
+        target = root / Path(directory).relative_to(source)
+        target.mkdir(mode=0o700, exist_ok=True)
+        for name in [*subdirs, *files]:
+            info = (Path(directory) / name).lstat()
+            if not (stat.S_ISDIR(info.st_mode) if name in subdirs else stat.S_ISREG(info.st_mode)):
+                raise FaultForgeError("engine_failed", "the source snapshot holds a link or special file")
+        for name in files:
+            shutil.copyfile(Path(directory) / name, target / name, follow_symlinks=False)
+            os.chmod(target / name, 0o600)
+    return code_dir_sha256(root)
+
+
 def store_run(
     state: Path, work_dir: Path, report: Report, meta: RunMeta, result: SandboxResult, pin_from: Path | None = None,
-    package_from: Path | None = None, app_from: Path | None = None,
+    package_from: Path | None = None, app_from: Path | None = None, stack_from: Path | None = None,
+    source_from: Path | None = None,
 ) -> Path:
     """Moves the runner's run directory out of the throwaway work dir, then records how it ran.
     pin_from is the directory holding the faultforge.yaml the run used. For a Python run,
     package_from is the support package it deployed, or None if it has none, and app_from is the
-    app.py a baseline deployed (its sha256 is already meta.scope's)."""
+    app.py a baseline deployed (its sha256 is already meta.scope's). For a stack run, stack_from is
+    the stack.yaml it ran with, and source_from the snapshot a baseline was built from."""
     source = report_module.run_dir(work_dir, report.run_id)
     destination = run_path(state, report.run_id)
     # mkdir is exclusive, so a second server with the same state dir can't merge two runs into one.
@@ -204,6 +252,10 @@ def store_run(
             meta = meta.model_copy(update={"pinned_package": name, "pinned_package_sha256": digest})
             if app_from is not None:
                 _pin_app(destination, app_from)
+        if stack_from is not None:
+            meta = meta.model_copy(update={"pinned_stack_sha256": _pin_stack(destination, stack_from)})
+        if source_from is not None:
+            meta = meta.model_copy(update={"pinned_source_sha256": _pin_source(destination, source_from)})
     report_module.write_json(destination / RUN_META_NAME, meta.model_dump(mode="json"))
     report_module.write_json(destination / SANDBOX_NAME, result.model_dump(mode="json", exclude={"report"}))
     return destination
@@ -253,6 +305,38 @@ def pinned_package(state: Path, meta: RunMeta) -> Path | None:
     if not usable:
         raise FaultForgeError("not_comparable", f"the pinned support package of {meta.run_id} is missing or changed", hint)
     return root / meta.pinned_package if meta.pinned_package else None
+
+
+def pinned_stack(state: Path, meta: RunMeta) -> Path:
+    """The stack.yaml a stack run was stored with, checked against its recorded hash. Fails closed:
+    the hooks' SQL and the fix scope come from this copy, never from a candidate."""
+    hint = "Call faultforge_run_scenario again to make a new baseline, then fix against that run."
+    path = run_path(state, meta.run_id) / PINNED_DIR / STACK_NAME
+    try:
+        info = path.lstat()
+        usable = meta.pinned_stack_sha256 is not None and stat.S_ISREG(info.st_mode) and info.st_size <= MAX_STACK_BYTES
+        usable = usable and file_sha256(path) == meta.pinned_stack_sha256
+    except OSError:
+        usable = False
+    if not usable:
+        raise FaultForgeError("not_comparable", f"the pinned {STACK_NAME} of {meta.run_id} is missing or changed", hint)
+    return path
+
+
+def pinned_source(state: Path, meta: RunMeta) -> Path:
+    """The source a stack baseline was built from, checked against its recorded hash and against
+    the hash of what was deployed. Fails closed: a fix is built from this tree."""
+    hint = "Call faultforge_run_scenario with source \"worktree\" or \"commit:<sha>\" to make a new baseline, then fix against that run."
+    root = run_path(state, meta.run_id) / PINNED_DIR / SOURCE_DIR
+    try:
+        usable = meta.pinned_source_sha256 is not None and not root.is_symlink() and root.is_dir()
+        usable = usable and not any(path.is_symlink() for path in root.rglob("*"))
+        usable = usable and code_dir_sha256(root) == meta.pinned_source_sha256 == meta.deployed_code_sha256
+    except OSError:
+        usable = False
+    if not usable:
+        raise FaultForgeError("not_comparable", f"the pinned source of {meta.run_id} is missing or changed", hint)
+    return root
 
 
 def _pin_app(destination: Path, source: Path) -> None:

@@ -1,0 +1,10 @@
+{
+	"extends": "$app/tsconfig",
+	"compilerOptions": {
+		"strict": true,
+		"erasableSyntaxOnly": true,
+		"allowImportingTsExtensions": true,
+		"types": ["$app/types", "node"]
+	},
+	"include": ["src", "vite.config.ts"]
+}

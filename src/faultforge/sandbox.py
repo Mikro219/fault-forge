@@ -320,6 +320,7 @@ def reap_stale(policy: SandboxPolicy = DEFAULT_POLICY, max_age_s: float | None =
     max_age_s = policy.stale_after_s if max_age_s is None else max_age_s
     ids = _list_labelled(policy, LABEL)
     if not ids:
+        reap_stale_networks(policy)
         return 0
     # A container that vanished since the list makes inspect exit nonzero; the others still print.
     described = _docker(policy, ["inspect", "--format", "{{.Id}} {{.Created}} {{json .Config.Labels}}", *ids])
@@ -337,7 +338,37 @@ def reap_stale(policy: SandboxPolicy = DEFAULT_POLICY, max_age_s: float | None =
             stale.append(parts[0])
     if stale:
         _docker(policy, ["rm", "--force", "--volumes", *stale])
+    # After the containers: a network that still has one attached can't be removed.
+    reap_stale_networks(policy)
     return len(stale)
+
+
+def reap_stale_networks(policy: SandboxPolicy = DEFAULT_POLICY, now: float | None = None) -> int:
+    """Removes the networks a killed dependency fetch left: only ones that carry the sandbox label
+    and an expiry label that has passed, each by its own ID. A network with no usable expiry is left
+    alone, and nothing is pruned. Doesn't raise: the run it precedes doesn't depend on it."""
+    try:
+        listed = _docker(policy, ["network", "ls", "--quiet", "--no-trunc", "--filter", f"label={LABEL}"])
+        ids = listed.stdout.decode("ascii", "replace").split() if listed.returncode == 0 else []
+        if not ids:
+            return 0
+        described = _docker(policy, ["network", "inspect", "--format", "{{.Id}} {{json .Labels}}", *ids])
+        now = time.time() if now is None else now
+        stale = []
+        for line in described.stdout.decode("utf-8", "replace").splitlines():
+            identifier, _, raw = line.partition(" ")
+            try:
+                labels = json.loads(raw)
+            except (ValueError, RecursionError):
+                continue
+            expires = labels.get(EXPIRES_LABEL) if isinstance(labels, dict) and LABEL in labels else None
+            if identifier in ids and isinstance(expires, str) and EXPIRES_VALUE.fullmatch(expires) and now >= int(expires):
+                stale.append(identifier)
+        for identifier in stale:
+            _docker(policy, ["network", "rm", identifier])
+        return len(stale)
+    except SandboxError:
+        return 0
 
 
 def _remove_sandbox(policy: SandboxPolicy, sandbox_id: str) -> int:
@@ -427,7 +458,9 @@ def target_argv(
 def runner_argv(
     name: str, sandbox_id: str, target_name: str, project_dir: Path, scenario_id: str,
     options: RunOptions, policy: SandboxPolicy, expires_at: int | None = None,
+    extra_env: Mapping[str, str] | None = None,
 ) -> list[str]:
+    """extra_env is for what only the trusted runner may hold, such as a stack's hooks token."""
     expires_at = expiry_unix(time.time(), policy) if expires_at is None else expires_at
     return [
         *_common_args(name, sandbox_id, "runner", policy.runner, expires_at),
@@ -435,7 +468,7 @@ def runner_argv(
         "--user", _runner_user(),
         "--mount", _mount(project_dir, "/out", read_only=False),
         "--workdir", "/out",
-        *_env_args(RUNNER_ENV),
+        *_env_args({**RUNNER_ENV, **(extra_env or {})}),
         policy.runner_image,
         "faultforge", "--project", "/out", "run", scenario_id, "--json",
         f"--wait-for-target-s={policy.wait_for_target_s:g}",

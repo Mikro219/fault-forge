@@ -1,8 +1,8 @@
 """The MCP tools as plain functions, so they can be tested without a transport (docs/PLAN.md V4.4).
 
 Every tool returns a dict, and every failure is `{status: "error", error_class, message, fix_hint}`.
-The only containers it can touch are the sandbox's own, through sandbox.py and stack.py, which act
-only on containers that carry the faultforge.sandbox label.
+The only containers it can touch are the sandbox's own, through sandbox.py, stack.py and
+node_build.py, which act only on containers that carry the faultforge.sandbox label.
 
 Network and money (M10, docs/PLAN.md V4.3). Two things reach the network, and nothing else does:
 credit.py's account read at api.vultr.com, made by faultforge_status and by faultforge_propose_fix
@@ -12,11 +12,24 @@ file. A vultr fix is the only thing that spends, and only after CreditGuard allo
 Targets:
 - **python**: a single-container ASGI app, `app.py` at the project root plus at most one package
   beside it, run by `run_sandboxed` from a git snapshot (`worktree` or `commit:<sha>`).
-- **stack**: a project with `stack.yaml`, run by `run_stack` from the prebuilt image that stack.yaml
-  names (`source: "image"`). Building a stack from source arrives in M11.
+- **stack**: a project with `stack.yaml`, run by `run_stack`. `source: "image"` runs the prebuilt
+  image that stack.yaml names. With a `build:` section, `worktree` and `commit:<sha>` build the app
+  from a snapshot with node_build.py (M11): a lint, an install cache, a sealed build and an image
+  with no RUN step.
 
 A project's stack.yaml is treated as untrusted here, unlike in the repo's own demos: the trusted
 services must be the stock postgres and redis images, and nothing may run as root.
+
+Network (M11): building a stack from source can fetch a new lockfile's packages once, from
+registry.npmjs.org only, through FaultForge's proxy, and only when mcp.toml sets
+allow_network_install. faultforge_run_scenario is the one tool that may; faultforge_verify_fix
+never does, because a baseline pins its dependency files and so its install cache key.
+
+Stack fixes (M11, client mode): a stack baseline built from source pins stack.yaml and the whole
+source snapshot as well as the config. faultforge_verify_fix builds the pinned source with only the
+paths in the pinned fix scope taken from the candidate, so edits to the config, the hooks' SQL, the
+dependency files or anything else outside the scope are never deployed. There is no app_policy row:
+the hooks are FaultForge's helper in another container, so app code can't wrap them.
 
 Fixes (M9, client mode): faultforge_propose_fix returns a brief and writes nothing.
 faultforge_verify_fix snapshots a candidate and takes only its app.py. The scenario, invariants,
@@ -27,7 +40,7 @@ rules or by editing the hooks' package. The gate itself is fix_agent's.
 That is not the same as the hooks being independent. app.py runs in the same process as the pinned
 hooks and could wrap them at import. For the Ticket API's package, fix_agent.check_app_policy, the
 policy written for it, refuses such a file before any load. For any other package there is no
-policy, and the results say so. M11 moves the hooks into a separate trusted container.
+policy, and the results say so. A stack's hooks run in a separate trusted container.
 
 Fixes (M10, vultr mode): faultforge_propose_fix hands the baseline's pinned inputs to
 fix_agent.run_fix_loop, the web app's loop, which asks the model for an app.py and judges each one
@@ -55,7 +68,7 @@ import httpx
 import yaml
 from pydantic import ValidationError
 
-from faultforge import config as config_module, expressions, fix_agent, k6_runner, safety, sandbox, stack as stack_module
+from faultforge import config as config_module, expressions, fix_agent, k6_runner, node_build, safety, sandbox, stack as stack_module
 from faultforge.errors import FaultForgeError
 from faultforge.lifecycle import RunOptions
 from faultforge.limits import LIMITS
@@ -67,9 +80,9 @@ from faultforge.sandbox import SandboxResult, TargetSpec
 from faultforge.stack import HOOKS_IMAGE, StackConfig, StackSpec
 from faultforge.web.settings import AGENT_MODEL, AGENT_REASONING_EFFORT
 
-STACK_NAME = "stack.yaml"
+STACK_NAME = store.STACK_NAME
 APP_NAME = "app.py"
-MAX_STACK_BYTES = 256_000
+MAX_STACK_BYTES = store.MAX_STACK_BYTES
 # A page of list_scenarios stays within about 60 lines; the rest is paged with offset.
 MAX_SCENARIOS_LISTED = 6
 MAX_SCENARIOS_TOTAL = 10_000
@@ -86,6 +99,16 @@ REMOTE_UNAVAILABLE = "not built yet (M12)"
 FIX_MODES = ("auto", "client", "vultr")
 RUNTIME_AUTO = f"auto -> local: the remote runtime is {REMOTE_UNAVAILABLE}"
 VULTR_PACKAGE_ONLY = "not a ticket_support project: the vultr fix loop's code policy is written for that package only"
+VULTR_STACK = "a stack fix can span several files, and the vultr fix loop writes one app.py"
+STACK_SOURCES = "worktree | commit:<sha>"
+HOOKS_SEPARATE = (
+    "The hooks are FaultForge's own helper in a separate container, started before the app and fed the pinned SQL as an admin "
+    "role the app has no password for, so app code can't wrap them. The app still owns its schema (docs/MCP.md)."
+)
+MAX_BUILD_LOG_LINES = 12
+MAX_CHANGED_FILES = 400
+# After FROM, JOIN, INTO, UPDATE or TRUNCATE: a name with no schema in front of it. A hint only.
+UNQUALIFIED_TABLE = re.compile(r"\b(?:FROM|JOIN|INTO|UPDATE|TRUNCATE(?:\s+TABLE)?)\s+(?!\()(\"?[A-Za-z_][A-Za-z0-9_]*\"?)(?![A-Za-z0-9_\"]*\s*[.(])", re.IGNORECASE)
 VULTR_PER_RUN = "decided for each run: a vultr fix also needs a ticket_support baseline with a pinned app.py"
 USE_CLIENT = "Use mode \"client\", or \"auto\", which falls back to it."
 # The first lines of a candidate's diff that a propose_fix result carries; get_run pages the rest.
@@ -112,7 +135,7 @@ POLICY_PACKAGE = "ticket_support"
 POLICY_MEANING = f"{APP_NAME} keeps to the code rules for this package, so it can't rebind or wrap the pinned test hooks"
 HOOKS_SHARED = (
     f"{APP_NAME} shares a process with the pinned test hooks and could wrap them, so the gate is only as strong as their "
-    "independence (M11 moves them to a separate container)."
+    "independence (a stack target's hooks run in a separate container)."
 )
 HOOKS_POLICY = f"{HOOKS_SHARED} Here the {GATE_POLICY} row checks {APP_NAME} for that before any load."
 HOOKS_NO_POLICY = f"{HOOKS_SHARED} This package has no code policy, so nothing checks for that: read the diff."
@@ -171,10 +194,11 @@ def stack_problems(stack: StackConfig) -> list[str]:
     problems = []
     if not POSTGRES_IMAGE.fullmatch(stack.postgres_image):
         problems.append("postgres_image must be a stock postgres:<tag> image")
-    if not REDIS_IMAGE.fullmatch(stack.redis_image):
+    if stack.redis_image is not None and not REDIS_IMAGE.fullmatch(stack.redis_image):
         problems.append("redis_image must be a stock redis:<tag> image")
     if stack.app_image is None:
-        problems.append("app_image must name the prebuilt image to run")
+        if stack.build is None:
+            problems.append("app_image must name the prebuilt image to run, or build: must say how to build it from source")
     elif not APP_IMAGE.fullmatch(stack.app_image):
         problems.append("app_image must be a plain local image name such as myapp:buggy")
     uid, gid = (int(part) for part in stack.app_user.split(":"))
@@ -196,6 +220,14 @@ def stack_problems(stack: StackConfig) -> list[str]:
     ):
         problems.append(f"state_sql needs 1 to {sandbox.MAX_STATE_FIELDS} plain lowercase field names")
     return problems
+
+
+def unqualified_sql(stack: StackConfig) -> list[str]:
+    """Which reset_sql and state_sql entries seem to name a table with no schema. The admin sessions
+    pin their search_path, so this is a hint to write public.<table>, not a rule."""
+    named = [(f"reset_sql[{index}]", sql) for index, sql in enumerate(stack.reset_sql)]
+    named += [(f"state_sql.{name}", sql) for name, sql in stack.state_sql.items()]
+    return [name for name, sql in named if UNQUALIFIED_TABLE.search(sql)]
 
 
 def _regular(path: Path) -> bool:
@@ -229,6 +261,13 @@ def python_support(root: Path) -> str | None:
 
 def _kind(project: Path) -> str:
     return "stack" if (project / STACK_NAME).exists() or (project / STACK_NAME).is_symlink() else "python"
+
+
+def _no_build_section() -> FaultForgeError:
+    return FaultForgeError(
+        "unsupported_build", f"{STACK_NAME} has no build: section, so this stack can't be built from source",
+        f"Use source \"image\" to run the prebuilt image {STACK_NAME} names, or add a build: section (docs/MCP.md).",
+    )
 
 
 def _busy() -> FaultForgeError:
@@ -339,6 +378,8 @@ class Tools:
         credit: CreditGuard | None = None,
         inference_transport: httpx.BaseTransport | None = None,
         fix_loop: Callable[..., fix_agent.LoopResult] = fix_agent.run_fix_loop,
+        build_stack: Callable[..., node_build.StackBuild] = node_build.build_stack_image,
+        remove_images: Callable[[list[str]], None] = node_build.remove_images,
     ):
         self._settings = settings
         self._run_sandboxed = run_sandboxed
@@ -347,6 +388,8 @@ class Tools:
         self._credit = credit or CreditGuard()
         self._inference_transport = inference_transport
         self._fix_loop = fix_loop
+        self._build_stack = build_stack
+        self._remove_images = remove_images
         self._lock = threading.Lock()
 
     # faultforge_status
@@ -388,6 +431,7 @@ class Tools:
                 "vultr": {"available": vultr_reason is None, "reason": vultr_reason or VULTR_PER_RUN},
                 "auto": fix_auto,
             },
+            "source_builds": self._source_builds(settings, bool(docker["reachable"])),
             "busy": self._lock.locked() or run_lock_held(settings.state_dir),
             "allowed_roots": [str(root) for root in settings.allowed_roots],
             "config_path": str(settings.config_path),
@@ -401,6 +445,27 @@ class Tools:
                 "fix": f"auto -> {fix_auto}: {vultr_reason or decision.reason}",
                 "runtime": RUNTIME_AUTO,
             },
+        }
+
+    def _source_builds(self, settings: McpSettings, reachable: bool) -> dict[str, Any]:
+        """What building a stack from source needs: the toolchain and proxy images, the install cache
+        and whether a cache miss may fetch. Reads only."""
+        toolchains: list[str] | None = None
+        if reachable:
+            try:
+                toolchains = node_build.toolchain_images(STATUS_POLICY)
+            except sandbox.SandboxError:
+                toolchains = None
+        try:
+            keys = [key[:16] for key in node_build.cache_keys(settings.state_dir)] if settings.state_dir.is_dir() else []
+        except OSError:
+            keys = []
+        return {
+            "toolchain_images": toolchains,
+            "proxy_image": self._image_present(node_build.PROXY_IMAGE) if reachable else None,
+            "install_cache": keys,
+            "allow_network_install": settings.allow_network_install,
+            "network": "registry.npmjs.org:443 only, through the proxy, on a cache miss in faultforge_run_scenario" if settings.allow_network_install else "none: a new lockfile's packages can't be fetched",
         }
 
     # faultforge_list_scenarios
@@ -418,15 +483,21 @@ class Tools:
         if result["kind"] == "stack":
             stack = _load_stack(project / STACK_NAME)
             allowed = stack.app_image is not None and stack.app_image in settings.allowed_images
+            unlisted = stack.app_image is not None or stack.build is None
             result["stack"] = {
                 "app_image": stack.app_image,
                 "app_image_allowed": allowed,
                 "app_image_present": (
                     self._image_present(stack.app_image) if allowed and APP_IMAGE.fullmatch(stack.app_image or "") else None
                 ),
-                "sources": "image",
-                "problems": stack_problems(stack) + ([] if allowed else [f"app_image isn't in allowed_images in {settings.config_path}"]),
+                "sources": f"image | {STACK_SOURCES}" if stack.build is not None else "image",
+                "problems": stack_problems(stack) + ([] if allowed or not unlisted else [f"app_image isn't in allowed_images in {settings.config_path}"]),
             }
+            if stack.build is not None:
+                result["stack"]["build"] = (
+                    f"{stack.build.kind}, node {stack.build.node}, pnpm {stack.build.pnpm}; fix scope "
+                    f"{', '.join(store.clean(item, MAX_FILE_NAME) for item in stack.build.fix_scope)}"
+                )
         else:
             result["sources"] = "worktree | commit:<sha>"
         page = config.scenarios[offset: offset + MAX_SCENARIOS_LISTED]
@@ -478,10 +549,18 @@ class Tools:
             try:
                 stack = _load_stack(project / STACK_NAME)
                 errors += stack_problems(stack)
-                if not errors:
+                if not errors and stack.build is None:
                     require_image_allowed(stack.app_image, settings)
             except FaultForgeError as error:
                 errors.append(f"{error.message}. {error.fix_hint}" if error.fix_hint else error.message)
+            if stack is not None:
+                loose = unqualified_sql(stack)
+                if loose:
+                    warnings.append(f"{', '.join(loose[:6])} name a table without a schema; write public.<table>, as the admin sessions pin their search_path")
+            if stack is not None and stack.build is not None and not errors:
+                build_errors, build_warnings = self._validate_build(settings, project, stack)
+                errors += build_errors
+                warnings += build_warnings
         else:
             try:
                 python_support(project)
@@ -503,6 +582,29 @@ class Tools:
             "warnings": warnings[:20],
             "user_confirmed": all(scenario.user_confirmed for scenario in chosen) if chosen else None,
         }
+
+    def _validate_build(self, settings: McpSettings, project: Path, stack: StackConfig) -> tuple[list[str], list[str]]:
+        """The builder's lint, on a copy of the dependency files alone. Runs nothing and fetches nothing."""
+        build = stack.build
+        assert build is not None
+        errors, warnings = [], []
+        snap = snapshot_module.copy_files(project, private_dir(settings.state_dir), [*node_build.DEPENDENCY_FILES, *(name for name in node_build.REFUSED_AT_ROOT if name not in node_build.REFUSED_DIRECTORIES)], "worktree")
+        try:
+            errors += [f"unsupported_build: {problem}" for problem in node_build.lint_problems(snap.root, build)]
+        finally:
+            snap.remove()
+        if stack.app_image is not None and stack.app_image not in settings.allowed_images:
+            warnings.append(f"app_image isn't in allowed_images in {settings.config_path}, so source \"image\" is refused; {STACK_SOURCES} build from source")
+        missing = [image for image in (build.build_image, build.run_image) if self._image_present(image) is False]
+        if missing:
+            warnings.append(f"{', '.join(missing)} not built. {node_build.toolchain_hint(build)}")
+        if not settings.allow_network_install:
+            warnings.append(
+                f"allow_network_install is off in {settings.config_path}: a lockfile that isn't in the install cache can't be built until it is on"
+            )
+        if snapshot_module.git(project, "rev-parse", "--is-inside-work-tree").returncode != 0:
+            warnings.append("Not a git working tree, so faultforge_run_scenario can't snapshot it.")
+        return errors, warnings
 
     # faultforge_run_scenario
 
@@ -545,12 +647,12 @@ class Tools:
             )
         target_kind = _kind(project)
         notes: list[str] = []
-        if target_kind == "stack":
-            if kind != "image":
-                raise FaultForgeError(
-                    "unsupported_build", "building a stack target from source isn't supported yet",
-                    "Building from source arrives in M11. Use source \"image\" to run the prebuilt image that stack.yaml names.",
-                )
+        images: list[str] = []
+        built: node_build.StackBuild | None = None
+        if target_kind == "stack" and kind != "image" and _load_stack(project / STACK_NAME).build is None:
+            # Before any snapshot. The snapshot's own stack.yaml is checked again below.
+            raise _no_build_section()
+        if target_kind == "stack" and kind == "image":
             snap = snapshot_module.copy_files(project, state, [config_module.CONFIG_NAME, STACK_NAME], "image")
         elif kind == "image":
             raise FaultForgeError("invalid_argument", "source \"image\" is only for stack targets", "Use \"worktree\" or \"commit:<sha>\".")
@@ -571,13 +673,35 @@ class Tools:
                 problems = stack_problems(stack)
                 if problems:
                     raise FaultForgeError("config_invalid", f"{STACK_NAME}: {'; '.join(problems)}", f"Fix {STACK_NAME}.")
-                require_image_allowed(stack.app_image, settings)
-                notes.append(
-                    f"Ran the prebuilt image {stack.app_image}. The source was not rebuilt; building from source arrives in M11. "
-                    f"{config_module.CONFIG_NAME} and {STACK_NAME} came from the working tree."
-                )
-                run = lambda: self._run_stack(StackSpec(stack.app_image, stack, config_path), work, scenario_id, RunOptions(compare_to=compare_to))  # noqa: E731
-                source = {**snap.describe(), "app_image": stack.app_image, "rebuilt": False}
+                if kind == "image":
+                    require_image_allowed(stack.app_image, settings)
+                    notes.append(
+                        f"Ran the prebuilt image {stack.app_image}. The source was not rebuilt"
+                        + (f"; use source {STACK_SOURCES} to build it. " if stack.build is not None else ". ")
+                        + f"{config_module.CONFIG_NAME} and {STACK_NAME} came from the working tree."
+                    )
+                    stack_spec = StackSpec(stack.app_image, stack, config_path)
+                    source = {**snap.describe(), "app_image": stack.app_image, "rebuilt": False}
+                else:
+                    if stack.build is None:
+                        raise _no_build_section()
+                    built = self._build_stack(snap.root, stack.build, state, allow_fetch=settings.allow_network_install)
+                    if built.image_id is None:
+                        raise _build_error(built, settings)
+                    images.append(built.image_id)
+                    stack_spec = StackSpec(built.image_id, stack, config_path, code_sha256=built.source_sha256)
+                    source = {**snap.describe(), "rebuilt": True, "source_sha256": built.source_sha256, "build": built.line()}
+                    if kind == "worktree":
+                        source["dirty"] = _dirty(project)
+                    notes.append(
+                        "Built from the snapshot in a sealed container with no network, then run by image ID. "
+                        f"{config_module.CONFIG_NAME}, {STACK_NAME} and the source are pinned with this run."
+                    )
+                    if built.install == "fetched":
+                        notes.append(f"Fetched this lockfile's packages once through the registry-only proxy ({'; '.join(built.proxy[:3])}).")
+                    if snap.dropped_secrets:
+                        notes.append(f"Left {len(snap.dropped_secrets)} secret-looking files out of the snapshot.")
+                run = lambda: self._run_stack(stack_spec, work, scenario_id, RunOptions(compare_to=compare_to))  # noqa: E731
             else:
                 if _regular(snap.root / STACK_NAME):
                     raise FaultForgeError("unsupported_build", f"the snapshot has a {STACK_NAME} the working tree doesn't", "Run the stack with source \"image\".")
@@ -604,12 +728,18 @@ class Tools:
                 result, project_dir=str(project), scenario_id=scenario_id, kind=target_kind, source=source,
                 compare_to=compare_to, notes=notes, pinned_config_sha256=store.file_sha256(config_path), scope=scope,
             )
+            if built is not None:
+                meta = meta.model_copy(update={"toolchain": dict(built.toolchain), "image_id": built.image_id, "build": built.line()})
             store.store_run(
                 state, work, result.report, meta, result, pin_from=snap.root, package_from=package,
                 app_from=snap.root / APP_NAME if target_kind == "python" else None,
+                stack_from=snap.root / STACK_NAME if target_kind == "stack" else None,
+                source_from=snap.root if built is not None else None,
             )
             return {**store.summary(state, result.report.run_id), "mutates_data": "only the sandbox's own throwaway data"}
         finally:
+            if images:
+                self._remove_images(images)
             snap.remove()
             if work is not None:
                 store.remove_tree(work)
@@ -626,10 +756,10 @@ class Tools:
                 "project_not_allowed", f"{meta.project_dir} now resolves to another directory",
                 "Call faultforge_run_scenario for the project as it is now, then fix against that run.",
             )
-        if meta.kind != "python":
+        if meta.kind == "stack" and meta.source.get("rebuilt") is not True:
             raise FaultForgeError(
-                "unsupported_build", "fixing a stack target isn't supported yet",
-                "A stack's source can't be rebuilt until M11, so a fix to it can't be verified. Python targets work now.",
+                "unsupported_build", f"{meta.run_id} ran a prebuilt image, so there is no source to fix against",
+                f"Make a baseline from source first: faultforge_run_scenario with source {STACK_SOURCES}. That needs a build: section in {STACK_NAME}.",
             )
         if meta.role != "run":
             raise FaultForgeError(
@@ -648,6 +778,8 @@ class Tools:
     def _vultr_blocker(self, state: Path, meta: store.RunMeta, config: ProjectConfig) -> FaultForgeError | None:
         """Why this run can't have a vultr fix, whatever the credit is. Nothing here uses the network.
         An explicit vultr request gets the error; auto takes its message as the reason for client."""
+        if meta.kind == "stack":
+            return FaultForgeError("mode_unavailable", VULTR_STACK, USE_CLIENT)
         if meta.pinned_package != POLICY_PACKAGE:
             return FaultForgeError("mode_unavailable", VULTR_PACKAGE_ONLY, USE_CLIENT)
         queries = config.target.state_queries
@@ -697,7 +829,13 @@ class Tools:
         meta, report, _ = self._fixable(settings, run_id)
         state = settings.state_dir
         pinned = store.pinned_config(state, meta)
-        store.pinned_package(state, meta)
+        stack: StackConfig | None = None
+        if meta.kind == "stack":
+            # Checked here, so a brief is never written for a baseline that can't be verified against.
+            stack = _load_stack(store.pinned_stack(state, meta))
+            store.pinned_source(state, meta)
+        else:
+            store.pinned_package(state, meta)
         config = config_module.parse_config(pinned.read_text(encoding="utf-8"))
         scenario = config_module.find_scenario(config, meta.scenario_id)
         worst = credit_module.fix_worst_case_usd()
@@ -735,7 +873,7 @@ class Tools:
             reason = f"auto resolves to client: {refusal}"
         view = decision.view if decision is not None else self._credit.view(state, refresh=False)
         next_call = f'faultforge_verify_fix(run_id="{meta.run_id}", source="worktree")'
-        brief = _brief(meta, report, config, scenario, store.pinned_rules(state, meta.run_id), next_call)
+        brief = _brief(meta, report, config, scenario, store.pinned_rules(state, meta.run_id), next_call, stack)
         return {
             "status": "ok",
             "run_id": meta.run_id,
@@ -893,12 +1031,18 @@ class Tools:
         settings = self._settings()
         meta, _, project = self._fixable(settings, run_id)
         if kind == "image":
-            raise FaultForgeError("invalid_argument", "source \"image\" is only for stack targets", "Use \"worktree\" or \"commit:<sha>\".")
+            raise FaultForgeError(
+                "invalid_argument", "a fix is verified from source, not from a prebuilt image", "Use \"worktree\" or \"commit:<sha>\".",
+            )
+        if kind == "candidate" and meta.kind == "stack":
+            raise FaultForgeError("invalid_argument", "a stack baseline has no stored candidates", "Use \"worktree\" or \"commit:<sha>\".")
         if not self._lock.acquire(blocking=False):
             raise _busy()
         try:
             # The same two locks as a run, in the same order; both are released on every path.
             with run_lock(settings.state_dir):
+                if meta.kind == "stack":
+                    return self._verify_stack(settings, project, meta, kind, sha)
                 return self._verify(settings, project, meta, kind, sha)
         finally:
             self._lock.release()
@@ -932,7 +1076,8 @@ class Tools:
         try:
             if _kind(project) == "stack" or (snap is not None and _regular(snap.root / STACK_NAME)):
                 raise FaultForgeError(
-                    "unsupported_build", f"the candidate has a {STACK_NAME}", "A stack's source can't be rebuilt until M11.",
+                    "unsupported_build", f"the candidate has a {STACK_NAME}, and the baseline is a Python target",
+                    "Call faultforge_run_scenario for the stack to make a new baseline, then fix against that run.",
                 )
             if snap is not None and not _regular(snap.root / APP_NAME):
                 raise FaultForgeError("unsupported_build", f"the candidate has no {APP_NAME}", f"The fix goes in {APP_NAME} at the project root.")
@@ -1086,6 +1231,198 @@ class Tools:
             if work is not None:
                 store.remove_tree(work)
 
+    def _verify_stack(self, settings: McpSettings, project: Path, baseline: store.RunMeta, kind: str, sha: str | None) -> dict[str, Any]:
+        """A stack fix. Everything that defines the test, and everything outside the fix scope, comes
+        from the baseline's pinned copies: the config, stack.yaml (the hooks' SQL, the images, the
+        build section and the scope itself) and the source. Only the candidate's files inside the
+        scope are overlaid. The dependency files are pinned, so the install cache key is the
+        baseline's and this never fetches: a missing cache entry is not_comparable."""
+        state = private_dir(settings.state_dir)
+        store.sweep_stale(state, time.time())
+        scenario_id = baseline.scenario_id
+        pinned = store.pinned_config(state, baseline)
+        stack = _load_stack(store.pinned_stack(state, baseline))
+        pinned_source = store.pinned_source(state, baseline)
+        build = stack.build
+        if build is None or stack_problems(stack):
+            raise FaultForgeError(
+                "not_comparable", f"the pinned {STACK_NAME} of {baseline.run_id} can't build from source",
+                "Call faultforge_run_scenario again to make a new baseline, then fix against that run.",
+            )
+        config = config_module.parse_config(pinned.read_text(encoding="utf-8"))
+        config_module.find_scenario(config, scenario_id)
+        regression_ids = fix_agent.regression_scenarios_for(pinned, scenario_id)
+        if len(regression_ids) > MAX_REGRESSION_SCENARIOS:
+            raise FaultForgeError(
+                "budget_exceeded", f"the pinned config has {len(regression_ids)} other scenarios; verify_fix runs at most {MAX_REGRESSION_SCENARIOS}",
+                "Split the project's scenarios across fewer configs, then make a new baseline.",
+            )
+        scope = list(build.fix_scope)
+        scope_text = ", ".join(store.clean(item, MAX_FILE_NAME) for item in scope)
+        if kind == "commit":
+            snap = snapshot_module.snapshot_commit(project, state, sha or "", settings.allowed_roots)
+        else:
+            snap = snapshot_module.snapshot_worktree(project, state, settings.allowed_roots)
+        work: Path | None = None
+        images: list[str] = []
+        try:
+            work = private_dir(state / "work") / secrets.token_hex(8)
+            work.mkdir(mode=0o700)
+            assembled = work / "source"
+            node_build.assemble_source(pinned_source, snap.root, scope, assembled)
+            candidate_sha = node_build.source_sha256(assembled)
+            edits = _tree_changes(pinned_source, snap.root)
+            ignored = [name for name in edits if not node_build.in_scope(name, scope)]
+            changed = _file_names(edits, 2 * MAX_BRIEF_FILES)
+            origin = _baseline_source(baseline)
+            origin_text = f"{snap.source}, {snap.files} files; only {scope_text} taken from it"
+            notes = [
+                f"faultforge_verify_fix of {baseline.run_id}. {config_module.CONFIG_NAME}, {STACK_NAME}, the business rules and every "
+                f"file outside the fix scope ({scope_text}) are the baseline's pinned copies."
+            ]
+            not_deployed = None
+            if ignored:
+                not_deployed = (
+                    f"Edits outside the fix scope aren't deployed ({_file_names(ignored, MAX_BRIEF_FILES)}). Everything outside "
+                    f"{scope_text} is pinned at the baseline. Put the fix in {scope_text}."
+                )
+                notes.append(not_deployed)
+            if snap.dropped_secrets:
+                notes.append(f"Left {len(snap.dropped_secrets)} secret-looking files out of the snapshot.")
+            shared: dict[str, Any] = {
+                "status": "ok", "verified": False, "run_id": None, "baseline_run_id": baseline.run_id,
+                "baseline_source": origin, "scenario_id": scenario_id, "source": origin_text,
+            }
+            tail: dict[str, Any] = {"regression": [], "changed_files": changed, "containers_left": 0, "hooks": HOOKS_SEPARATE, **self._cached_credit(state)}
+
+            def unrun(first: str, why: str, evidence: str) -> list[dict[str, object]]:
+                return [
+                    {"gate": name, "passed": False, "evidence": evidence if name == first else f"not run: {why}"}
+                    for name in GATE_MEANING
+                ]
+
+            if candidate_sha == baseline.deployed_code_sha256:
+                # Before any build: nothing in the scope changed, so there is nothing new to test.
+                code = f"baseline {_short(baseline.deployed_code_sha256)}, candidate {_short(candidate_sha)} (identical)"
+                return {
+                    **shared, "gate": unrun(fix_agent.GATE_CODE, f"{fix_agent.GATE_CODE} failed first, so nothing was built", code), **tail,
+                    "fix_next": [
+                        *([not_deployed] if not_deployed else []),
+                        f"The source inside the fix scope ({scope_text}) is the same as the failing run's, so nothing was built. Put the fix there.",
+                    ],
+                }
+            built = self._build_stack(assembled, build, state, allow_fetch=False)
+            if built.image_id is None:
+                if built.failure_reason == "install_cache_missing":
+                    raise FaultForgeError(
+                        "not_comparable", "the install cache for this baseline is gone",
+                        "Call faultforge_run_scenario again to make a new baseline, then fix against that run. faultforge_verify_fix never fetches.",
+                    )
+                if built.failure_reason not in CANDIDATE_BUILD_FAILURES:
+                    raise _build_error(built, settings)
+                # The candidate's own build failed: not a gate row, and no run is stored.
+                reason = store.clean(built.failure_reason, 60)
+                return {
+                    **shared, "build_failed": reason, "build": built.line(), "build_log": _build_log(built),
+                    "gate": [{"gate": name, "passed": False, "evidence": f"not run: the candidate's sealed build failed ({reason})"} for name in GATE_MEANING],
+                    **tail,
+                    "fix_next": [
+                        *([not_deployed] if not_deployed else []),
+                        f"The candidate didn't build ({reason}). Read `build_log`, which quotes the build's own output, then fix the source in {scope_text}.",
+                    ],
+                }
+            images.append(built.image_id)
+            if built.source_sha256 != candidate_sha or dict(built.toolchain) != baseline.toolchain:
+                raise FaultForgeError(
+                    "not_comparable", "the toolchain images changed since the baseline was built",
+                    "Call faultforge_run_scenario again to make a new baseline with this toolchain, then fix against that run.",
+                )
+            spec = StackSpec(built.image_id, stack, pinned, code_sha256=built.source_sha256)
+            store.stage_baseline(state, work, baseline.run_id)
+            results: dict[str, SandboxResult] = {}
+
+            def run(target: StackSpec, project_dir: Path, scenario: str, options: RunOptions) -> SandboxResult:
+                results[scenario] = self._run_stack(target, project_dir, scenario, options)
+                return results[scenario]
+
+            result, failure, _ = fix_agent.run_candidate(
+                spec, work, scenario_id, RunOptions(compare_to=baseline.run_id), run, baseline.deployed_code_sha256,  # type: ignore[arg-type]
+            )
+            if result is None:
+                raise FaultForgeError("engine_failed", f"the sandbox didn't run ({failure})", "This is a FaultForge bug; nothing was verified.")
+            if result.status != "completed" or result.report is None:
+                return {**_failure(result), "verified": False}
+            regression = fix_agent.run_regression(
+                spec, work, regression_ids, RunOptions(), run, result.deployed_code_sha256, pinned,  # type: ignore[arg-type]
+            )
+            # The host's direct read uses the pinned state_sql. A field an invariant reads that it
+            # doesn't cover fails the state gate, as for a Python target.
+            queries = stack.state_sql
+            scenarios = {item.id: item for item in config.scenarios}
+            uncovered = {name: _undeclared(scenarios[name], queries) for name in (scenario_id, *regression_ids)}
+            regression = tuple(
+                dataclasses.replace(item, passed=False, failure_reason="state_fields_undeclared")
+                if item.passed and uncovered.get(item.scenario_id) else item
+                for item in regression
+            )
+            broken = set(fix_agent.gate_failures(result, baseline.deployed_code_sha256))
+            if uncovered.get(scenario_id):
+                broken.add(fix_agent.GATE_STATE)
+            if not all(item.passed for item in regression):
+                broken.add(fix_agent.GATE_REGRESSION)
+            failed = [name for name in GATE_MEANING if name in broken]
+            verified = not failed
+            report = result.report
+            rows = _gate_rows(result, baseline, failed, regression, queries, uncovered.get(scenario_id, []))
+            regression_lines = _regression_lines(regression)
+            described = {**snap.describe(), "rebuilt": True, "source_sha256": built.source_sha256, "build": built.line(), "fix_scope": scope}
+            facts = {"toolchain": dict(built.toolchain), "image_id": built.image_id, "build": built.line()}
+            for item in regression:
+                other = results.get(item.scenario_id)
+                if item.run_id is None or other is None or other.report is None:
+                    continue
+                store.store_run(state, work, other.report, _meta(
+                    other, project_dir=str(project), scenario_id=item.scenario_id, kind="stack", source=described,
+                    compare_to=None, notes=[f"A regression run of faultforge_verify_fix for {baseline.run_id} (main run {report.run_id})."],
+                    pinned_config_sha256=baseline.pinned_config_sha256, role="regression", **facts,
+                ), other, pin_from=pinned.parent, stack_from=pinned.parent / STACK_NAME)
+            meta = _meta(
+                result, project_dir=str(project), scenario_id=scenario_id, kind="stack", source=described,
+                compare_to=baseline.run_id, notes=notes, pinned_config_sha256=baseline.pinned_config_sha256, role="verify",
+                fix_gate={"verified": verified, "baseline_run_id": baseline.run_id, "failed": failed, "regression": regression_lines},
+                **facts,
+            )
+            store.store_run(state, work, report, meta, result, pin_from=pinned.parent, stack_from=pinned.parent / STACK_NAME)
+            left = [item.containment.containers_left for item in results.values()]
+            answer: dict[str, Any] = {
+                **shared,
+                "verified": verified,
+                "run_id": report.run_id,
+                "verdict": report.verdict,
+                "gate": rows,
+                "regression": regression_lines,
+                "config": f"pinned at the baseline, with {STACK_NAME} and the source outside the fix scope (sha256 {_short(baseline.pinned_config_sha256)})",
+                "build": built.line(),
+                "changed_files": changed,
+                "hooks": HOOKS_SEPARATE,
+                "containers_left": None if any(count is None for count in left) else sum(left),
+                **self._cached_credit(state),
+            }
+            if not verified:
+                answer["proven"] = [f"{UNTRUSTED} {line}" for line in store.proven_lines(report)[:MAX_VERIFY_PROVEN]]
+                answer["fix_next"] = ([not_deployed] if not_deployed else []) + _fix_next(
+                    result, failed, regression, queries, uncovered.get(scenario_id, []), scope_text,
+                )
+            elif not_deployed:
+                answer["not_deployed"] = not_deployed
+            return answer
+        finally:
+            if images:
+                self._remove_images(images)
+            snap.remove()
+            if work is not None:
+                store.remove_tree(work)
+
     def _cached_credit(self, state: Path) -> dict[str, Any]:
         """For a tool that isn't a paid decision: the last reading if it is still fresh, and what
         auto would pick on that alone. It never touches the network."""
@@ -1122,6 +1459,56 @@ class Tools:
                 raise FaultForgeError("invalid_argument", "candidate must be a candidate id")
             return store.diff(state, run_id, store.parse_candidate(candidate) if candidate is not None else None, offset, limit)
         return store.evidence(state, run_id, offset, limit, trial, outcome)
+
+
+# A build that failed because of the candidate's own source, as opposed to a missing image or Docker.
+CANDIDATE_BUILD_FAILURES = frozenset({
+    "unsupported_build", "build_failed", "build_timed_out", "build_output_rejected", "build_output_missing",
+})
+
+
+def _build_log(built: node_build.StackBuild) -> list[str]:
+    """The end of the build's own output: project text, so cleaned, cut and marked."""
+    lines = [line for line in (built.log_tail or "").splitlines() if line.strip()]
+    return [f"{UNTRUSTED} {store.clean(line, MAX_LINE)}" for line in lines[-MAX_BUILD_LOG_LINES:]]
+
+
+def _build_error(built: node_build.StackBuild, settings: McpSettings) -> FaultForgeError:
+    """Why a stack couldn't be built for faultforge_run_scenario. The message is fixed text plus the
+    builder's own fixed sentence; the build's output is quoted only in the hint, marked."""
+    reason = built.failure_reason or "internal_error"
+    detail = store.clean(built.failure_detail or "", 400)
+    log = _build_log(built)
+    quoted = (" The end of its output: " + " | ".join(log[-4:])) if log else ""
+    if reason == "install_cache_missing":
+        return FaultForgeError(
+            "unsupported_build", "this lockfile's packages aren't in the install cache, and allow_network_install is off",
+            f"Set allow_network_install = true in {settings.config_path} to let faultforge_run_scenario fetch them once from "
+            "registry.npmjs.org through the registry-only proxy (docs/MCP.md says what that permits), then call again.",
+        )
+    if reason == "unsupported_build":
+        return FaultForgeError("unsupported_build", detail or "this project can't be built from source", f"FaultForge never gives a build network as a fallback.{quoted}")
+    if reason == "image_missing":
+        return FaultForgeError("sandbox_failed", f"the build couldn't start: {detail}", "Build the images, then call faultforge_status.")
+    if reason in CANDIDATE_BUILD_FAILURES:
+        return FaultForgeError(
+            "sandbox_failed", f"the sealed build failed: {reason}" + (f" ({detail})" if detail else ""),
+            f"Fix the build, then call again. It ran with no network and no secrets ({built.line()}).{quoted}",
+        )
+    return FaultForgeError("sandbox_failed", f"the build couldn't run: {store.clean(reason, 60)}", "Call faultforge_status to check Docker and the images, then try again.")
+
+
+def _tree_changes(before: Path, after: Path) -> list[str]:
+    """Which files differ between the baseline's pinned source and the candidate's snapshot, by
+    content. Evidence for the reader, not a gate; cut off at a cap."""
+    names = sorted({*node_build._regular_files(before), *node_build._regular_files(after)})
+    changed = []
+    for name in names:
+        if not _same_bytes(after / name, before / name):
+            changed.append(name)
+            if len(changed) >= MAX_CHANGED_FILES:
+                break
+    return changed
 
 
 def _python_spec(root: Path, package: Path | None, config_path: Path, config: ProjectConfig) -> TargetSpec:
@@ -1358,9 +1745,10 @@ def _regression_lines(regression: tuple[fix_agent.RegressionRecord, ...]) -> lis
 
 def _fix_next(
     result: SandboxResult, failed: list[str], regression: tuple[fix_agent.RegressionRecord, ...], queries: Mapping[str, str] | None,
-    uncovered: list[str],
+    uncovered: list[str], stack_scope: str | None = None,
 ) -> list[str]:
-    """One line for each failed gate, in fixed words plus names from the pinned config."""
+    """One line for each failed gate, in fixed words plus names from the pinned config. stack_scope
+    is a stack fix's scope, already cleaned; None is a Python target."""
     report = result.report
     assert report is not None
     lines = []
@@ -1386,9 +1774,16 @@ def _fix_next(
             )
         elif verification is not None and verification.status == "mismatch":
             lines.append("What the target reports through its state hook must be what its database holds. Don't change the hook's answer; fix the writes.")
+        elif stack_scope is not None:
+            lines.append("The database couldn't be read after the run: postgres or the hooks helper wasn't running. The app must not stop them or exhaust the stack.")
         else:
             lines.append("The database couldn't be read after the run. The target must still be running, with its SQLite file at the sandbox's database path.")
-    if fix_agent.GATE_CODE in failed:
+    if fix_agent.GATE_CODE in failed and stack_scope is not None:
+        lines.append(
+            f"The deployed source is the same as the failing run's. Only files in {stack_scope} are taken from your tree: everything "
+            "else is the baseline's pinned copy, so edits to it change nothing."
+        )
+    elif fix_agent.GATE_CODE in failed:
         lines.append(
             f"The deployed code is the same as the failing run's. Only your {APP_NAME} is deployed: the support package and the "
             "config are the baseline's pinned copies, so edits to them change nothing."
@@ -1406,9 +1801,11 @@ def _fix_next(
 
 def _brief(
     meta: store.RunMeta, report: Report, config: ProjectConfig, scenario: ScenarioConfig, rules: str | None, next_call: str,
+    stack: StackConfig | None = None,
 ) -> list[str]:
     """Every line is one line of the result. Text the project wrote, or the target influenced, is
-    cleaned, cut short and marked, so the reader can tell it from FaultForge's own words."""
+    cleaned, cut short and marked, so the reader can tell it from FaultForge's own words. stack is
+    the pinned stack.yaml of a stack baseline built from source."""
     load = scenario.load
     lines = [
         f"FIX BRIEF: {scenario.id} failed in {meta.run_id}. You edit your working tree; FaultForge only judges the result.",
@@ -1433,7 +1830,16 @@ def _brief(
     if len(shown) > MAX_BRIEF_RULES:
         lines.append(f"... {len(shown) - MAX_BRIEF_RULES} more not shown")
     lines.append("## Files in scope")
-    lines.append(f"{APP_NAME} only. Put the whole fix there: it is the one file of yours that is deployed.")
+    if stack is not None and stack.build is not None:
+        scope = ", ".join(store.clean(item, MAX_FILE_NAME) for item in stack.build.fix_scope)
+        lines.append(f"{UNTRUSTED} {scope} only. Files you add, change or delete there are built into the candidate; nothing else of your tree is.")
+        lines.append(
+            f"Pinned at this run and never taken from your tree: {STACK_NAME} (the hooks' SQL, the images, the build and this scope), "
+            "package.json, pnpm-lock.yaml, pnpm-workspace.yaml, .nvmrc and every other file outside the scope."
+        )
+        lines.append("So a fix can't add or change a dependency. That needs a new baseline: faultforge_run_scenario again.")
+    else:
+        lines.append(f"{APP_NAME} only. Put the whole fix there: it is the one file of yours that is deployed.")
     if meta.pinned_package:
         files = sorted(name for name in meta.scope if "/" in name)
         lines.append(
@@ -1441,14 +1847,17 @@ def _brief(
             "read-only for the fix: read it, call it, but edits to it are not deployed."
         )
     lines.append(f"{config_module.CONFIG_NAME} and {store.RULES_NAME} are pinned at this run too: editing them changes nothing.")
-    policed = meta.pinned_package == POLICY_PACKAGE
-    lines.append(HOOKS_POLICY if policed else HOOKS_NO_POLICY)
-    lines.append("## The gate: every row must pass")
+    policed = stack is None and meta.pinned_package == POLICY_PACKAGE
+    lines.append(HOOKS_SEPARATE if stack is not None else HOOKS_POLICY if policed else HOOKS_NO_POLICY)
+    lines.append("## The gate: every row must pass" + (" (the candidate must build first, sealed, with no network)" if stack is not None else ""))
     if policed:
         lines.append(f"0. {GATE_POLICY}: {POLICY_MEANING}; checked before any load")
     for number, (name, meaning) in enumerate(GATE_MEANING.items(), 1):
         extra = ""
-        if name == fix_agent.GATE_STATE and config.target.state_queries is None:
+        if name == fix_agent.GATE_STATE and stack is not None:
+            if _undeclared(scenario, stack.state_sql):
+                extra = f". WILL FAIL: the pinned {STACK_NAME} has no state_sql for a field its invariants read; add it and make a new baseline first"
+        elif name == fix_agent.GATE_STATE and config.target.state_queries is None:
             extra = ". WILL FAIL: this run's config declares no target.state_queries; add them and make a new baseline first"
         elif name == fix_agent.GATE_STATE and _undeclared(scenario, config.target.state_queries):
             extra = ". WILL FAIL: this run's config has no state query for a field its invariants read; add it and make a new baseline first"

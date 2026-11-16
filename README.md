@@ -167,6 +167,7 @@ src/faultforge/web/    FastAPI app, run manager, budget, replays, static page
 demo/ticket-api/       Buggy target, reference fix, false fixes, business rules
 demo/hostile-build/    Containment target; don't run it outside a limited container
 demo/sportsdeck/       A multi-service target, built from a Git repo at a pinned commit
+demo/redeem-code/      A SvelteKit and Postgres target, built from source by the Node builder (docs/MCP.md)
 deploy/                Provisioning, deployment, systemd unit, Caddy template
 scripts/               k6 install, image build, model trial
 docs/                  Plan, verified tool behaviour

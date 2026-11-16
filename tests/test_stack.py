@@ -18,12 +18,12 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from faultforge import config as config_module, fix_agent, stack_hooks
+from faultforge import config as config_module, fix_agent, hooks as hooks_module, stack as stack_module, stack_hooks
 from faultforge.errors import FaultForgeError
 from faultforge.fix_agent import ApiKey, ModelPrice, OutputRejected, TokenBudget
 from faultforge.lifecycle import RunOptions
 from faultforge.models import Comparison, InvariantComparison
-from faultforge.sandbox import ContainmentFacts, SandboxResult, StateVerification
+from faultforge.sandbox import ContainmentFacts, SandboxError, SandboxResult, StateVerification
 from faultforge.stack import HOOKS_IMAGE, StackSession, StackSpec, STACK_POLICY, load_stack, psql_state_argv, run_stack, setup_role_sql
 from faultforge.stack_fix import (
     BuildResult,
@@ -45,6 +45,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import model_trial  # noqa: E402
+
+REDEEM = ROOT / "demo" / "redeem-code"
+REDEEM_STACK = load_stack(REDEEM / "stack.yaml")
 
 DEMO = ROOT / "demo" / "sportsdeck"
 CONFIG = DEMO / "faultforge.yaml"
@@ -398,6 +401,127 @@ def test_too_many_files_are_refused(tmp_path: Path) -> None:
         extract_output(tar_stream(*[(f"f{n}", "file", b"", 0o644) for n in range(5)]), tmp_path, max_members=3)
 
 
+# M11: what holds for every stack
+
+
+def redeem_session(tmp_path: Path) -> StackSession:
+    return StackSession(StackSpec("faultforge-redeem-code:buggy", REDEEM_STACK, REDEEM / "faultforge.yaml"), tmp_path, "same-code-race", RunOptions(), STACK_POLICY, 0.0)
+
+
+def test_a_stack_without_redis_starts_no_redis_container(tmp_path: Path) -> None:
+    assert REDEEM_STACK.redis_image is None and STACK.redis_image == "redis:7-alpine"
+    built = redeem_session(tmp_path).argv("pw", 1, "admin")
+    assert sorted(built) == ["app", "hooks", "postgres"]
+    assert not any("REDIS" in item or "redis" in item for args in built.values() for item in args)
+    assert sorted(session(tmp_path).argv("pw", 1)) == ["app", "hooks", "postgres", "redis"]
+    assert any(item == "REDIS_URL=redis://127.0.0.1:6379" for item in session(tmp_path).argv("pw", 1)["app"])
+
+
+@pytest.mark.parametrize("make", [session, redeem_session])
+def test_postgres_asks_for_a_password_on_every_tcp_login(tmp_path: Path, make) -> None:
+    """Without this the app, which shares postgres's loopback, could log in as the administrator
+    with no password: the stock image trusts 127.0.0.1."""
+    postgres = make(tmp_path).argv("pw", 1, "admin")["postgres"]
+    assert "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256" in postgres
+    assert "POSTGRES_HOST_AUTH_METHOD=trust" not in " ".join(postgres)
+
+
+def test_every_admin_session_pins_its_search_path_first() -> None:
+    argv = psql_state_argv("c", REDEEM_STACK, REDEEM_STACK.state_sql)
+    assert argv[argv.index("-d") + 1] == "dbname=redeem options=-csearch_path=pg_catalog,public"
+    assert stack_hooks.session_statements("pg_catalog, public", "SELECT 1") == ["SET search_path = pg_catalog, public", "SELECT 1"]
+    assert stack_module.ADMIN_SEARCH_PATH == stack_hooks.DEFAULT_SEARCH_PATH == "pg_catalog, public"
+    hooks = redeem_session(tmp_path := Path("/tmp")).argv("pw", 1, "admin")["hooks"]
+    spec = json.loads(next(item for item in hooks if item.startswith("FF_STACK_HOOKS=")).split("=", 1)[1])
+    assert spec["search_path"] == "pg_catalog, public" and tmp_path
+    for sql in [*REDEEM_STACK.state_sql.values(), *REDEEM_STACK.reset_sql]:
+        assert "public." in sql
+
+
+def test_the_source_hash_stands_in_for_the_image_id_when_faultforge_built_the_image() -> None:
+    prebuilt = StackSpec("sha256:abc", REDEEM_STACK, REDEEM / "faultforge.yaml")
+    assert prebuilt.deployed_code("sha256:abc") == hashlib.sha256(b"sha256:abc").hexdigest()
+    assert prebuilt.deployed_code("sha256:other") != prebuilt.deployed_code("sha256:abc")
+    built = StackSpec("sha256:abc", REDEEM_STACK, REDEEM / "faultforge.yaml", code_sha256="5" * 64)
+    assert built.deployed_code("sha256:abc") == built.deployed_code("sha256:other") == "5" * 64
+
+
+def hooks_server(token: str):
+    from http.server import ThreadingHTTPServer
+    import threading
+
+    spec = {"state_sql": {"n": "SELECT 1"}, "reset_sql": ["SELECT 2"], "build_id": "b", "instance_id": "i", "started_at": "t"}
+    ran: list[str] = []
+
+    def run(sql: str):
+        ran.append(sql)
+        return [[7]]
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), stack_hooks.make_handler(run, spec, "http://127.0.0.1:9/none", token))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, ran
+
+
+def test_the_hooks_helper_answers_only_the_holder_of_the_runs_token() -> None:
+    token = "ab" * 16
+    server, ran = hooks_server(token)
+    origin = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        for headers in ({}, {"X-FF-Hooks-Token": "cd" * 16}, {"X-FF-Hooks-Token": ""}, {"Authorization": token}):
+            assert httpx.get(f"{origin}/__ff/state", headers=headers).status_code == 403
+            assert httpx.post(f"{origin}/__ff/reset", headers=headers, json={}).status_code == 403
+            assert httpx.get(f"{origin}/__ff/health", headers=headers).status_code == 403
+        assert ran == []
+        good = {"X-FF-Hooks-Token": token}
+        assert httpx.get(f"{origin}/__ff/state", headers=good).json()["n"] == 7
+        assert httpx.post(f"{origin}/__ff/reset", headers=good, json={}).status_code == 200 and "SELECT 2" in ran
+    finally:
+        server.shutdown()
+    # A helper that was given no token answers nobody, whatever they send.
+    server, ran = hooks_server("")
+    try:
+        origin = f"http://127.0.0.1:{server.server_address[1]}"
+        for headers in ({}, {"X-FF-Hooks-Token": ""}):
+            assert httpx.post(f"{origin}/__ff/reset", headers=headers, json={}).status_code == 403
+        assert ran == []
+    finally:
+        server.shutdown()
+
+
+def test_the_token_goes_to_the_runner_and_the_helper_and_never_to_the_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    active = redeem_session(tmp_path)
+    active.hooks_token = "ab" * 16
+    built = active.argv("pw", 1, "admin")
+    assert f"FF_HOOKS_TOKEN={'ab' * 16}" in built["hooks"]
+    assert not any("ab" * 16 in item or "FF_HOOKS_TOKEN" in item for item in built["app"] + built["postgres"])
+    runner = stack_module.runner_argv("r", "sb-x", "pg", tmp_path, "same-code-race", RunOptions(), STACK_POLICY, 1, extra_env={"FF_HOOKS_TOKEN": "ab" * 16})
+    assert f"FF_HOOKS_TOKEN={'ab' * 16}" in runner
+    assert not any("FF_HOOKS_TOKEN" in item for item in stack_module.runner_argv("r", "sb-x", "pg", tmp_path, "same-code-race", RunOptions(), STACK_POLICY, 1))
+    # The runner sends it only to a hooks origin of its own, never to the target's own port.
+    config = config_module.parse_config((REDEEM / "faultforge.yaml").read_text(encoding="utf-8"))
+    monkeypatch.setenv("FF_HOOKS_TOKEN", "ab" * 16)
+    assert hooks_module.TargetHooks(config.target, 1.0).token == "ab" * 16
+    same = config.target.model_copy(update={"hooks_origin": config.target.origin})
+    none = config.target.model_copy(update={"hooks_origin": None})
+    assert hooks_module.TargetHooks(same, 1.0).token is None and hooks_module.TargetHooks(none, 1.0).token is None
+    monkeypatch.setenv("FF_HOOKS_TOKEN", "not a token\r\nX-Injected: 1")
+    assert hooks_module.TargetHooks(config.target, 1.0).token is None
+    monkeypatch.delenv("FF_HOOKS_TOKEN")
+    assert hooks_module.TargetHooks(config.target, 1.0).token is None
+
+
+def test_a_stack_whose_hooks_origin_isnt_the_helper_is_refused(tmp_path: Path) -> None:
+    """Otherwise the runner would hand the token to whatever listens there, such as the app."""
+    config = tmp_path / "faultforge.yaml"
+    config.write_text((REDEEM / "faultforge.yaml").read_text(encoding="utf-8").replace("http://127.0.0.1:8001", "http://127.0.0.1:8000"), encoding="utf-8")
+    active = StackSession(StackSpec("x", REDEEM_STACK, config), tmp_path, "same-code-race", RunOptions(), STACK_POLICY, 0.0)
+    with pytest.raises(SandboxError) as refused:
+        active._require_helper_origin()
+    assert refused.value.reason == "invalid_spec"
+    redeem_session(tmp_path)._require_helper_origin()
+    session(tmp_path)._require_helper_origin()
+
+
 # The gate against a cheating app
 
 
@@ -540,3 +664,38 @@ def test_the_reference_fix_passes_every_regression_scenario(tmp_path: Path) -> N
         assert result.report.verdict == "PASS", (scenario, result.report.verdict_reason)
         assert result.containment.state_verification.status == "matched"
 
+
+
+def test_the_output_may_hold_only_what_the_caller_asked_tar_for(tmp_path: Path) -> None:
+    asked = tar_stream(("build", "dir", None, 0o755), ("build/index.js", "file", b"ok", 0o644))
+    assert extract_output(asked, tmp_path / "ok", tops=("build",)) == 2
+    extra = tar_stream(("build/index.js", "file", b"ok", 0o644), ("planted.js", "file", b"x", 0o644))
+    with pytest.raises(UnsafeOutput):
+        extract_output(extra, tmp_path / "extra", tops=("build",))
+    assert not (tmp_path / "extra" / "planted.js").exists()
+
+
+@pytest.mark.parametrize(("status", "expected"), [(403, 0), (200, 5), (500, 3)])
+def test_a_hooks_helper_that_answers_without_the_token_is_refused(status: int, expected: int) -> None:
+    """The probe a stack run sends the helper: only a 403 for a call without the run's token passes."""
+    import http.server
+    import threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_: object) -> None:
+            pass
+
+        def do_GET(self) -> None:
+            self.send_response(status)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        script = stack_module._TOKEN_DEMANDED.format(port=server.server_address[1])
+        result = subprocess.run([sys.executable, "-I", "-c", script], capture_output=True, timeout=30, check=False)
+        assert result.returncode == expected
+    finally:
+        server.shutdown()

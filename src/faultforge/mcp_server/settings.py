@@ -18,7 +18,7 @@ MAX_ROOTS = 64
 MAX_PATH_CHARS = 4096
 MAX_IMAGES = 64
 MAX_IMAGE_CHARS = 256
-CONFIG_KEYS = {"allowed_roots", "allowed_images"}
+CONFIG_KEYS = {"allowed_roots", "allowed_images", "allow_network_install"}
 
 
 def config_path() -> Path:
@@ -40,6 +40,9 @@ class McpSettings:
     problems: tuple[str, ...] = ()
     # The prebuilt app images a stack project may name. Empty by default, so none is allowed.
     allowed_images: tuple[str, ...] = ()
+    # Whether faultforge_run_scenario may fetch a new lockfile's packages from registry.npmjs.org
+    # (docs/PLAN.md M11). Off unless the file says true; faultforge_verify_fix never fetches.
+    allow_network_install: bool = False
 
 
 def _string_list(data: dict, key: str, limit: int) -> list[str]:
@@ -51,11 +54,14 @@ def _string_list(data: dict, key: str, limit: int) -> list[str]:
     return raw
 
 
-def _parse_config(text: str) -> tuple[tuple[Path, ...], tuple[str, ...], list[str]]:
+def _parse_config(text: str) -> tuple[tuple[Path, ...], tuple[str, ...], list[str], bool]:
     data = tomllib.loads(text)
     unknown = set(data) - CONFIG_KEYS
     if unknown:
         raise ValueError(f"unknown keys {sorted(unknown)}")
+    network_install = data.get("allow_network_install", False)
+    if type(network_install) is not bool:
+        raise ValueError("allow_network_install must be true or false")
     images = _string_list(data, "allowed_images", MAX_IMAGES)
     if any(not image or len(image) > MAX_IMAGE_CHARS or "\0" in image or image.startswith("-") for image in images):
         raise ValueError("allowed_images entries must be plain image names such as myapp:buggy")
@@ -73,7 +79,7 @@ def _parse_config(text: str) -> tuple[tuple[Path, ...], tuple[str, ...], list[st
             problems.append(f"ignored {item!r}: not a directory")
         else:
             roots.append(resolved)
-    return tuple(dict.fromkeys(roots)), tuple(dict.fromkeys(images)), problems
+    return tuple(dict.fromkeys(roots)), tuple(dict.fromkeys(images)), problems, network_install
 
 
 def load_settings() -> McpSettings:
@@ -81,12 +87,12 @@ def load_settings() -> McpSettings:
     try:
         if path.stat().st_size > MAX_CONFIG_BYTES:
             raise ValueError(f"larger than {MAX_CONFIG_BYTES} bytes")
-        roots, images, problems = _parse_config(path.read_text(encoding="utf-8"))
+        roots, images, problems, network_install = _parse_config(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return McpSettings(path, state, (), (f"{path} doesn't exist, so no project is allowed",))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, ValueError) as error:
         return McpSettings(path, state, (), (f"{path} is invalid, so no project is allowed: {error}",))
-    return McpSettings(path, state, roots, tuple(problems), images)
+    return McpSettings(path, state, roots, tuple(problems), images, network_install)
 
 
 def require_image_allowed(image: str | None, settings: McpSettings) -> None:
