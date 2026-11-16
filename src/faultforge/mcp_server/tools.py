@@ -1,9 +1,13 @@
 """The MCP tools as plain functions, so they can be tested without a transport (docs/PLAN.md V4.4).
 
 Every tool returns a dict, and every failure is `{status: "error", error_class, message, fix_hint}`.
-Nothing here reads an inference key, makes a network call or spends money. The only containers it
-can touch are the sandbox's own, through sandbox.py and stack.py, which act only on containers that
-carry the faultforge.sandbox label.
+The only containers it can touch are the sandbox's own, through sandbox.py and stack.py, which act
+only on containers that carry the faultforge.sandbox label.
+
+Network and money (M10, docs/PLAN.md V4.3). Two things reach the network, and nothing else does:
+credit.py's account read at api.vultr.com, made by faultforge_status and by faultforge_propose_fix
+in auto or vultr mode, and fix_agent's model call, made only by a vultr fix. Both need their key
+file. A vultr fix is the only thing that spends, and only after CreditGuard allows its worst case.
 
 Targets:
 - **python**: a single-container ASGI app, `app.py` at the project root plus at most one package
@@ -24,11 +28,18 @@ That is not the same as the hooks being independent. app.py runs in the same pro
 hooks and could wrap them at import. For the Ticket API's package, fix_agent.check_app_policy, the
 policy written for it, refuses such a file before any load. For any other package there is no
 policy, and the results say so. M11 moves the hooks into a separate trusted container.
+
+Fixes (M10, vultr mode): faultforge_propose_fix hands the baseline's pinned inputs to
+fix_agent.run_fix_loop, the web app's loop, which asks the model for an app.py and judges each one
+with the same gate. The result is a diff. Each candidate is stored under the baseline run as
+candidate:<id> and nothing is ever written to the project; faultforge_verify_fix judges a stored
+candidate exactly as it judges a working tree.
 """
 
 import contextlib
 import dataclasses
 import fcntl
+import hashlib
 import os
 import re
 import secrets
@@ -40,6 +51,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
+import httpx
 import yaml
 from pydantic import ValidationError
 
@@ -47,11 +59,13 @@ from faultforge import config as config_module, expressions, fix_agent, k6_runne
 from faultforge.errors import FaultForgeError
 from faultforge.lifecycle import RunOptions
 from faultforge.limits import LIMITS
-from faultforge.mcp_server import snapshot as snapshot_module, store
+from faultforge.mcp_server import credit as credit_module, snapshot as snapshot_module, store
+from faultforge.mcp_server.credit import CreditGuard, CreditView, Decision
 from faultforge.mcp_server.settings import McpSettings, load_settings, private_dir, require_image_allowed, resolve_project
 from faultforge.models import ProjectConfig, Report, ScenarioConfig
 from faultforge.sandbox import SandboxResult, TargetSpec
 from faultforge.stack import HOOKS_IMAGE, StackConfig, StackSpec
+from faultforge.web.settings import AGENT_MODEL, AGENT_REASONING_EFFORT
 
 STACK_NAME = "stack.yaml"
 APP_NAME = "app.py"
@@ -69,11 +83,16 @@ WRITABLE_PATH = re.compile(r"/[A-Za-z0-9._/-]{1,128}")
 RESERVED_PORTS = (5432, 6379)
 STATUS_POLICY = dataclasses.replace(sandbox.DEFAULT_POLICY, docker_timeout_s=5.0)
 REMOTE_UNAVAILABLE = "not built yet (M12)"
-VULTR_UNAVAILABLE = "Vultr fixes arrive in M10"
 FIX_MODES = ("auto", "client", "vultr")
+RUNTIME_AUTO = f"auto -> local: the remote runtime is {REMOTE_UNAVAILABLE}"
+VULTR_PACKAGE_ONLY = "not a ticket_support project: the vultr fix loop's code policy is written for that package only"
+VULTR_PER_RUN = "decided for each run: a vultr fix also needs a ticket_support baseline with a pinned app.py"
+USE_CLIENT = "Use mode \"client\", or \"auto\", which falls back to it."
+# The first lines of a candidate's diff that a propose_fix result carries; get_run pages the rest.
+MAX_DIFF_SHOWN = 20
 NO_STATE_QUERIES = "faultforge.yaml declares no target.state_queries, so the database wasn't read directly"
 # A brief stays within about 60 lines as a whole result; each section has its own cap below.
-MAX_BRIEF_LINES = 50
+MAX_BRIEF_LINES = 48
 MAX_BRIEF_VIOLATIONS = 6
 MAX_BRIEF_RULES = 12
 MAX_BRIEF_FILES = 6
@@ -317,11 +336,17 @@ class Tools:
         run_sandboxed: Callable[..., SandboxResult] = sandbox.run_sandboxed,
         run_stack: Callable[..., SandboxResult] = stack_module.run_stack,
         image_present: Callable[[str], bool | None] = _image_present,
+        credit: CreditGuard | None = None,
+        inference_transport: httpx.BaseTransport | None = None,
+        fix_loop: Callable[..., fix_agent.LoopResult] = fix_agent.run_fix_loop,
     ):
         self._settings = settings
         self._run_sandboxed = run_sandboxed
         self._run_stack = run_stack
         self._image_present = image_present
+        self._credit = credit or CreditGuard()
+        self._inference_transport = inference_transport
+        self._fix_loop = fix_loop
         self._lock = threading.Lock()
 
     # faultforge_status
@@ -344,6 +369,11 @@ class Tools:
         except k6_runner.K6Missing:
             k6 = "not on the host; the runner image carries its own"
         local_ready = bool(docker["reachable"]) and all(images[image] for image in list(images)[:2])
+        # The one tool that reads the credit without a paid decision behind it, so the user can see it.
+        decision = self._credit.decide(settings.state_dir, credit_module.fix_worst_case_usd())
+        _, no_inference = credit_module.inference_key()
+        vultr_reason = None if decision.allowed and no_inference is None else (no_inference if decision.allowed else decision.reason)
+        fix_auto = "client" if vultr_reason else "vultr"
         return {
             "status": "ok",
             "docker": docker,
@@ -355,16 +385,22 @@ class Tools:
             },
             "fix_modes": {
                 "client": {"available": True, "reason": None},
-                "vultr": {"available": False, "reason": VULTR_UNAVAILABLE},
-                "auto": "client",
+                "vultr": {"available": vultr_reason is None, "reason": vultr_reason or VULTR_PER_RUN},
+                "auto": fix_auto,
             },
             "busy": self._lock.locked() or run_lock_held(settings.state_dir),
             "allowed_roots": [str(root) for root in settings.allowed_roots],
             "config_path": str(settings.config_path),
             "config_problems": list(settings.problems),
             "state_dir": str(settings.state_dir),
-            "credit": None,
-            "credit_reason": "credit check arrives in M10",
+            **_credit_fields(decision.view),
+            "credit_age_s": decision.view.age_s,
+            "credit_reason": decision.reason,
+            "ledger": _ledger_line(decision.view),
+            "effective_modes": {
+                "fix": f"auto -> {fix_auto}: {vultr_reason or decision.reason}",
+                "runtime": RUNTIME_AUTO,
+            },
         }
 
     # faultforge_list_scenarios
@@ -568,7 +604,10 @@ class Tools:
                 result, project_dir=str(project), scenario_id=scenario_id, kind=target_kind, source=source,
                 compare_to=compare_to, notes=notes, pinned_config_sha256=store.file_sha256(config_path), scope=scope,
             )
-            store.store_run(state, work, result.report, meta, result, pin_from=snap.root, package_from=package)
+            store.store_run(
+                state, work, result.report, meta, result, pin_from=snap.root, package_from=package,
+                app_from=snap.root / APP_NAME if target_kind == "python" else None,
+            )
             return {**store.summary(state, result.report.run_id), "mutates_data": "only the sandbox's own throwaway data"}
         finally:
             snap.remove()
@@ -606,45 +645,251 @@ class Tools:
             )
         return meta, report, project
 
+    def _vultr_blocker(self, state: Path, meta: store.RunMeta, config: ProjectConfig) -> FaultForgeError | None:
+        """Why this run can't have a vultr fix, whatever the credit is. Nothing here uses the network.
+        An explicit vultr request gets the error; auto takes its message as the reason for client."""
+        if meta.pinned_package != POLICY_PACKAGE:
+            return FaultForgeError("mode_unavailable", VULTR_PACKAGE_ONLY, USE_CLIENT)
+        queries = config.target.state_queries
+        if queries is None or any(_undeclared(scenario, queries) for scenario in config.scenarios):
+            # Refused before any money is spent: the state gate would fail every candidate.
+            return FaultForgeError(
+                "mode_unavailable", "the pinned config's state_queries don't cover what its invariants read, so no candidate could pass the gate",
+                "Declare a state query for each field, call faultforge_run_scenario for a new baseline, then fix against that run.",
+            )
+        if len(config.scenarios) - 1 > MAX_REGRESSION_SCENARIOS:
+            return FaultForgeError(
+                "budget_exceeded", f"the pinned config has more than {MAX_REGRESSION_SCENARIOS} other scenarios",
+                "Split the project's scenarios across fewer configs, then make a new baseline.",
+            )
+        try:
+            store.pinned_app(state, meta)
+        except FaultForgeError as error:
+            return error
+        if store.candidates_stored(state, meta.run_id) + credit_module.FIX_ATTEMPTS > store.MAX_CANDIDATES:
+            # Checked here, before any model call, so the cap can't stop a fix that was already paid for.
+            return FaultForgeError(
+                "budget_exceeded", f"{meta.run_id} has no room for another fix's candidates (at most {store.MAX_CANDIDATES})",
+                "Call faultforge_run_scenario for a new baseline, then fix against that run.",
+            )
+        _, reason = credit_module.inference_key()
+        if reason is not None:
+            return FaultForgeError(
+                "mode_unavailable", reason,
+                f"Put {credit_module.INFERENCE_KEY_NAME}=... in {credit_module.inference_key_path()}, mode 0600. {USE_CLIENT}",
+            )
+        return None
+
     @structured
     def propose_fix(self, run_id: str, mode: str = "auto") -> dict[str, Any]:
-        """Client mode: a brief for the caller, who edits its own working tree. Nothing is written to
-        the repo, no load is sent and no model is called.
+        """client: a brief for the caller, who edits its own working tree. No load is sent, no model
+        is called and no run lock is taken: it only reads a stored run, whose files are complete
+        before its run_id is ever returned.
 
-        It takes no run lock. It only reads a stored run, and a run's files are complete before its
-        run_id is ever returned, so there is nothing for a run in progress to race with."""
+        vultr: a model writes app.py and the gate judges it, under both run locks, because it sends
+        load. It needs the credit floor's permission, an inference key and a ticket_support
+        baseline. auto is vultr when all of that holds and client otherwise, and says why.
+
+        Nothing is written to the repo in any mode."""
         if mode not in FIX_MODES:
             raise FaultForgeError("invalid_argument", f"mode must be one of {', '.join(FIX_MODES)}")
-        if mode == "vultr":
-            raise FaultForgeError("mode_unavailable", "the vultr fix mode isn't built yet", f"{VULTR_UNAVAILABLE}. Use mode \"client\" or \"auto\".")
         settings = self._settings()
         meta, report, _ = self._fixable(settings, run_id)
-        pinned = store.pinned_config(settings.state_dir, meta)
-        store.pinned_package(settings.state_dir, meta)
+        state = settings.state_dir
+        pinned = store.pinned_config(state, meta)
+        store.pinned_package(state, meta)
         config = config_module.parse_config(pinned.read_text(encoding="utf-8"))
         scenario = config_module.find_scenario(config, meta.scenario_id)
+        worst = credit_module.fix_worst_case_usd()
+        reason = "requested"
+        decision: Decision | None = None
+        if mode != "client":
+            blocker = self._vultr_blocker(state, meta, config)
+            if blocker is not None and mode == "vultr":
+                raise blocker
+            if blocker is None:
+                decision = self._credit.decide(state, worst)
+            if blocker is not None:
+                refusal: str | None = blocker.message
+            else:
+                refusal = None if decision.allowed else decision.reason
+            if refusal is None:
+                if not self._lock.acquire(blocking=False):
+                    raise _busy()
+                try:
+                    # The same two locks as a run, in the same order; both are released on every path.
+                    with run_lock(state):
+                        # Asked again under the lock: another server may have spent since. The reading is cached,
+                        # so this reads the ledger and not the network.
+                        decision = self._credit.decide(state, worst)
+                        if decision.allowed:
+                            return self._vultr_fix(settings, meta, report, config, scenario, pinned, decision, mode)
+                        refusal = decision.reason
+                finally:
+                    self._lock.release()
+            if mode == "vultr":
+                return {
+                    **FaultForgeError("credit_floor", refusal, f"Nothing was spent. {USE_CLIENT} faultforge_status shows the credit.").to_dict(),
+                    **_credit_fields(decision.view), "mode": None,
+                }
+            reason = f"auto resolves to client: {refusal}"
+        view = decision.view if decision is not None else self._credit.view(state, refresh=False)
         next_call = f'faultforge_verify_fix(run_id="{meta.run_id}", source="worktree")'
-        brief = _brief(meta, report, config, scenario, store.pinned_rules(settings.state_dir, meta.run_id), next_call)
+        brief = _brief(meta, report, config, scenario, store.pinned_rules(state, meta.run_id), next_call)
         return {
             "status": "ok",
             "run_id": meta.run_id,
             "mode": "client",
-            "mode_reason": f"auto resolves to client: {VULTR_UNAVAILABLE}" if mode == "auto" else "requested",
+            "mode_reason": reason,
             "writes_to_repo": False,
+            **_credit_fields(view),
             "brief": brief,
             "next_call": next_call,
         }
+
+    def _vultr_fix(
+        self, settings: McpSettings, meta: store.RunMeta, report: Report, config: ProjectConfig, scenario: ScenarioConfig,
+        pinned: Path, decision: Decision, mode: str,
+    ) -> dict[str, Any]:
+        """Runs fix_agent's loop on the baseline's pinned inputs. Both run locks are held."""
+        state = private_dir(settings.state_dir)
+        store.sweep_stale(state, time.time())
+        package = store.pinned_package(state, meta)
+        app = store.pinned_app(state, meta)
+        key, _ = credit_module.inference_key()
+        if package is None or key is None:
+            raise FaultForgeError("mode_unavailable", "the vultr fix mode's inputs went missing", USE_CLIENT)
+        rules = store.pinned_rules(state, meta.run_id) or "\n".join(f"- {item.name}: {item.check}" for item in scenario.invariants)
+        regression_ids = fix_agent.regression_scenarios_for(pinned, scenario.id)
+        ledger = self._credit.ledger(state)
+        spent_before = credit_module.usd(ledger.snapshot()["total_usd_spent"])
+        work = private_dir(state / "work") / secrets.token_hex(8)
+        ran: list[tuple[str, SandboxResult]] = []
+        lines: list[str] = []
+        candidates: list[tuple[str, bool, tuple[fix_agent.RegressionRecord, ...]]] = []
+
+        def run(target: TargetSpec, project_dir: Path, scenario_id: str, options: RunOptions) -> SandboxResult:
+            result = self._run_sandboxed(target, project_dir, scenario_id, options)
+            ran.append((scenario_id, result))
+            return result
+
+        def on_attempt(record: fix_agent.AttemptRecord, proposal: fix_agent.Proposal) -> None:
+            mine, ran[:] = list(ran), []
+            identifier = None
+            if proposal.code is not None:
+                code = proposal.code.encode("utf-8")
+                identifier = store.store_candidate(state, meta.run_id, code, {
+                    "attempt": record.attempt, "model": record.model, "verified": record.fix_verified,
+                    "gate_failed": list(record.gate_failed), "failure_reason": record.failure_reason, "run_id": record.run_id,
+                })
+                candidates.append((identifier, record.fix_verified, record.regression))
+                self._store_attempt(state, work, meta, pinned, package, code, identifier, record, mine)
+            lines.append(_attempt_line(record, identifier, bool(regression_ids)))
+
+        try:
+            work.mkdir(mode=0o700)
+            store.stage_baseline(state, work, meta.run_id)
+            try:
+                loop = self._fix_loop(
+                    model=AGENT_MODEL, api_key=key, budget=self._credit.budget(ledger), app_source=app,
+                    support_sources=fix_agent.load_support_sources(package), business_rules=rules, baseline=report,
+                    baseline_code_sha256=meta.deployed_code_sha256, support_dir=package, config_path=pinned, project_dir=work,
+                    scenario_id=scenario.id, run_sandboxed=run, options=RunOptions(), attempts=credit_module.FIX_ATTEMPTS,
+                    max_tokens=credit_module.FIX_MAX_TOKENS, reasoning_effort=AGENT_REASONING_EFFORT,
+                    transport=self._inference_transport, on_attempt=on_attempt,
+                    state_verifier=config.target.state_queries, regression_scenarios=regression_ids,
+                )
+            except Exception as error:
+                # Whatever was charged is already in the ledger. The message is fixed words and a type.
+                spent = credit_module.usd(self._credit.ledger(state).snapshot()["total_usd_spent"]) - spent_before
+                raise FaultForgeError(
+                    "engine_failed", f"the fix loop stopped early ({type(error).__name__}); ${spent:.6f} was spent and is in the ledger",
+                    f"Nothing was written to the repo. {USE_CLIENT}",
+                ) from None
+        finally:
+            store.remove_tree(work)
+        after = self._credit.view(state, refresh=False)
+        chosen = next((item for item in candidates if item[1]), candidates[-1] if candidates else None)
+        result: dict[str, Any] = {
+            "status": "ok",
+            "run_id": meta.run_id,
+            "mode": "vultr",
+            "mode_reason": "requested" if mode == "vultr" else f"auto resolves to vultr: {decision.reason}",
+            "model": AGENT_MODEL,
+            "writes_to_repo": False,
+            "verified": loop.success,
+            "stop_reason": store.clean(loop.stop_reason, 60),
+            "candidate": f"candidate:{chosen[0]}" if chosen else None,
+            "attempts": lines,
+        }
+        if chosen is not None:
+            shown, exact = store.diff_lines(app, store.read_candidate(state, meta.run_id, chosen[0]))
+            result["regression"] = _regression_lines(chosen[2])
+            result["diff_notice"] = store.DIFF_NOTICE + ("" if exact else " Some lines were cleaned or cut, so it won't apply as it is.")
+            result["diff"] = shown[:MAX_DIFF_SHOWN]
+            result["diff_lines"] = len(shown)
+            if len(shown) > MAX_DIFF_SHOWN:
+                result["diff_more"] = (
+                    f'faultforge_get_run("{meta.run_id}", section="diff", candidate="{chosen[0]}", offset={MAX_DIFF_SHOWN})'
+                )
+        before = decision.view.credit_usd
+        result |= {
+            "cost_usd": round(loop.cost_usd, 4),
+            **_credit_fields(after),
+            "credit": (
+                f"{credit_module.money(before) if before is not None else 'unknown'} before, "
+                f"{credit_module.money(after.credit_usd) if after.credit_usd is not None else 'unknown'} after "
+                "(the last account reading, less what the ledger recorded since)"
+            ),
+            "ledger": _ledger_line(after),
+            "hooks": HOOKS_POLICY,
+            "next_call": (
+                f'faultforge_verify_fix(run_id="{meta.run_id}", source="candidate:{chosen[0]}") judges it again; then apply the diff yourself'
+                if loop.success and chosen else f'faultforge_propose_fix(run_id="{meta.run_id}", mode="client") for a brief to fix it yourself'
+            ),
+        }
+        return result
+
+    def _store_attempt(
+        self, state: Path, work: Path, baseline: store.RunMeta, pinned: Path, package: Path, code: bytes, identifier: str,
+        record: fix_agent.AttemptRecord, ran: list[tuple[str, SandboxResult]],
+    ) -> None:
+        """Stores an attempt's runs as faultforge_verify_fix stores its own: the regression runs
+        first and the main run last, so faultforge_get_run pages their evidence."""
+        source = {"source": f"candidate:{identifier}", "files": 1, "model": record.model}
+        scope = _scope_of(code, package)
+        main = next((result for name, result in ran if name == baseline.scenario_id and result.report is not None and result.status == "completed"), None)
+        for name, other in ran:
+            if name == baseline.scenario_id or other.report is None or other.status != "completed":
+                continue
+            store.store_run(state, work, other.report, _meta(
+                other, project_dir=baseline.project_dir, scenario_id=name, kind="python", source=source, compare_to=None,
+                notes=[f"A regression run of a vultr fix attempt for {baseline.run_id}."],
+                pinned_config_sha256=baseline.pinned_config_sha256, scope=scope, role="regression",
+            ), other, pin_from=pinned.parent, package_from=package)
+        if main is not None:
+            store.store_run(state, work, main.report, _meta(
+                main, project_dir=baseline.project_dir, scenario_id=baseline.scenario_id, kind="python", source=source,
+                compare_to=baseline.run_id,
+                notes=[
+                    f"Attempt {record.attempt} of a vultr fix for {baseline.run_id}: app.py written by {record.model}, stored as "
+                    f"candidate:{identifier}. The config and the support package are the baseline's pinned copies."
+                ],
+                pinned_config_sha256=baseline.pinned_config_sha256, scope=scope, role="verify",
+                fix_gate={
+                    "verified": record.fix_verified, "baseline_run_id": baseline.run_id, "failed": list(record.gate_failed),
+                    "regression": _regression_lines(record.regression),
+                },
+            ), main, pin_from=pinned.parent, package_from=package)
 
     # faultforge_verify_fix
 
     @structured
     def verify_fix(self, run_id: str, source: str = "worktree") -> dict[str, Any]:
         if isinstance(source, str) and source.startswith("candidate:"):
-            raise FaultForgeError(
-                "mode_unavailable", "candidate sources come from the vultr fix mode, which isn't built yet",
-                f"{VULTR_UNAVAILABLE}. Use source \"worktree\" or \"commit:<sha>\".",
-            )
-        kind, sha = snapshot_module.parse_source(source)
+            kind, sha = "candidate", store.parse_candidate(source)
+        else:
+            kind, sha = snapshot_module.parse_source(source)
         settings = self._settings()
         meta, _, project = self._fixable(settings, run_id)
         if kind == "image":
@@ -675,23 +920,34 @@ class Tools:
                 "budget_exceeded", f"the pinned config has {len(regression_ids)} other scenarios; verify_fix runs at most {MAX_REGRESSION_SCENARIOS}",
                 "Split the project's scenarios across fewer configs, then make a new baseline.",
             )
-        if kind == "commit":
+        snap: snapshot_module.Snapshot | None = None
+        if kind == "candidate":
+            # A stored candidate is one app.py a model wrote for this baseline. Nothing is snapshotted.
+            stored = store.read_candidate(state, baseline.run_id, sha or "")
+        elif kind == "commit":
             snap = snapshot_module.snapshot_commit(project, state, sha or "", settings.allowed_roots)
         else:
             snap = snapshot_module.snapshot_worktree(project, state, settings.allowed_roots)
         work: Path | None = None
         try:
-            if _kind(project) == "stack" or _regular(snap.root / STACK_NAME):
+            if _kind(project) == "stack" or (snap is not None and _regular(snap.root / STACK_NAME)):
                 raise FaultForgeError(
                     "unsupported_build", f"the candidate has a {STACK_NAME}", "A stack's source can't be rebuilt until M11.",
                 )
-            if not _regular(snap.root / APP_NAME):
+            if snap is not None and not _regular(snap.root / APP_NAME):
                 raise FaultForgeError("unsupported_build", f"the candidate has no {APP_NAME}", f"The fix goes in {APP_NAME} at the project root.")
             # Only app.py comes from the candidate. The package is the baseline's pinned copy, so the
             # deployed hash covers the candidate's app.py and nothing else of its tree.
-            spec = _python_spec(snap.root, package, pinned, config)
-            scope = _scope(snap.root, package)
-            edits = _changed_names(baseline.scope, _candidate_scope(snap.root, baseline.scope))
+            if snap is not None:
+                spec = _python_spec(snap.root, package, pinned, config)
+                edits = _changed_names(baseline.scope, _candidate_scope(snap.root, baseline.scope))
+                described, origin_text = snap.describe(), f"{snap.source}, {snap.files} files"
+            else:
+                spec = TargetSpec(app_source=stored, config_path=pinned, support_dir=package, state_verifier=config.target.state_queries)
+                edits = [APP_NAME] if baseline.scope.get(APP_NAME) != hashlib.sha256(stored).hexdigest() else []
+                described = {"source": f"candidate:{sha}", "files": 1}
+                origin_text = f"candidate:{sha}, {APP_NAME} only, model output stored under the baseline run"
+            scope = _scope_of(spec.app_source, package)
             ignored = [name for name in edits if name != APP_NAME]
             notes = [
                 f"faultforge_verify_fix of {baseline.run_id}. {config_module.CONFIG_NAME}, the business rules and the support "
@@ -715,26 +971,27 @@ class Tools:
                 return {
                     "status": "ok", "verified": False, "run_id": None, "baseline_run_id": baseline.run_id,
                     "baseline_source": origin, "scenario_id": scenario_id,
-                    "source": f"{snap.source}, {snap.files} files",
+                    "source": origin_text,
                     "gate": [
                         {"gate": GATE_POLICY, "passed": False, "evidence": "; ".join(broken_rules[:MAX_GATE_NAMES])
                          + (f"; and {len(broken_rules) - MAX_GATE_NAMES} more" if len(broken_rules) > MAX_GATE_NAMES else "")},
                         *({"gate": name, "passed": False, "evidence": f"not run: {GATE_POLICY} failed first"} for name in GATE_MEANING),
                     ],
                     "regression": [], "changed_files": changed, "containers_left": 0, "hooks": hooks,
+                    **self._cached_credit(state),
                     "fix_next": [
                         *([not_deployed] if not_deployed else []),
                         f"{APP_NAME} breaks the code rules in the {GATE_POLICY} row, so it wasn't run. Fix the logic of the endpoint itself; "
                         "don't rebind, wrap or reach into the support package.",
                     ],
                 }
-            if not _same_bytes(snap.root / config_module.CONFIG_NAME, pinned):
+            if snap is not None and not _same_bytes(snap.root / config_module.CONFIG_NAME, pinned):
                 pinning = (
                     f"The candidate's {config_module.CONFIG_NAME} differs from the baseline's and was ignored. "
                     "To adopt a config change, call faultforge_run_scenario for a new baseline."
                 )
                 notes.append(pinning)
-            if snap.dropped_secrets:
+            if snap is not None and snap.dropped_secrets:
                 notes.append(f"Left {len(snap.dropped_secrets)} secret-looking files out of the snapshot.")
             work = private_dir(state / "work") / secrets.token_hex(8)
             work.mkdir(mode=0o700)
@@ -786,12 +1043,12 @@ class Tools:
                 if item.run_id is None or other is None or other.report is None:
                     continue
                 store.store_run(state, work, other.report, _meta(
-                    other, project_dir=str(project), scenario_id=item.scenario_id, kind="python", source=snap.describe(),
+                    other, project_dir=str(project), scenario_id=item.scenario_id, kind="python", source=described,
                     compare_to=None, notes=[f"A regression run of faultforge_verify_fix for {baseline.run_id} (main run {report.run_id})."],
                     pinned_config_sha256=baseline.pinned_config_sha256, scope=scope, role="regression",
                 ), other, pin_from=pinned.parent, package_from=package)
             meta = _meta(
-                result, project_dir=str(project), scenario_id=scenario_id, kind="python", source=snap.describe(),
+                result, project_dir=str(project), scenario_id=scenario_id, kind="python", source=described,
                 compare_to=baseline.run_id, notes=notes, pinned_config_sha256=baseline.pinned_config_sha256, scope=scope,
                 role="verify",
                 fix_gate={"verified": verified, "baseline_run_id": baseline.run_id, "failed": failed, "regression": regression_lines},
@@ -805,7 +1062,7 @@ class Tools:
                 "baseline_run_id": baseline.run_id,
                 "baseline_source": origin,
                 "scenario_id": scenario_id,
-                "source": f"{snap.source}, {snap.files} files",
+                "source": origin_text,
                 "verdict": report.verdict,
                 "gate": rows,
                 "regression": regression_lines,
@@ -813,6 +1070,7 @@ class Tools:
                 "changed_files": changed,
                 "hooks": hooks,
                 "containers_left": None if any(count is None for count in left) else sum(left),
+                **self._cached_credit(state),
             }
             if not verified:
                 answer["proven"] = [f"{UNTRUSTED} {line}" for line in store.proven_lines(report)[:MAX_VERIFY_PROVEN]]
@@ -823,16 +1081,26 @@ class Tools:
                 answer["not_deployed"] = not_deployed
             return answer
         finally:
-            snap.remove()
+            if snap is not None:
+                snap.remove()
             if work is not None:
                 store.remove_tree(work)
+
+    def _cached_credit(self, state: Path) -> dict[str, Any]:
+        """For a tool that isn't a paid decision: the last reading if it is still fresh, and what
+        auto would pick on that alone. It never touches the network."""
+        decision = self._credit.decide(state, credit_module.fix_worst_case_usd(), refresh=False)
+        fields = _credit_fields(decision.view)
+        mode = "vultr, if faultforge_propose_fix confirms it" if decision.allowed else f"client unless a new reading allows vultr ({decision.reason})"
+        # One line, so a verify result stays within its 60: the same three facts faultforge_status gives.
+        return {"credit": f"credit_usd={'null' if fields['credit_usd'] is None else fields['credit_usd']}, floor_usd={fields['floor_usd']}; fix auto -> {mode}"}
 
     # faultforge_get_run
 
     @structured
     def get_run(
         self, run_id: str, section: str = "summary", offset: int = 0, limit: int = store.DEFAULT_PAGE,
-        trial: int | None = None, outcome: str | None = None,
+        trial: int | None = None, outcome: str | None = None, candidate: str | None = None,
     ) -> dict[str, Any]:
         state = self._settings().state_dir
         store.run_path(state, run_id)
@@ -849,6 +1117,10 @@ class Tools:
             return store.hypotheses(state, run_id, offset, limit)
         if section == "performance":
             return store.performance(state, run_id)
+        if section == "diff":
+            if candidate is not None and not isinstance(candidate, str):
+                raise FaultForgeError("invalid_argument", "candidate must be a candidate id")
+            return store.diff(state, run_id, store.parse_candidate(candidate) if candidate is not None else None, offset, limit)
         return store.evidence(state, run_id, offset, limit, trial, outcome)
 
 
@@ -873,7 +1145,11 @@ def _package_files(package: Path) -> list[Path]:
 def _scope(root: Path, package: Path | None) -> dict[str, str]:
     """What the host deploys for a Python target, each file with its sha256: app.py from root and
     the package's files, named as they sit beside app.py."""
-    scope = {APP_NAME: store.file_sha256(root / APP_NAME)}
+    return _scope_of((root / APP_NAME).read_bytes(), package)
+
+
+def _scope_of(app_source: bytes, package: Path | None) -> dict[str, str]:
+    scope = {APP_NAME: hashlib.sha256(app_source).hexdigest()}
     for path in _package_files(package)[: store.MAX_SCOPE_FILES - 1] if package is not None else []:
         scope[store.clean(f"{package.name}/{path.relative_to(package).as_posix()}", 120)] = store.file_sha256(path)
     return scope
@@ -887,6 +1163,46 @@ def _candidate_scope(root: Path, deployed: dict[str, str]) -> dict[str, str]:
     if package is not None and (package.is_symlink() or not package.is_dir()):
         package = None
     return _scope(root, package)
+
+
+def _credit_fields(view: CreditView) -> dict[str, Any]:
+    """Whole dollars, rounded down, or None when there is no fresh reading to show."""
+    return {"credit_usd": view.rounded(), "floor_usd": int(credit_module.FLOOR_USD)}
+
+
+def _ledger_line(view: CreditView) -> str:
+    """FaultForge's own inference spend, from numbers only."""
+    if view.ledger is None:
+        return "unreadable, so nothing may be spent"
+    ledger = view.ledger
+    line = (
+        f"today ${ledger['daily_usd_spent']:.2f} of ${ledger['daily_usd_cap']:.2f}, "
+        f"total ${ledger['total_usd_spent']:.2f} of ${ledger['total_usd_cap']:.2f}"
+    )
+    return line + (f"; blocked ({view.ledger_reason})" if view.ledger_reason else "")
+
+
+def _attempt_line(record: fix_agent.AttemptRecord, identifier: str | None, has_regression: bool) -> str:
+    """One attempt on one line: the candidate, the gate's rows, the regression suite and why it
+    failed. Every word is fixed vocabulary, a scenario id from the pinned config or a run id."""
+    if identifier is None:
+        return store.clean(f"{record.attempt}: no usable app.py from the model ({record.failure_reason or 'unknown'}); nothing ran", MAX_LINE)
+    if record.policy_violations:
+        rows = f"{GATE_POLICY} FAILED ({record.policy_violations[0]}); the other rows not run"
+    else:
+        failed = set(record.gate_failed)
+        main_failed = failed - {fix_agent.GATE_REGRESSION}
+        suite = (
+            "nothing else to check" if not has_regression
+            else "not run" if main_failed and not record.regression
+            else f"{sum(item.passed for item in record.regression)} of {len(record.regression)} passed"
+        )
+        rows = f"{GATE_POLICY} passed, " + ", ".join(
+            f"{name} {'FAILED' if name in failed else 'passed'}" for name in list(GATE_MEANING)[:3]
+        ) + f", {fix_agent.GATE_REGRESSION} {'FAILED: ' if fix_agent.GATE_REGRESSION in failed else ''}{suite}"
+    verdict = "VERIFIED" if record.fix_verified else f"not verified ({record.failure_reason or 'unknown'})"
+    run = f"; {record.run_id}" if record.run_id else ""
+    return store.clean(f"{record.attempt}: candidate:{identifier} {verdict}; {rows}{run}", 2 * MAX_LINE)
 
 
 def _file_names(names: list[str], limit: int) -> str:
@@ -1083,7 +1399,8 @@ def _fix_next(
             where = f" faultforge_get_run(\"{item.run_id}\", section=\"violations\")." if item.run_id else ""
             lines.append(f"The fix broke {item.scenario_id} ({item.failure_reason}).{where}")
         if len(broken) > MAX_FIX_NEXT_REGRESSION:
-            lines.append(f"It broke {len(broken) - MAX_FIX_NEXT_REGRESSION} more scenarios: see `regression`.")
+            # On the same line as the last one named, so the credit line costs the result no length.
+            lines[-1] += f" It broke {len(broken) - MAX_FIX_NEXT_REGRESSION} more scenarios: see `regression`."
     return lines
 
 

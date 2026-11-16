@@ -24,6 +24,8 @@ ErrorClass = Literal[
     # Fixes (docs/PLAN.md V4.4): a mode that isn't built, and a run with nothing to fix.
     "mode_unavailable",
     "nothing_to_fix",
+    # A paid operation refused by the credit floor or the spend ledger (docs/PLAN.md V4.3).
+    "credit_floor",
 ]
 
 

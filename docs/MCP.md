@@ -1,6 +1,13 @@
 # FaultForge MCP server
 
-A stdio MCP server that Claude Code starts. It proves business-rule bugs under real concurrent load in a sealed local sandbox, and returns the verdict with its evidence. It then judges a fix through a gate that no model decides. Milestones M8 and M9 of `docs/PLAN.md` v4. It costs nothing to run: it makes no network calls, never uses Vultr and never reads an inference key.
+A stdio MCP server that Claude Code starts. It proves business-rule bugs under real concurrent load in a sealed local sandbox, and returns the verdict with its evidence. It then judges a fix through a gate that no model decides. Milestones M8 to M10 of `docs/PLAN.md` v4.
+
+**Network and money.** Runs, briefs and verifying a fix cost nothing and make no network call. Since M10 the server can make two kinds of call, and only these:
+
+- an account read at `api.vultr.com` (`GET /v2/account`), for `faultforge_status` and for `faultforge_propose_fix` in `auto` or `vultr` mode, and only when the billing key file exists;
+- a model call to Vultr Serverless Inference (`api.vultrinference.com`), only for a `vultr` fix that the credit floor allowed, and only when the inference key file exists.
+
+With neither key file, the server makes no network call at all, `auto` is `client`, and nothing can be spent. See "The credit floor" below.
 
 ## Install
 
@@ -36,13 +43,13 @@ allowed_images = ["faultforge-sportsdeck:buggy"]
 
 | Tool | What it does |
 |---|---|
-| `faultforge_status` | Docker, the sandbox images, runtimes (`local` only; `remote` arrives in M12), fix modes (`client` works; `vultr` arrives in M10; `auto` is `client`), allowed roots. `credit` is `null` until M10. |
+| `faultforge_status` | Docker, the sandbox images, runtimes (`local` only; `remote` arrives in M12), fix modes, allowed roots. Also `credit_usd` (whole dollars, rounded down, or `null`), `floor_usd: 10`, `credit_age_s`, `credit_reason`, the `ledger` line (FaultForge's own inference spend today and in total) and `effective_modes`: what `auto` resolves to for fixes, with the reason, and for the runtime (`local`). |
 | `faultforge_list_scenarios(project_dir, offset?)` | Reads `faultforge.yaml`, and `stack.yaml` if there is one, six scenarios at a time; `more` and `next_offset` say how to page. Contacts no target. |
 | `faultforge_validate_scenario(project_dir, scenario_id?)` | Checks the schema, safety rules and expressions. For a stack, it checks that `state_sql` covers every `before.`/`after.` variable. It sends no load and never calls reset. |
 | `faultforge_run_scenario(project_dir, scenario_id, source, runtime="auto", compare_to?)` | Snapshots the source, runs the scenario in the sandbox and stores the run. Returns the verdict, Proven and Suspected lines, completeness and a `run_id`. |
-| `faultforge_get_run(run_id, section, offset?, limit?, trial?, outcome?)` | `summary`, `violations`, `hypotheses`, `performance` or `evidence`. `evidence` pages through every request, at most 100 per page. |
-| `faultforge_propose_fix(run_id, mode="auto")` | For a FAIL run of a Python target. `client` returns a fix brief of at most 60 lines and writes nothing. `auto` resolves to `client`. `vultr` returns `mode_unavailable` until M10. |
-| `faultforge_verify_fix(run_id, source="worktree")` | Snapshots the candidate (`worktree` or `commit:<sha>`), reruns the failing scenario against the baseline `run_id`, then every other scenario, and applies the full gate. Returns `verified`, the gate rows with evidence, the regression results, the new `run_id` and, when it fails, `fix_next`. |
+| `faultforge_get_run(run_id, section, offset?, limit?, trial?, outcome?, candidate?)` | `summary`, `violations`, `hypotheses`, `performance`, `evidence` or `diff`. `evidence` pages through every request, at most 100 per page. `diff` pages a stored candidate's diff against the baseline's `app.py`. |
+| `faultforge_propose_fix(run_id, mode="auto")` | For a FAIL run of a Python target. `client` returns a fix brief of at most 60 lines. `vultr` has a model write `app.py`, judges it with the full gate and returns a diff. `auto` is `vultr` when every condition for it holds, otherwise `client`, and `mode_reason` says why. No mode writes to the repo. |
+| `faultforge_verify_fix(run_id, source="worktree")` | Takes the candidate (`worktree`, `commit:<sha>` or `candidate:<id>`), reruns the failing scenario against the baseline `run_id`, then every other scenario, and applies the full gate. Returns `verified`, the gate rows with evidence, the regression results, the new `run_id` and, when it fails, `fix_next`. |
 
 Every failure is `{status: "error", error_class, message, fix_hint}`, never an exception.
 
@@ -89,7 +96,82 @@ The comparison, state and code rows and each regression run are judged by the sa
 - For any other package there is no code policy. The brief and the verify result both say so in their `hooks` line, and the fix's diff has to be read.
 - M11 moves the hooks into a separate trusted container, and revisits fix scope for JADE-shaped projects, where a fix can't live in one file.
 
-**Refusals.** A run that isn't FAIL gives `nothing_to_fix`. A run that `verify_fix` itself stored (the verify run or a regression run) gives `not_comparable`: a fix is judged against the run that proved the bug. The verify result shows `baseline_source`: `worktree, clean`, `worktree, with uncommitted changes` or `commit:<sha>`. A stack run gives `unsupported_build` until M11. The run's project must still be inside an allowed root, and still be the same directory, when the tool is called. `source: "candidate:<id>"` gives `mode_unavailable` until M10.
+## Vultr fixes
+
+`faultforge_propose_fix(run_id, mode="vultr")` runs the web app's fix loop (`fix_agent.run_fix_loop`) on the baseline's pinned inputs: `pinned/app.py`, the pinned package, `faultforge.yaml`, `BUSINESS_RULES.md`, the state queries and the regression list. The model is `glm-5.3` at low reasoning effort, with up to 3 attempts and 8000 output tokens each. Every candidate that keeps to the code rules runs in a new sandbox under the same gate as above, then against every other scenario. The call holds the run lock, since it sends load, and can take several minutes.
+
+**It never writes to the repo.** The result holds:
+
+- `verified` and `stop_reason`, and one line per attempt in `attempts`: the candidate's id, each gate row by name as passed or FAILED, the regression suite and the failure reason, in fixed words;
+- `candidate`, as `candidate:<id>`: the verified one, or the last one tried. Each candidate is stored under the baseline run in `<state>/runs/<run_id>/candidates/<id>/`, and its id is the start of its sha256, checked whenever it is read;
+- `diff`: the first 20 lines of a unified diff of the baseline's `app.py` against the candidate. `diff_more` is the `faultforge_get_run(..., section="diff")` call that pages the rest;
+- `cost_usd`, `credit_usd`, `floor_usd`, the credit before and after, and the `ledger` line.
+
+**The diff is model output, so it is untrusted,** and every line of it is marked `[model]`, as project text is marked `[project]`. FaultForge applies nothing. Read the diff, strip the mark from each line, call `faultforge_verify_fix(run_id, source="candidate:<id>")` to have the stored candidate judged again through the whole gate (the `app_policy` row included), and apply it yourself. Lines keep tabs and printable ASCII; anything else is replaced and the result says the diff is no longer exact.
+
+Each attempt's runs are stored like a verify run, so `faultforge_get_run` pages their evidence.
+
+**When `vultr` is allowed.** All of these must hold, and they are checked in this order, so nothing reaches the network for a run that can't use it:
+
+1. The baseline's pinned package is `ticket_support`. The loop's code policy (`check_app_policy`) is written for that package, so any other project gets `mode_unavailable`.
+2. The pinned state queries cover every field the invariants read. Otherwise no candidate could pass the gate, and the money would be wasted: `mode_unavailable`.
+3. The baseline has its pinned `app.py`. A baseline stored before M10 doesn't: `not_comparable`. Run the scenario again.
+4. The inference key file is there: `mode_unavailable` without it.
+5. The credit floor and the ledger allow the worst case: `credit_floor` otherwise, with the reason and `credit_usd`.
+
+`auto` picks `vultr` when all five hold and `client` otherwise. `mode_reason` gives the first reason, for example `auto resolves to client: credit $10.29 is below the $10.00 floor after the worst case ($0.30)`, `no billing key` or `not a ticket_support project`.
+
+## The credit floor
+
+A paid operation is allowed only if `credit - worst_case_cost >= $10.00`.
+
+- **Credit** is `-balance - pending_charges` from `GET https://api.vultr.com/v2/account`, less whatever the ledger recorded after that reading was taken.
+- **The floor is a buffer, not a hard limit.** It is there so that a small overspend doesn't matter, and two things can cause one:
+  - Vultr's account figure can lag FaultForge's own spend. The ledger only corrects for spend since the last reading, so after a new reading that hasn't caught up, a fix can be allowed that takes the real credit a little under $10.
+  - The per-call cap is checked against an estimate before the call is sent. A reply that reports more usage is charged in full, so one fix can cost more than the $0.30 below.
+
+  The ledger's $2 a day and $15 total caps are the outer bound on FaultForge's spend.
+- **The planned worst case of a vultr fix is $0.30.** Each model call is capped at $0.10: before a call is sent, its worst case (the prompt's upper bound in tokens plus all 8000 output tokens, at $0.75 and $3.00 per million) must be within the cap, or it isn't sent. There are at most 3 attempts. A fix verified on the first attempt is expected to cost about $0.01 to $0.03 (an estimate from the prompt size, not yet measured).
+- **The worst case of a remote run** (M12) will be the VM's hourly rate for the run's wall limit, rounded up to whole hours. The function exists and isn't used yet.
+- **The reading is cached** in memory with its time, and read again only when `faultforge_status` or a paid decision finds it missing or older than 10 minutes. No other tool reads it: their results carry the last reading if it is still fresh, or `null`.
+
+**It fails closed.** Each of these counts as below the floor, with a short fixed reason and `credit_usd: null`:
+
+- no billing key file;
+- negative `pending_charges`, which would raise the credit;
+- a key file that is a symlink, not a regular file, readable by group or others, owned by another user, or too large;
+- a key file without a usable `VULTR_BILLING_API_KEY` line;
+- any HTTP status but 200, a redirect included;
+- a timeout or a network error;
+- a reply that isn't JSON, has no `account.balance` or `account.pending_charges`, or holds a string, a boolean, `NaN`, an infinity or an absurd number there;
+- a reading older than 10 minutes, measured on the monotonic clock, so setting the wall clock back doesn't keep it fresh;
+- a ledger that can't be read.
+
+Then `auto` picks `client`, and an explicit `vultr` returns `error_class: credit_floor`.
+
+**The ledger** is the second bound. `<state>/spend.json` holds FaultForge's own MCP inference spend, in numbers only. It is the web app's `BudgetLedger` with the same caps: **$2 a day and $15 in total**, and 1,000,000 tokens a day. Every model call is checked against it before it is sent and recorded after. It is read from disk for every decision, so two servers sharing a state directory see each other's spend, and a vultr fix holds the run lock while it spends. A ledger that can't be read or written stops all spending. A capped ledger refuses without asking the API.
+
+### The key files
+
+| File | Variable | Override |
+|---|---|---|
+| `~/.config/faultforge/vultr.env` | `VULTR_BILLING_API_KEY` | `FF_VULTR_ENV` |
+| `~/.config/faultforge/inference.env` | `VULTR_INFERENCE_API_KEY` | `FF_INFERENCE_ENV` |
+
+```bash
+install -m 600 /dev/null ~/.config/faultforge/vultr.env
+$EDITOR ~/.config/faultforge/vultr.env   # VULTR_BILLING_API_KEY=...
+```
+
+Each file must be a regular file, not a symlink, owned by you, with mode 0600 (no access for group or others). It is read again on every use, never cached and never put in the environment. A key is never passed to a sandbox, logged, stored in the state directory or returned by a tool; errors carry fixed words and an exception's type at most.
+
+**Which Vultr key.** `VULTR_BILLING_API_KEY` only needs to read the account.
+
+- **Preferred:** make a sub-user with only the billing view and use its key. Then the key can do nothing else, whatever holds it.
+- **The main account key works too,** and it carries every permission. FaultForge only ever reads `/v2/account` with it, and that is enforced in code, not by convention: the one HTTP client that carries the key sends through a transport that refuses any request except `GET https://api.vultr.com/v2/account` with no query string and no body, before it leaves. Another method, host, port, scheme, path or query is refused. Redirects are never followed, and a 3xx reply counts as a failed check.
+- **Either way, restrict the key to this machine's IP** under Vultr's API access control (Account, API, Access Control), so a copy of it is useless elsewhere.
+
+**Refusals.** A run that isn't FAIL gives `nothing_to_fix`. A run that `verify_fix` itself stored (the verify run or a regression run) gives `not_comparable`: a fix is judged against the run that proved the bug. The verify result shows `baseline_source`: `worktree, clean`, `worktree, with uncommitted changes` or `commit:<sha>`. A stack run gives `unsupported_build` until M11. The run's project must still be inside an allowed root, and still be the same directory, when the tool is called. A `candidate:<id>` that isn't 12 hex characters gives `invalid_argument`, one that isn't stored for that run gives `run_not_found`, and one whose bytes no longer match its id gives `not_comparable`.
 
 ### The direct database check: `target.state_queries`
 
@@ -127,8 +209,8 @@ target:
   - The trusted services must be stock `postgres:<tag>` and `redis:<tag>` images.
   - The app may not run as root.
   - Writable paths must be plain paths.
-- **One run at a time.** A per-process lock and an `flock` on `<state>/run.lock` are both held for a run and for a `verify_fix`, so a second call, in this server or in another server process sharing the state directory, gets `busy`, while `status` (which reports `busy`), `get_run` and `propose_fix` still answer. `propose_fix` takes no lock: it sends no load and only reads a stored run, whose files are complete before its `run_id` is returned. The kernel releases the file lock when the server exits, however it exits.
-- **Runs** are stored in `<state>/runs/<run_id>/`: `report.json`, `requests.jsonl`, the trial files, `run.json`, `sandbox.json` and `pinned/`. A `run_id` is checked against its strict format before it's used in a path. `compare_to` must be an earlier run of the same scenario in the same project.
+- **One run at a time.** A per-process lock and an `flock` on `<state>/run.lock` are both held for a run and for a `verify_fix`, so a second call, in this server or in another server process sharing the state directory, gets `busy`, while `status` (which reports `busy`), `get_run` and a client-mode `propose_fix` still answer. A client-mode `propose_fix` takes no lock: it sends no load and only reads a stored run, whose files are complete before its `run_id` is returned. A vultr fix holds both locks like a run, so `auto` returns `busy` when it would have picked `vultr` during a run. The kernel releases the file lock when the server exits, however it exits.
+- **Runs** are stored in `<state>/runs/<run_id>/`: `report.json`, `requests.jsonl`, the trial files, `run.json`, `sandbox.json`, `pinned/` (with `app.py` for a Python baseline) and, after a vultr fix, `candidates/`. A `run_id` is checked against its strict format before it's used in a path. `compare_to` must be an earlier run of the same scenario in the same project.
 - **Results stay short,** at about 60 lines. Text a target could influence, such as captured response fields and probe results, is cleaned, cut short and labelled.
 - **The hostile demo's opt-in is never set.** The server never sets `FF_HOSTILE_ALLOWED`, so `demo/hostile-build` refuses its attacks and doesn't show them off. Run that demo through the web app or the tests.
 
@@ -138,10 +220,16 @@ target:
 - **Superuser SQL inside the sealed postgres container.** The stack's state queries run as the database owner inside a throwaway container with no network, a read-only root and hard limits. They can read anything in that container's database, and nothing outside it.
 - **The baseline is whichever run the caller names.** Pinning stops a fix from changing the rules and the hooks' files of the run it is judged against. It doesn't stop someone from making a new baseline from a tree whose config or package is already weak, and verifying against that. The verify result names the `baseline_run_id` and the pinned config's sha256, so check them against the run that proved the bug.
 - **The state directory is trusted.** The pinned copies and their hash live side by side in `<state>/runs/`, which is private to the user. The hash catches a damaged copy, not someone who can write there.
+- **The per-call cap bounds what is sent, not what a provider reports.** A call is refused unless its worst case is within $0.10, and the ledger records what the reply's usage says. A provider that reported more output than the limit it was given would be charged to the ledger in full, and the next decision would see it. The owner accepted this: the $10 buffer is what it's for.
+- **The ledger is only as accurate as its price table.** Costs are computed from token counts and the hardcoded `AGENT_PRICES` ($0.75 and $3.00 per million for `glm-5.3`). If Vultr changes its prices, the ledger and the caps drift until the table is updated.
+- **A run holds at most 64 candidates.** A vultr fix is refused, before any model call, when its 3 attempts might not fit.
+- **Credit after a fix is an estimate:** the last account reading less the ledger's spend since. Vultr's own number catches up at the next reading.
+- **The key files are trusted to be yours.** The checks stop a link, a shared mode and another owner. They don't stop someone who can already write files as you.
 - **`faultforge_run_scenario` with `compare_to` is not the gate.** It uses the snapshot's own config, as in M8. A changed scenario makes it `NOT_COMPARABLE`, but it doesn't run the regression suite or pin the queries. Use `faultforge_verify_fix` to judge a fix.
 
 ## Not exposed
 
 - Arbitrary URLs, arbitrary scripts, load overrides and cancel.
 - Any write to the user's repo.
-- The `vultr` fix mode and `candidate:<id>` sources (M10), fixes for stack targets (M11), the `remote` runtime (M12) and the credit check (M10).
+- Applying a vultr diff: FaultForge never does it.
+- The `vultr` fix mode for anything but a `ticket_support` project, fixes for stack targets (M11) and the `remote` runtime (M12).
