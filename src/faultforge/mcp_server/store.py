@@ -39,6 +39,7 @@ from faultforge.errors import FaultForgeError
 from faultforge.mcp_server.settings import private_dir
 from faultforge.models import Contract, Report, RequestRecord
 from faultforge.sandbox import SandboxResult, code_dir_sha256
+from faultforge.stack import MAX_SCHEMA_OBJECTS
 
 RUN_META_NAME = "run.json"
 SANDBOX_NAME = "sandbox.json"
@@ -69,6 +70,7 @@ MAX_REPORT_BYTES = 16 * 1024 * 1024
 MAX_EVIDENCE_LINES = 100_000
 MAX_EVIDENCE_LINE_BYTES = 4096
 MAX_PAGE = 100
+MAX_SCHEMA_PAGE = 40
 DEFAULT_PAGE = 50
 MAX_LIST_LINES = 12
 MAX_DISCLOSURES = 6
@@ -77,7 +79,7 @@ MAX_TEXT = 200
 UNPRINTABLE = re.compile(r"[^\x20-\x7e]")
 
 Section = Literal["summary", "violations", "hypotheses", "performance", "evidence", "diff"]
-SECTIONS: tuple[str, ...] = ("summary", "violations", "hypotheses", "performance", "evidence", "diff")
+SECTIONS: tuple[str, ...] = ("summary", "violations", "hypotheses", "performance", "evidence", "diff", "schema_objects")
 OUTCOMES = ("accepted", "rejected", "unexpected", "transport_error")
 
 
@@ -119,6 +121,13 @@ class RunMeta(Contract):
     toolchain: dict[str, str] = Field(default_factory=dict)
     image_id: str | None = None
     build: str | None = None
+    # A stack run: the catalog inventory the host read (stack.py, which says when), one line an
+    # object, names being the project's text. None when it wasn't read, with the reason beside it,
+    # and for a run stored before inventories were recorded. A fix is compared with its baseline's.
+    schema_objects: list[str] | None = Field(default=None, max_length=MAX_SCHEMA_OBJECTS)
+    schema_objects_reason: str | None = None
+    # The lines of schema_objects a stack with a prestart didn't have before the load.
+    schema_objects_during: list[str] = Field(default_factory=list, max_length=MAX_SCHEMA_OBJECTS)
 
 
 def clean(value: object, limit: int = MAX_TEXT) -> str:
@@ -603,7 +612,7 @@ def summary(state: Path, run_id: str) -> dict[str, object]:
         },
         "disclosures": [clean(item) for item in report.disclosures[:MAX_DISCLOSURES]],
         "notes": meta.notes,
-        "more": "faultforge_get_run(run_id, section=violations|hypotheses|performance|evidence)",
+        "more": "faultforge_get_run(run_id, section=violations|hypotheses|performance|evidence|schema_objects)",
     }
     probes = _probe_lines(state, run_id)
     if probes:
@@ -615,6 +624,9 @@ def summary(state: Path, run_id: str) -> dict[str, object]:
         result["fix_gate"] = (
             f"verified={meta.fix_gate.get('verified') is True} against {clean(meta.fix_gate.get('baseline_run_id'), 40)}; failed gates: {names}"
         )
+        if meta.fix_gate.get("review_required") is True:
+            # A stack fix only: on the same line, so the flag costs the summary no length.
+            result["fix_gate"] += "; review required: the fix's database objects must be read before the result is trusted"
     return result
 
 
@@ -641,6 +653,29 @@ def violations(state: Path, run_id: str, offset: int, limit: int) -> dict[str, o
     ]
     page, paging = _page(items, offset, limit)
     return {"status": "ok", "run_id": run_id, "section": "violations", "items": page, **paging}
+
+
+def schema_objects(state: Path, run_id: str, offset: int, limit: int) -> dict[str, object]:
+    """A page of a stack run's database objects. For the run faultforge_verify_fix stored, it is
+    what the fix added or changed against its baseline, every line of it; for any other run, the
+    whole inventory. Names are the project's text, so each line is cleaned and marked."""
+    meta = read_meta(state, run_id)
+    changes = meta.fix_gate.get("schema_changes") if meta.fix_gate is not None else None
+    if isinstance(changes, list):
+        listing = f"what the fix added or changed, against {clean(meta.fix_gate.get('baseline_run_id'), 40)}"
+        lines = [str(line) for line in changes]
+    elif meta.schema_objects is not None:
+        listing = "the inventory recorded with this run; `#` begins a digest of the object's definition"
+        during = set(meta.schema_objects_during)
+        lines = [f"{line} (appeared during the run)" if line in during else line for line in meta.schema_objects]
+    else:
+        listing = (
+            "none recorded: " + (clean(meta.schema_objects_reason, 60) if meta.schema_objects_reason else "not a stack run, or stored before inventories")
+        )
+        lines = []
+    # A page of one-line items, so it is held to what keeps the whole result within about 60 lines.
+    page, paging = _page([f"[project] {clean(line, 240)}" for line in lines], offset, min(limit, MAX_SCHEMA_PAGE))
+    return {"status": "ok", "run_id": run_id, "section": "schema_objects", "listing": listing, "items": page, **paging}
 
 
 def hypotheses(state: Path, run_id: str, offset: int, limit: int) -> dict[str, object]:

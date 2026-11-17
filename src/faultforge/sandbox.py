@@ -233,6 +233,17 @@ class ContainmentFacts(Contract):
     target_log_tail: str = Field(default="", description="Untrusted text from the target")
     services: list[ContainerFacts] = Field(default_factory=list, description="A stack's other containers, read by the host")
     state_verification: StateVerification | None = Field(default=None, description="None if not requested")
+    schema_objects: list[str] | None = Field(
+        default=None,
+        description="A stack's catalog inventory, read by the host: triggers, rules, views, row-security policies, functions, "
+        "operators, casts, generated columns, partitioned, foreign and child tables and event triggers. Names are the project's "
+        "text. None if it wasn't read",
+    )
+    schema_objects_reason: str | None = Field(default=None, description="Why the inventory wasn't read, from a fixed vocabulary")
+    schema_objects_during: list[str] = Field(
+        default_factory=list,
+        description="The lines of schema_objects that a stack with a prestart didn't have before the load: they appeared during the run",
+    )
 
 
 class SandboxResult(Contract):
@@ -793,6 +804,10 @@ class _Session:
     runner_facts: ContainerFacts | None = None
     containers_left: int | None = None
     service_facts: list[ContainerFacts] = field(default_factory=list)
+    # A stack's catalog inventory (stack.py). Never set for a Python target.
+    schema_objects: list[str] | None = None
+    schema_failure: str | None = None
+    schema_during: list[str] = field(default_factory=list)
 
     @property
     def target_name(self) -> str:
@@ -1025,5 +1040,8 @@ def run_session(session: _Session) -> SandboxResult:
             target_log_tail=session.target_log_tail,
             state_verification=session.state_verification(report),
             services=session.service_facts,
+            schema_objects=session.schema_objects,
+            schema_objects_reason=session.schema_failure if session.schema_objects is None else None,
+            schema_objects_during=session.schema_during,
         ),
     )

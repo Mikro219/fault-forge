@@ -9,8 +9,13 @@ State has no in_flight count, because a separate process can't see the app's req
 
 Every call must carry the run's token, which the sandbox gives to this helper and to the runner
 only. That keeps an app that calls a /__ff/ path by accident from resetting the data. It is not a
-defence against a hostile app, which owns its schema and can act through it. Every admin session
-sets its search_path first, so built-in names can't be shadowed from the app's schema.
+defence against a hostile app, which owns its schema and can act through it.
+
+The helper logs in as an ordinary role that is a member of the tables' owner, never as a superuser,
+so a trigger or a view function that fires in its session has no more than the owner's rights.
+Every session sets its search_path first, so built-in names can't be shadowed from the app's
+schema, and then row_security = off, so a statement that a row-security policy would filter fails
+instead of reading or writing fewer rows than the tables hold.
 """
 
 import hmac
@@ -33,8 +38,8 @@ def token_matches(expected: str, given: str | None) -> bool:
 
 
 def session_statements(search_path: str, sql: str) -> list[str]:
-    """What one admin session runs: the search_path first, then the statement."""
-    return [f"SET search_path = {search_path}", sql]
+    """What one session runs: the search_path, then row_security off, then the statement."""
+    return [f"SET search_path = {search_path}", "SET row_security = off", sql]
 
 
 def database_state(run: Callable[[str], Sequence], queries: dict[str, str]) -> dict[str, int]:

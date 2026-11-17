@@ -3,12 +3,20 @@
 postgres_image: postgres:16-alpine
 # Built by scripts/build_redeem_demo.sh, for source "image". "worktree" and "commit:<sha>" build from source.
 app_image: faultforge-redeem-code:buggy
-database_user: redeem
+# The role the app logs in as. With a prestart step it owns nothing: migrations/ grants it what it needs.
+database_user: redeem_app
 database_name: redeem
 app_port: 8000
 app_user: "1000:1000"
 app_health_path: /healthz
 hooks_port: 8001
+# Migrations are a step of their own, run once in the app image before the app, as the database's
+# owner. The owner's URL is in MIGRATION_DATABASE_URL, for this step only; the app gets DATABASE_URL.
+prestart:
+  command: [node, tools/migrate.ts]
+  owner_role: redeem_owner
+  owner_url_env: MIGRATION_DATABASE_URL
+  timeout_s: 30
 env:
   NODE_ENV: production
   HOST: 127.0.0.1
@@ -38,7 +46,8 @@ build:
   node: 24.22.3
   pnpm: 12.21.0
   output: [build]
-  runtime_copy: [package.json, migrations]
+  runtime_copy: [package.json, migrations, tools]
   start: [node, build]
   prod_dependencies: true
-  fix_scope: [src/, migrations/]
+  # tools/ is outside the scope, so the migration runner itself is the baseline's.
+  fix_scope: [src/, migrations/, tools/]

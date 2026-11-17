@@ -163,7 +163,7 @@ class BuildConfig(Contract):
     @field_validator("start")
     @classmethod
     def start_is_a_plain_node_command(cls, value: list[str]) -> list[str]:
-        if value[0] != "node" or any(not START_TOKEN.fullmatch(token) for token in value):
+        if not is_plain_node_command(value):
             raise ValueError("start must be an argument list that begins with node, such as [node, build]")
         return value
 
@@ -190,6 +190,12 @@ class BuildConfig(Contract):
     @property
     def run_image(self) -> str:
         return f"faultforge-node-run:{self.node}"
+
+
+def is_plain_node_command(argv: list[str]) -> bool:
+    """An argument list for node made of plain tokens: no shell, no space, quote or expansion. The
+    image's start command and a stack's prestart command are both held to it."""
+    return bool(argv) and argv[0] == "node" and all(isinstance(token, str) and START_TOKEN.fullmatch(token) for token in argv)
 
 
 def _plain_parts(path: str) -> bool:

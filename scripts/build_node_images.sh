@@ -17,7 +17,8 @@ if [[ "$locked" != "$pnpm" || ! "$sha512" =~ ^[0-9a-f]{128}$ ]]; then
 fi
 
 build() {
-    docker build --quiet --pull=false --file "$root/docker/node-toolchain.Dockerfile" --target "$1" \
+    # No attestations, so a full cache hit keeps the image's ID, which keys the install cache.
+    docker build --provenance=false --sbom=false --quiet --pull=false --file "$root/docker/node-toolchain.Dockerfile" --target "$1" \
         --build-arg "NODE_VERSION=$node" --build-arg "PNPM_VERSION=$pnpm" --build-arg "PNPM_SHA512=$sha512" \
         --tag "$2" "$root"
 }

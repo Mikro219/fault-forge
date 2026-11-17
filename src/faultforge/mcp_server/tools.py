@@ -101,10 +101,36 @@ RUNTIME_AUTO = f"auto -> local: the remote runtime is {REMOTE_UNAVAILABLE}"
 VULTR_PACKAGE_ONLY = "not a ticket_support project: the vultr fix loop's code policy is written for that package only"
 VULTR_STACK = "a stack fix can span several files, and the vultr fix loop writes one app.py"
 STACK_SOURCES = "worktree | commit:<sha>"
-HOOKS_SEPARATE = (
-    "The hooks are FaultForge's own helper in a separate container, started before the app and fed the pinned SQL as an admin "
-    "role the app has no password for, so app code can't wrap them. The app still owns its schema (docs/MCP.md)."
+_HOOKS_SEPARATE = (
+    "The hooks are FaultForge's own helper in a separate container, started before the app. It runs the pinned SQL as a role "
+    "of its own, not a superuser, that the app has no password for, so app code can't wrap them."
 )
+HOOKS_SEPARATE = f"{_HOOKS_SEPARATE} The app still owns its schema (docs/MCP.md)."
+# With a prestart step the app is a lesser role; what owns the schema is the project's migrations.
+HOOKS_SEPARATE_PRESTART = (
+    f"{_HOOKS_SEPARATE} The schema belongs to the owner role the prestart step runs as, so a migration is project code that "
+    "can still put a trigger, rule or view on a table the hooks read (docs/MCP.md)."
+)
+# What a stack run records, and what a fix is compared on (stack.py's catalog inventory).
+SCHEMA_KINDS_TEXT = (
+    "triggers, rules, views, row-security policies, functions, operators, casts, generated columns, partitioned, foreign and "
+    "child tables and event triggers"
+)
+REVIEW_BRIEF = (
+    f"This run recorded the database's {SCHEMA_KINDS_TEXT}. A fix that adds or changes one is still judged by the gate alone, "
+    "but its result says review_required and names them, because such an object can change what the state check reads."
+)
+REVIEW_OBJECTS = "the fix added database objects that can change what the state check reads"
+REVIEW_VERIFIED = f"verified by the gate, but {REVIEW_OBJECTS}; read them before trusting the result."
+REVIEW_UNVERIFIED = f"not verified, and {REVIEW_OBJECTS}; read them before trusting any gate row that passed."
+REVIEW_UNREAD = "couldn't read the catalog"
+REVIEW_TOO_MANY = "too many database objects to record"
+DURING_RUN = "appeared during the run"
+# The oldest postgres whose roles can't grant membership in themselves: before 16 a migration could
+# hand the owner role to the app.
+MIN_POSTGRES_MAJOR = stack_module.MIN_POSTGRES_MAJOR
+# Lines of a result, the "more" line included: a flagged result must stay within the 60-line cap.
+MAX_REVIEW_OBJECTS = 3
 MAX_BUILD_LOG_LINES = 12
 MAX_CHANGED_FILES = 400
 # After FROM, JOIN, INTO, UPDATE or TRUNCATE: a name with no schema in front of it. A hint only.
@@ -149,7 +175,10 @@ FAILURE_HINTS = {
     "docker_unavailable": "Start Docker, then call faultforge_status.",
     "image_missing": "Build the sandbox images with scripts/build_images.sh, and a stack's app image first.",
     "invalid_spec": "Fix the project's faultforge.yaml; faultforge_validate_scenario shows what's wrong.",
-    "target_start_failed": "The target couldn't start in the sandbox. It must serve `uvicorn app:app` with its hooks.",
+    "target_start_failed": (
+        "The target couldn't start in the sandbox. It must serve `uvicorn app:app` with its hooks. For a stack, the detail names "
+        "what failed: a prestart step that exits non-zero or passes its limit stops the run."
+    ),
     "target_exited": "The target exited in the sandbox. Check that app.py imports and starts without network.",
     "target_unreachable": "The target never answered its health hook inside the sandbox.",
     "wall_limit_exceeded": "The run hit the sandbox's wall limit and was killed. Try a smaller load.",
@@ -194,6 +223,13 @@ def stack_problems(stack: StackConfig) -> list[str]:
     problems = []
     if not POSTGRES_IMAGE.fullmatch(stack.postgres_image):
         problems.append("postgres_image must be a stock postgres:<tag> image")
+    else:
+        major = re.match(r"postgres:(\d+)(?![\d])", stack.postgres_image)
+        if major is None or int(major[1]) < MIN_POSTGRES_MAJOR:
+            problems.append(
+                f"postgres_image must be postgres {MIN_POSTGRES_MAJOR} or newer, named by its version (such as postgres:16-alpine): "
+                "in an older one a role can grant membership in itself, so a migration could hand the owner role to the app"
+            )
     if stack.redis_image is not None and not REDIS_IMAGE.fullmatch(stack.redis_image):
         problems.append("redis_image must be a stock redis:<tag> image")
     if stack.app_image is None:
@@ -219,11 +255,43 @@ def stack_problems(stack: StackConfig) -> list[str]:
         sandbox.STATE_FIELD_NAME.fullmatch(name) for name in stack.state_sql
     ):
         problems.append(f"state_sql needs 1 to {sandbox.MAX_STATE_FIELDS} plain lowercase field names")
+    if stack.prestart is not None:
+        problems += prestart_problems(stack)
     return problems
 
 
+def prestart_problems(stack: StackConfig) -> list[str]:
+    """The prestart runs as the database's owner, so its script must be pinned: never a node option
+    in its place (--require, --import, --inspect) and never a file a fix supplies or the build writes.
+    What that script imports from the fix scope is still the candidate's; the docs say so."""
+    command = stack.prestart.command if stack.prestart is not None else []
+    if len(command) < 2 or command[1].startswith("-"):
+        return ["prestart.command must name its script right after node, with no node options, such as [node, tools/migrate.ts]"]
+    script = command[1].removeprefix("./")
+    build = stack.build
+    if build is not None and (
+        node_build.in_scope(script, build.fix_scope)
+        or any(script == out.rstrip("/") or script.startswith(out.rstrip("/") + "/") for out in build.output)
+    ):
+        return ["prestart.command's script must be outside fix_scope and the build output, so a fix can't replace it"]
+    return []
+
+
+def _hooks_line(stack: StackConfig) -> str:
+    return HOOKS_SEPARATE if stack.prestart is None else HOOKS_SEPARATE_PRESTART
+
+
+def _prestart_line(step: stack_module.PrestartConfig) -> str:
+    """The command is plain tokens by its own validation; it is still the project's text."""
+    command = store.clean(" ".join(step.command), 160)
+    return (
+        f"{UNTRUSTED} `{command}` runs once in the app image before the app, sealed like it, as the database owner "
+        f"{step.owner_role}; the app logs in as a lesser role"
+    )
+
+
 def unqualified_sql(stack: StackConfig) -> list[str]:
-    """Which reset_sql and state_sql entries seem to name a table with no schema. The admin sessions
+    """Which reset_sql and state_sql entries seem to name a table with no schema. The trusted sessions
     pin their search_path, so this is a hint to write public.<table>, not a rule."""
     named = [(f"reset_sql[{index}]", sql) for index, sql in enumerate(stack.reset_sql)]
     named += [(f"state_sql.{name}", sql) for name, sql in stack.state_sql.items()]
@@ -498,6 +566,8 @@ class Tools:
                     f"{stack.build.kind}, node {stack.build.node}, pnpm {stack.build.pnpm}; fix scope "
                     f"{', '.join(store.clean(item, MAX_FILE_NAME) for item in stack.build.fix_scope)}"
                 )
+            if stack.prestart is not None:
+                result["stack"]["prestart"] = _prestart_line(stack.prestart)
         else:
             result["sources"] = "worktree | commit:<sha>"
         page = config.scenarios[offset: offset + MAX_SCENARIOS_LISTED]
@@ -556,7 +626,7 @@ class Tools:
             if stack is not None:
                 loose = unqualified_sql(stack)
                 if loose:
-                    warnings.append(f"{', '.join(loose[:6])} name a table without a schema; write public.<table>, as the admin sessions pin their search_path")
+                    warnings.append(f"{', '.join(loose[:6])} name a table without a schema; write public.<table>, as the trusted sessions pin their search_path")
             if stack is not None and stack.build is not None and not errors:
                 build_errors, build_warnings = self._validate_build(settings, project, stack)
                 errors += build_errors
@@ -723,6 +793,8 @@ class Tools:
             result = run()
             if result.status != "completed" or result.report is None:
                 return _failure(result)
+            if target_kind == "stack":
+                notes.append(_inventory_note(result))
             # The config is pinned from the snapshot, which is what ran, so a later fix is judged by it.
             meta = _meta(
                 result, project_dir=str(project), scenario_id=scenario_id, kind=target_kind, source=source,
@@ -1293,7 +1365,7 @@ class Tools:
                 "status": "ok", "verified": False, "run_id": None, "baseline_run_id": baseline.run_id,
                 "baseline_source": origin, "scenario_id": scenario_id, "source": origin_text,
             }
-            tail: dict[str, Any] = {"regression": [], "changed_files": changed, "containers_left": 0, "hooks": HOOKS_SEPARATE, **self._cached_credit(state)}
+            tail: dict[str, Any] = {"regression": [], "changed_files": changed, "containers_left": 0, "hooks": _hooks_line(stack), **self._cached_credit(state)}
 
             def unrun(first: str, why: str, evidence: str) -> list[dict[str, object]]:
                 return [
@@ -1373,6 +1445,11 @@ class Tools:
             failed = [name for name in GATE_MEANING if name in broken]
             verified = not failed
             report = result.report
+            # After the gate has decided, and never part of it: what the fix added to the database
+            # that could stand between the state check and the tables. Every run of this verify counts.
+            review, schema_changes = _schema_review(
+                baseline, list(results.values()), [name for name in edits if name not in ignored], verified, report.run_id,
+            )
             rows = _gate_rows(result, baseline, failed, regression, queries, uncovered.get(scenario_id, []))
             regression_lines = _regression_lines(regression)
             described = {**snap.describe(), "rebuilt": True, "source_sha256": built.source_sha256, "build": built.line(), "fix_scope": scope}
@@ -1389,7 +1466,10 @@ class Tools:
             meta = _meta(
                 result, project_dir=str(project), scenario_id=scenario_id, kind="stack", source=described,
                 compare_to=baseline.run_id, notes=notes, pinned_config_sha256=baseline.pinned_config_sha256, role="verify",
-                fix_gate={"verified": verified, "baseline_run_id": baseline.run_id, "failed": failed, "regression": regression_lines},
+                fix_gate={
+                    "verified": verified, "baseline_run_id": baseline.run_id, "failed": failed, "regression": regression_lines,
+                    "review_required": review["review_required"], "schema_changes": schema_changes,
+                },
                 **facts,
             )
             store.store_run(state, work, report, meta, result, pin_from=pinned.parent, stack_from=pinned.parent / STACK_NAME)
@@ -1404,7 +1484,8 @@ class Tools:
                 "config": f"pinned at the baseline, with {STACK_NAME} and the source outside the fix scope (sha256 {_short(baseline.pinned_config_sha256)})",
                 "build": built.line(),
                 "changed_files": changed,
-                "hooks": HOOKS_SEPARATE,
+                **review,
+                "hooks": _hooks_line(stack),
                 "containers_left": None if any(count is None for count in left) else sum(left),
                 **self._cached_credit(state),
             }
@@ -1454,6 +1535,8 @@ class Tools:
             return store.hypotheses(state, run_id, offset, limit)
         if section == "performance":
             return store.performance(state, run_id)
+        if section == "schema_objects":
+            return store.schema_objects(state, run_id, offset, limit)
         if section == "diff":
             if candidate is not None and not isinstance(candidate, str):
                 raise FaultForgeError("invalid_argument", "candidate must be a candidate id")
@@ -1496,6 +1579,90 @@ def _build_error(built: node_build.StackBuild, settings: McpSettings) -> FaultFo
             f"Fix the build, then call again. It ran with no network and no secrets ({built.line()}).{quoted}",
         )
     return FaultForgeError("sandbox_failed", f"the build couldn't run: {store.clean(reason, 60)}", "Call faultforge_status to check Docker and the images, then try again.")
+
+
+def _inventory_note(result: SandboxResult) -> str:
+    """One line of a stack run's notes: what the catalog inventory holds, or why there is none."""
+    found = result.containment.schema_objects
+    if found is None:
+        reason = store.clean(result.containment.schema_objects_reason or "not read", 60)
+        return f"FaultForge {REVIEW_UNREAD} ({reason}), so a fix verified against this run will be flagged for review."
+    during = len(result.containment.schema_objects_during)
+    late = f" {during} of them appeared during the run." if during else ""
+    return f"Recorded {len(found)} database objects ({SCHEMA_KINDS_TEXT}).{late} A fix that adds or changes one is flagged for review."
+
+
+def _is_migration(name: str) -> bool:
+    """By name only: a .sql file, or a path that says migration. A hint for the reader."""
+    lowered = name.lower()
+    return lowered.endswith(".sql") or "migrat" in lowered
+
+
+def _schema_review(
+    baseline: store.RunMeta, results: list[SandboxResult], deployed_edits: list[str], verified: bool, run_id: str,
+) -> tuple[dict[str, Any], list[str]]:
+    """Whether a person must read the fix's database objects before trusting the result: the
+    result's fields, and every added or changed line for the stored run. It never changes
+    `verified`: the gate decides that alone. A stack's fix can add a trigger, a rule, a view, a
+    function, a policy or a child table that makes the state SQL read the right numbers while the
+    bug remains, and no gate row can see a careful one.
+
+    Flagged when any run of this verify has an object the baseline didn't, or the same object with
+    another definition, and when either side's catalog couldn't be recorded: a missing inventory is
+    a reason to look, never a reason not to. An object that wasn't there before the load and was
+    at the end of the run says so: project code made it while the hooks ran."""
+    files = [name for name in deployed_edits if _is_migration(name)]
+    named = _file_names(files, MAX_BRIEF_FILES) if files else "no changed file in the fix scope is a migration by name; read every file in changed_files"
+    unread = reason = None
+    if baseline.schema_objects is None:
+        reason = baseline.schema_objects_reason
+        why = store.clean(reason, 60) if reason else "none was recorded with it"
+        unread = f"of the baseline run ({why}); a new baseline from faultforge_run_scenario records it"
+    else:
+        for item in results:
+            if item.containment.schema_objects is None:
+                reason = item.containment.schema_objects_reason
+                unread = f"({store.clean(reason or 'not read', 60)})"
+                break
+    if unread is not None:
+        too_many = reason == stack_module.SCHEMA_TOO_MANY
+        what = (
+            f"FaultForge recorded no inventory {unread}: there are more than {stack_module.MAX_SCHEMA_OBJECTS} database objects, or "
+            "their names are too long to store" if too_many else f"FaultForge {REVIEW_UNREAD} {unread}"
+        )
+        return {
+            "review_required": True,
+            "review": (
+                f"{'verified by the gate, but' if verified else 'not verified, and'} {what}, so it can't say whether "
+                "the fix added database objects that can change what the state check reads; read the fix's migrations before "
+                "trusting the result."
+            ),
+            "review_reason": REVIEW_TOO_MANY if too_many else REVIEW_UNREAD,
+            "review_files": named,
+        }, []
+    found: list[str] = []
+    during: set[str] = set()
+    for item in results:
+        during |= {stack_module.schema_object_name(line) for line in item.containment.schema_objects_during}
+        for line in stack_module.schema_changes(baseline.schema_objects, item.containment.schema_objects or []):
+            if line not in found:
+                found.append(line)
+    if not found:
+        return {"review_required": False}, []
+    # `added: kind name on table`: one made while the run was under way is marked as that.
+    every = [f"{line} ({DURING_RUN})" if line.split(": ", 1)[1] in during else line for line in sorted(found)]
+    lines = [f"{UNTRUSTED} {store.clean(line, MAX_LINE)}" for line in every]
+    if len(lines) > MAX_REVIEW_OBJECTS:
+        lines = [
+            *lines[: MAX_REVIEW_OBJECTS - 1],
+            f"... {len(lines) - MAX_REVIEW_OBJECTS + 1} more: faultforge_get_run(\"{run_id}\", section=\"schema_objects\")",
+        ]
+    return {
+        "review_required": True,
+        "review": REVIEW_VERIFIED if verified else REVIEW_UNVERIFIED,
+        "schema_objects": lines,
+        "review_files": named,
+    }, every
 
 
 def _tree_changes(before: Path, after: Path) -> list[str]:
@@ -1645,6 +1812,13 @@ def _meta(result: SandboxResult, *, notes: list[str], **fields: Any) -> store.Ru
     """What the host saw of a completed run. A mismatch is spelled out, since the summary shows only its status."""
     assert result.report is not None
     facts = [item for item in (result.containment.target, result.containment.runner) if item is not None]
+    if fields.get("kind") == "stack":
+        reason = result.containment.schema_objects_reason
+        fields = {
+            **fields, "schema_objects": result.containment.schema_objects,
+            "schema_objects_reason": store.clean(reason, 60) if reason else None,
+            "schema_objects_during": result.containment.schema_objects_during,
+        }
     verification = result.containment.state_verification
     if verification is not None and verification.status == "mismatch":
         notes = [*notes, f"The database disagrees with the state the target reported: {_mismatches(verification)}."]
@@ -1838,6 +2012,12 @@ def _brief(
             "package.json, pnpm-lock.yaml, pnpm-workspace.yaml, .nvmrc and every other file outside the scope."
         )
         lines.append("So a fix can't add or change a dependency. That needs a new baseline: faultforge_run_scenario again.")
+        if stack.prestart is not None:
+            lines.append(
+                f"Prestart, its script pinned too: {_prestart_line(stack.prestart)}. Code it imports from the scope above is yours. "
+                "A schema change belongs in a migration it applies, "
+                "and only if that folder is in the scope above. If it fails, the run fails: target_start_failed."
+            )
     else:
         lines.append(f"{APP_NAME} only. Put the whole fix there: it is the one file of yours that is deployed.")
     if meta.pinned_package:
@@ -1848,7 +2028,9 @@ def _brief(
         )
     lines.append(f"{config_module.CONFIG_NAME} and {store.RULES_NAME} are pinned at this run too: editing them changes nothing.")
     policed = stack is None and meta.pinned_package == POLICY_PACKAGE
-    lines.append(HOOKS_SEPARATE if stack is not None else HOOKS_POLICY if policed else HOOKS_NO_POLICY)
+    lines.append(_hooks_line(stack) if stack is not None else HOOKS_POLICY if policed else HOOKS_NO_POLICY)
+    if stack is not None:
+        lines.append(REVIEW_BRIEF)
     lines.append("## The gate: every row must pass" + (" (the candidate must build first, sealed, with no network)" if stack is not None else ""))
     if policed:
         lines.append(f"0. {GATE_POLICY}: {POLICY_MEANING}; checked before any load")

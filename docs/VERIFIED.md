@@ -233,6 +233,50 @@ It could start a child process (`id`), as any build can. The sandbox shares the 
 - JADE's own build wasn't run. Its `package.json`, lockfile, workspace file and `.nvmrc` pass the lint (321 packages).
 - Nothing ran on the VM.
 
+## The prestart step: migrations as the database's owner (2026-11-16, local only)
+
+`stack.yaml` can name a `prestart:` command, run once in the app image before the hooks helper and the app, as an owner role; the app then logs in as a lesser role. `demo/redeem-code` moved to it: `node tools/migrate.ts` as `redeem_owner`, the app as `redeem_app`, `fix_scope: [src/, migrations/]`. SportsDeck has no prestart and is unchanged. See docs/MCP.md, "The prestart step".
+
+### The roles, in a real postgres (`postgres:16-alpine`)
+
+From a container in the stack's namespace with the app's user and limits:
+
+- **The owner is not a superuser.** As `redeem_owner`, each of these was refused, with SQLSTATE 42501 for the first two: `COPY ... TO PROGRAM`, `COPY ... FROM PROGRAM`, `COPY ... FROM '/etc/passwd'`, `pg_read_file`, `CREATE ROLE` (plain and `SUPERUSER`), `ALTER ROLE redeem_owner SUPERUSER`, `GRANT pg_execute_server_program`, changing the app's or the administrator's password, `CREATE DATABASE`, `CREATE EXTENSION file_fdw`, a C-language function and `ALTER SYSTEM`.
+- Read by the host: neither role has superuser, createrole, createdb, replication or bypassrls, neither is a member of any role, and `redeem_owner` owns the database and the `public` schema.
+- **The app role owns nothing.** As `redeem_app`: an insert it wasn't granted, `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE`, `CREATE SCHEMA`, `CREATE FUNCTION`, `TRUNCATE`, `ALTER DATABASE ... SET search_path` and `COPY ... TO PROGRAM` were all refused with 42501. A `SELECT` the owner granted worked.
+- **What a migration runner needs works** as the owner: an advisory lock, its own tables, `REVOKE CREATE ON SCHEMA public FROM PUBLIC`, grants to the app role by name, and a session in the cluster's `postgres` database with an advisory lock there (JADE's runner takes one).
+- **Every TCP login still needs its password.** `redeem_owner` with no password, a wrong one and the app's password, over `127.0.0.1` and `::1`, was refused; so was the app role with the owner's password, and the administrator and `postgres` as before. With the right password the owner logs in and `rolsuper` is false.
+- The search_path pin still holds when it is the owner, not the app, that plants `public.count(*)`: an unpinned admin session got 999, the helper's and the host's got 3.
+
+### The step itself, on the demo
+
+- The buggy image still fails the race, with migrations applied only by the prestart. The run's facts hold the prestart's container, read before it was removed: user `1000:1000`, the app's limits applied, postgres's namespace, read-only root, all capabilities dropped, exit status 0. Its environment had `MIGRATION_DATABASE_URL` and `DATABASE_URL`, and none of `FF_HOOKS_TOKEN`, `FF_DATABASE_PASSWORD`, `FF_STACK_HOOKS` or `POSTGRES_PASSWORD`. The app and the runner had no `MIGRATION_DATABASE_URL`. 0 containers left.
+- **A prestart that fails stops the stack.** A script that isn't there (exit 1) and an option node refuses (exit 9) each gave a failed run, `target_start_failed`, no report, the detail `the prestart step exited with status N. Its output: [project] ...`, no app, helper or runner started, and 0 containers left. The demo's runner refusing an app URL for another role came back the same way, with its own line: `[project] migrate: DATABASE_URL must be for role redeem_app ...`.
+- A timeout is tested with a faked docker only: the container is killed and removed and the run is `target_start_failed`. It wasn't run against a real container that hangs.
+
+### Both reference fixes and every false fix, through real builds (`FF_TEST_STACK_BUILD=1`)
+
+- `faultforge_run_scenario` from a worktree, warm cache: 48 s, FAIL, database matched, limits applied, 0 containers left.
+- **The schema fix** (`reference_fix_schema/`: a unique constraint on `redemptions(code_id)` in a new migration, and the unique violation answered as 409): verified in 115 s, all four rows passed, 3 regression scenarios passed. The candidate also rewrote `tools/migrate.ts` to do nothing; that file is outside the scope, so the baseline's runner applied the migration and the edit was reported as not deployed.
+- The `src/`-only reference fix: verified in 113 s, as before.
+- A candidate migration that fails (`ALTER TABLE public.nope ...`): an error, `target_start_failed`, quoting `[project] migrate: 0001_one_redemption_per_code failed; rolled back (SQLSTATE 42P01)`, never `verified`.
+- **`migration_mutes_audit`**, the new false fix (the right constraint plus a rule that drops every audit row): rejected by `comparison_fix_verified`, and by no other row. The four older false fixes were rejected by the rows they were before.
+- The prebuilt `faultforge-redeem-code:fixed-schema` image passes the gate and all three regression scenarios in the default suite too.
+
+### The install cache went cold on every image rebuild: found and fixed
+
+- **Found.** The install cache is keyed on the toolchain image's ID. Docker here uses the containerd image store, where an image's ID is the digest of an OCI index. BuildKit adds a provenance attestation to that index, which records an invocation ID and the build's start and finish times. So every `docker build` gave a new ID, even with every layer cached: `faultforge-node-build` went `1b821bb2...` to `77f0fb3e...` to `6163a55e...` with the same `Created` time and the same layer. `tests/test_mcp.py`, `tests/test_sandbox.py` and `tests/test_web.py` each run `scripts/build_images.sh`, so every suite run made the cache cold, and the next build from source needed the network.
+- **Fixed.** Both scripts now pass `--provenance=false --sbom=false`. Three runs of `scripts/build_images.sh` in a row gave identical IDs for all six images (`faultforge-node-build` is `58f474b3...`, the digest of the platform manifest the old index pointed to). The ID is still the content's digest, so a real change to the toolchain still changes the cache key.
+- **Cost.** Two fetches of the demo's unchanged lockfile, both through the proxy: 114 connections and 27 MB, then 115 connections and 29 MB, all to `registry.npmjs.org:443`, nothing refused. The second was needed because the suite itself rebuilt the images after the first.
+- After two full suite runs (each runs `scripts/build_images.sh`) the toolchain ID was unchanged and the cache was still warm. The volume from the first fetch, `ff-deps-011de56bdf8e6542`, was removed by name with its index entry. The pre-existing `ff-deps-274197ea8d293707` is unreachable under any key now but was left alone; it is within the 5 kept.
+- Test counts at the end: the four stack suites 441 passed, 16 skipped; the full suite 1361 passed, 16 skipped; `tests/test_redeem_code.py` with `FF_TEST_STACK_BUILD=1` 23 passed, 1 skipped (the network test). 0 sandbox containers and 0 sandbox networks left.
+
+### Not done
+
+- JADE's own runner wasn't run in a sandbox: that needs JADE's `stack.yaml`. Its env names, its role bootstrap and its two advisory locks were read from its source and matched against the tests above.
+- No independent review of this diff was run (the `strict` profile asks for one for sandbox-policy changes).
+- Nothing ran on the VM.
+
 ## Not tested
 
 - The bridge-gateway egress test and the rest of `tests/test_sandbox.py` ran on the dev machine, not the VM.

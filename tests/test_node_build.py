@@ -363,7 +363,7 @@ def test_a_build_section_that_isnt_plain_is_refused(changes: dict) -> None:
 
 def test_the_build_section_derives_its_images_and_takes_a_wider_scope() -> None:
     assert BUILD.build_image == "faultforge-node-build:24.22.3-pnpm12.21.0" and BUILD.run_image == "faultforge-node-run:24.22.3"
-    assert BUILD.fix_scope == ["src/"]
+    assert BUILD.fix_scope == ["src/", "migrations/"]
     wider = build_config(fix_scope=["src/", "migrations/", "vite.config.ts"])
     assert node_build.in_scope("migrations/0001.sql", wider.fix_scope) and node_build.in_scope("vite.config.ts", wider.fix_scope)
     assert not node_build.in_scope("vite.config.ts.bak", wider.fix_scope) and not node_build.in_scope("srcx/a.ts", wider.fix_scope)
@@ -877,3 +877,15 @@ def test_an_orphan_volume_of_this_state_dir_is_swept_and_no_other_is(tmp_path: P
 def test_neither_network_has_ipv6() -> None:
     for argv in node_build.network_argv("sb-x", 99).values():
         assert "--ipv6=false" in argv
+
+
+def test_the_build_scripts_leave_out_attestations_so_a_cached_rebuild_keeps_its_id() -> None:
+    """The install cache is keyed on the toolchain image's ID. A provenance attestation records when
+    the build ran, so with one the ID changed on every run of the scripts, and the cache went cold."""
+    scripts = ROOT / "scripts"
+    images = (scripts / "build_images.sh").read_text(encoding="utf-8")
+    assert "stable=(--provenance=false --sbom=false)" in images
+    builds = [line for line in images.splitlines() if line.lstrip().startswith("docker build")]
+    assert len(builds) == 4 and all('"${stable[@]}"' in line for line in builds)
+    node = [line for line in (scripts / "build_node_images.sh").read_text(encoding="utf-8").splitlines() if line.lstrip().startswith("docker build")]
+    assert len(node) == 1 and "--provenance=false" in node[0] and "--sbom=false" in node[0]

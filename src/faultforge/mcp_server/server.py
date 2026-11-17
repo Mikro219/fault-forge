@@ -78,7 +78,9 @@ def build_server(tools: Tools | None = None) -> FastMCP:
         run_id: str, section: str = "summary", offset: int = 0, limit: int = 50,
         trial: int | None = None, outcome: str | None = None, candidate: str | None = None,
     ) -> dict[str, Any]:
-        """Reads a stored run. section: summary | violations | hypotheses | performance | evidence | diff.
+        """Reads a stored run. section: summary | violations | hypotheses | performance | evidence | diff |
+        schema_objects. schema_objects pages a stack run's database objects, 40 a page: for a run of
+        faultforge_verify_fix, what the fix added or changed; names are the project's text.
         evidence pages through every request (limit at most 100), optionally filtered by trial or
         outcome (accepted, rejected, unexpected, transport_error). diff pages the unified diff between
         a baseline run's app.py and one of its stored candidates (candidate: "candidate:<id>", or the

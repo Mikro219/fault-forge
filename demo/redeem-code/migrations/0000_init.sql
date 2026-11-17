@@ -1,4 +1,5 @@
--- Applied once at start by src/hooks.server.ts. Every statement can run again safely.
+-- Applied once by tools/migrate.ts, as the owner, before the app starts. The app logs in as
+-- redeem_app and owns nothing: the grants at the end are everything it may do.
 CREATE TABLE IF NOT EXISTS public.codes (
 	id serial PRIMARY KEY,
 	code text NOT NULL UNIQUE,
@@ -34,3 +35,11 @@ CREATE TABLE IF NOT EXISTS public.kit_items (
 INSERT INTO public.kit_items (kit, position, name)
 SELECT 'starter', n, 'item-' || n FROM generate_series(1, 40) AS n
 ON CONFLICT (kit, position) DO NOTHING;
+
+-- The app role, by name. It reads and claims codes, adds redemptions and audit rows, and reads kits.
+-- It can't delete or rewrite a redemption or an audit row, and it can't create or alter anything.
+GRANT USAGE ON SCHEMA public TO redeem_app;
+GRANT SELECT, UPDATE ON public.codes TO redeem_app;
+GRANT SELECT, INSERT ON public.redemptions, public.audit_log TO redeem_app;
+GRANT USAGE ON SEQUENCE public.redemptions_id_seq, public.audit_log_id_seq TO redeem_app;
+GRANT SELECT ON public.kit_items TO redeem_app;

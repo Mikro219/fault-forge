@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds faultforge-redeem-code:buggy and :fixed for the default-suite stack tests, through
+# Builds faultforge-redeem-code:buggy, :fixed and :fixed-schema for the default-suite stack tests, through
 # node_build: the lint, the install cache and the sealed build, never a docker build of project code.
 #
 #   scripts/build_redeem_demo.sh [--allow-network]
@@ -26,11 +26,14 @@ build = load_stack(demo / "stack.yaml").build
 state = private_dir(state_dir())
 allow = os.environ["FF_DEMO_ALLOW_FETCH"] == "1"
 with tempfile.TemporaryDirectory(prefix="faultforge-redeem-demo-") as temp:
-    fixed = Path(temp) / "candidate"
-    shutil.copytree(demo, fixed)
-    shutil.copytree(demo / "reference_fix", fixed, dirs_exist_ok=True)
-    sources = {"buggy": demo, "fixed": Path(temp) / "fixed"}
-    node_build.assemble_source(demo, fixed, build.fix_scope, sources["fixed"])
+    sources = {"buggy": demo}
+    # Each fix is taken as verify_fix takes one: only the paths in the fix scope, over the baseline.
+    for tag, overlay in {"fixed": "reference_fix", "fixed-schema": "reference_fix_schema"}.items():
+        candidate = Path(temp) / f"candidate-{tag}"
+        shutil.copytree(demo, candidate)
+        shutil.copytree(demo / overlay, candidate, dirs_exist_ok=True)
+        sources[tag] = Path(temp) / tag
+        node_build.assemble_source(demo, candidate, build.fix_scope, sources[tag])
     for tag, source in sources.items():
         built = node_build.build_stack_image(source, build, state, allow_fetch=allow, tag=f"faultforge-redeem-code:{tag}")
         if built.image_id is None:

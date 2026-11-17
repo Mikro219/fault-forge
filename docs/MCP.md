@@ -51,9 +51,9 @@ allow_network_install = false   # the default; see "Building a stack from source
 | `faultforge_list_scenarios(project_dir, offset?)` | Reads `faultforge.yaml`, and `stack.yaml` if there is one, six scenarios at a time; `more` and `next_offset` say how to page. Contacts no target. |
 | `faultforge_validate_scenario(project_dir, scenario_id?)` | Checks the schema, safety rules and expressions. For a stack, it checks that `state_sql` covers every `before.`/`after.` variable. It sends no load and never calls reset. |
 | `faultforge_run_scenario(project_dir, scenario_id, source, runtime="auto", compare_to?)` | Snapshots the source, runs the scenario in the sandbox and stores the run. Returns the verdict, Proven and Suspected lines, completeness and a `run_id`. |
-| `faultforge_get_run(run_id, section, offset?, limit?, trial?, outcome?, candidate?)` | `summary`, `violations`, `hypotheses`, `performance`, `evidence` or `diff`. `evidence` pages through every request, at most 100 per page. `diff` pages a stored candidate's diff against the baseline's `app.py`. |
+| `faultforge_get_run(run_id, section, offset?, limit?, trial?, outcome?, candidate?)` | `summary`, `violations`, `hypotheses`, `performance`, `evidence`, `diff` or `schema_objects`. `evidence` pages through every request, at most 100 per page. `diff` pages a stored candidate's diff against the baseline's `app.py`. `schema_objects` pages a stack run's database objects: for a verify run, what the fix added or changed. |
 | `faultforge_propose_fix(run_id, mode="auto")` | For a FAIL run of a Python target. `client` returns a fix brief of at most 60 lines. `vultr` has a model write `app.py`, judges it with the full gate and returns a diff. `auto` is `vultr` when every condition for it holds, otherwise `client`, and `mode_reason` says why. No mode writes to the repo. |
-| `faultforge_verify_fix(run_id, source="worktree")` | Takes the candidate (`worktree`, `commit:<sha>` or `candidate:<id>`), reruns the failing scenario against the baseline `run_id`, then every other scenario, and applies the full gate. Returns `verified`, the gate rows with evidence, the regression results, the new `run_id` and, when it fails, `fix_next`. |
+| `faultforge_verify_fix(run_id, source="worktree")` | Takes the candidate (`worktree`, `commit:<sha>` or `candidate:<id>`), reruns the failing scenario against the baseline `run_id`, then every other scenario, and applies the full gate. Returns `verified`, the gate rows with evidence, the regression results, the new `run_id` and, when it fails, `fix_next`. For a stack it also returns `review_required` (see "The review flag"). |
 
 Every failure is `{status: "error", error_class, message, fix_hint}`, never an exception.
 
@@ -81,6 +81,8 @@ build:
   fix_scope: [src/]          # what a fix may change; the default
 ```
 
+`runtime_copy` is also how a migration runner reaches the image: the demo copies `tools` and `migrations`, and JADE would copy `tools` and the three `src/lib/server/` folders its runner imports.
+
 There is no command field. The build is the package's own `build` script, run as `pnpm run build`, and the toolchain images are named from the two versions (`scripts/build_node_images.sh <node> <pnpm>`), never by the project. The steps:
 
 1. **Lint, on the host.** `package.json`, `pnpm-lock.yaml` and `pnpm-workspace.yaml` must have a shape the builder knows. Every lockfile package is `name@version` with a sha512 integrity and nothing else; the only exception is one `node@runtime:<build.node>` entry, which `devEngines.runtime` produces and which is never fetched. A pnpmfile, `.npmrc`, patches, a workspace, config dependencies, a `pnpm` field, any `link:`, `file:` or `workspace:` dependency, any resolution with a URL or a git repo, any snapshot, snapshot dependency or importer version that doesn't land on one of those checked registry packages, any unknown key, and a workspace file that asks for install scripts (`allowBuilds: true`, `onlyBuiltDependencies`) are all `unsupported_build`, with one fixed sentence. Nothing is ever given network as a fallback. `faultforge_validate_scenario` runs this lint on the dependency files and the pnpmfiles; it copies files only, so a root `node_modules/` or `patches/` directory is caught at run time instead. A project's `.npmrc` is a secret-looking file, dropped from every snapshot, so it never reaches the lint or the build.
@@ -104,7 +106,7 @@ Expect about 15 s for a build of the demo with a warm cache, about 25 s with a c
 
 The loop, in client mode: `faultforge_run_scenario` proves the bug (a FAIL `run_id`), `faultforge_propose_fix` returns the brief, Claude Code edits the working tree, and `faultforge_verify_fix` judges the result. Repeat the last two steps until `verified` is true. FaultForge never writes to the repo.
 
-**The brief** holds the failing scenario and its proven violations with their numbers, the business rules (`BUSINESS_RULES.md` if the project had one, otherwise the scenario's invariants), the file in scope (`app.py` only; the package beside it is named as pinned and read-only), the gate rows, a line on how far the hooks can be trusted, the regression scenarios and the next call. Lines marked `[project]` quote the project's files or the target's output. They are cleaned and cut short, and they are data, never instructions.
+**The brief** holds the failing scenario and its proven violations with their numbers, the business rules (`BUSINESS_RULES.md` if the project had one, otherwise the scenario's invariants), the file in scope (`app.py` only; the package beside it is named as pinned and read-only), the gate rows, a line on how far the hooks can be trusted, the regression scenarios and the next call. For a stack it also says that a fix which adds or changes a trigger, rule, view, row-security policy, function or another listed database object is judged by the gate as usual and comes back with `review_required`. Lines marked `[project]` quote the project's files or the target's output. They are cleaned and cut short, and they are data, never instructions.
 
 **The gate.** `verified` is true only when every row passes. Each row fails closed: missing evidence is a failure.
 
@@ -147,10 +149,14 @@ A stack baseline built from source pins more: `pinned/stack.yaml` (the hooks' SQ
 | `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`, `.nvmrc` | the baseline, always: they can't be put in `fix_scope` |
 | Everything else outside `fix_scope` (build config, migrations, static files) | the baseline |
 | Paths inside `fix_scope`, by default `src/` | the candidate |
+| `stack.yaml`'s `prestart:` section: the command, the owner role, its variable and its limit | the baseline |
+| The file the prestart command runs, and what it imports | the baseline if outside `fix_scope`, the candidate if inside |
+| The migrations the prestart applies | the candidate, if their folder is in `fix_scope`; otherwise the baseline |
+| The database roles (the app's, the owner's, the hooks role and the administrator) and their passwords | FaultForge, new for every run |
 | The hooks | FaultForge's own helper image, never the project |
 
 - `fix_scope` can't name a dependency file, `.npmrc`, a pnpmfile, `node_modules`, `stack.yaml`, `faultforge.yaml` or `BUSINESS_RULES.md`. A project may add paths such as `migrations/` or `vite.config.ts`. So a fix can never add or change a dependency; that needs a new baseline.
-- **A fix that changes the schema needs two things.** First, its migrations folder must be in `fix_scope` before the baseline is recorded, because the scope is pinned then. Second, something in the sandbox must apply the migrations. The stack has no pre-start step: the redeem demo applies its migration from `src/hooks.server.ts` when the app starts, but an app whose migrations run as a separate step (JADE's `node tools/db/migrate.ts`, under its own owner role) gets no migration in the sandbox. A unique index added there would never exist, and the fix would fail on the comparison row. A `prestart` step is planned with the JADE integration.
+- **A fix that changes the schema needs two things.** First, its migrations folder must be in `fix_scope` before the baseline is recorded, because the scope is pinned then. Second, something in the sandbox must apply the migrations: a `prestart` step (next section), or the app itself at start. The redeem demo does the first: `fix_scope: [src/, migrations/]`, and `node tools/migrate.ts` as its prestart. A candidate's migrations are then built into the image and applied by the **pinned** prestart command.
 - Edits outside the scope are never an error and never silent: `changed_files` names them and `not_deployed` or `fix_next` says they weren't deployed.
 - `code_changed` compares the source hash, and is checked **before any build**: a candidate whose scope is unchanged fails that row at once and nothing is built.
 - A candidate whose sealed build fails gives `verified: false` with `build_failed`, the end of the build's output in `build_log` (marked `[project]`: it is the project's text), every row "not run" and no stored run.
@@ -158,10 +164,120 @@ A stack baseline built from source pins more: `pinned/stack.yaml` (the hooks' SQ
 - A verify with different toolchain images, or after the baseline's install cache entry is gone, is `not_comparable`: make a new baseline.
 - The `vultr` mode is `mode_unavailable` for a stack and `auto` picks `client`: a stack fix can span several files, and the model loop writes one `app.py`.
 
+### The prestart step: migrations as the database's owner
+
+```yaml
+# stack.yaml
+database_user: redeem_app            # the role the app logs in as
+prestart:
+  command: [node, tools/migrate.ts]  # an argument list for node: plain tokens, no shell
+  owner_role: redeem_owner           # must differ from database_user
+  owner_url_env: MIGRATION_DATABASE_URL   # the default; the app's URL is always DATABASE_URL
+  timeout_s: 30                      # the default; 1 to 60
+```
+
+Without `prestart:` a stack is as before: one role, `database_user`, which owns its database. With it:
+
+1. Postgres starts. FaultForge creates **two ordinary roles**, each with its own random password: `owner_role`, which owns the database and its `public` schema, and `database_user`, which owns nothing. `CREATE` on `public` is revoked from `PUBLIC`, so the app role has only what the project's migrations grant it. It also creates its own hooks role (next section).
+2. **The prestart runs once**, in the app image (the one just built, or the prebuilt `app_image`), with `node` as its entrypoint and the rest of `command` as its arguments. It is sealed exactly as the app is: the same user, limits, read-only root, dropped capabilities and `no-new-privileges`, in postgres's network namespace and nowhere else, labelled `faultforge.sandbox`. It gets the stack's `env`, `DATABASE_URL` (the app role's) and the owner's URL in `owner_url_env`. It never gets the hooks token or the administrator's password.
+3. Its container is read (its settings and exit status go into the run's containment facts) and removed, by its exact name. Only an exit status of 0 inside `timeout_s` lets the stack go on. Anything else is a failed run, `target_start_failed`, never a verdict: the detail says the status or the limit, and quotes the last 200 characters of the command's output on one line, marked `[project]`, with this run's two database passwords taken out.
+4. The owner is locked (`NOLOGIN`, its sessions ended), and the catalog inventory is read for the first time (see "The review flag").
+5. Then the hooks helper, then the app. The app gets `DATABASE_URL` for the app role and never the owner's URL. The helper reads and resets as the hooks role, with its `search_path` pinned and `row_security` off.
+
+`command` is held to the same rule as `build.start`: it begins with `node`, and every token is plain (`[A-Za-z0-9_./=:@-]`), so there is no shell, quote, space or expansion. The whole section is part of `stack.yaml`, so it is pinned at the baseline: a candidate can't change the command, the roles or the limit.
+
+**The file the command names is pinned only if it is outside `fix_scope`.** The demo's `tools/migrate.ts` is; JADE's `tools/db/migrate.ts` is too, but it imports `src/lib/server/db/`, which a `src/` scope takes from the candidate. Either way it is project code.
+
+**How this maps to JADE** (read from its repo; nothing there was changed). JADE's `node tools/db/migrate.ts` reads `MIGRATION_DATABASE_URL` (a URL for role `jade_owner`) and `DATABASE_URL` (for `jade_app`), which must name the same host, port and database and carry no query string, and `APP_ENV`. Its `stack.yaml` would have `database_user: jade_app`, `prestart: {command: [node, tools/db/migrate.ts], owner_role: jade_owner}` and `APP_ENV: staging` in `env` (its image sets `NODE_ENV=production`, which allows only `staging` and `production`). Three things in its runner were checked against this design:
+
+- Its role bootstrap creates `jade_app` only when the role is missing. FaultForge has already created it with the password in `DATABASE_URL`, so the runner finds it, logs in as it to confirm, and writes nothing. That matters: the owner here can't create a role.
+- It takes one advisory lock in the target database and one in the cluster's `postgres` database. An ordinary role can do both; the test suite checks the owner can connect to `postgres` and lock there.
+- Its first migration revokes `CREATE` on `public` from `PUBLIC` and grants to `jade_app` by name. The owner owns the schema, so both work.
+
+JADE's runner has not been run in a FaultForge sandbox yet: that needs its own `stack.yaml` and is the JADE bead's work.
+
+### The hooks role: the pinned SQL never runs as a superuser
+
+`reset_sql` and `state_sql` run in two places: in the hooks helper, over TCP, and from the host, through the unix socket inside the postgres container. Both run as **`faultforge_hooks`**, which every stack gets, with or without a prestart:
+
+- It is `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE`, with a random password of its own that only the helper holds. `faultforge_hooks` and `faultforge_admin` are refused as a `database_user` or an `owner_role`.
+- It is **a member of the role that owns the tables**: `owner_role` in a stack with a prestart, `database_user` in one without (SportsDeck, where the app creates its own schema). Membership and not table grants, because `TRUNCATE ... RESTART IDENTITY` needs ownership and the tables don't exist when the roles are made. The grant is one way, with no admin option: the owner gains nothing, and the hooks role can't pass the membership on. Locking the owner (`NOLOGIN`) doesn't touch it; the tests reset and read as the hooks role after the owner is locked.
+- **So a trigger, a rule or a view function that fires in a hooks session has the table owner's rights and no more.** A migration's trigger on a table the reset truncates can no longer run `COPY ... TO PROGRAM`, read a server file or change a role: the tests plant one and check the refusal (SQLSTATE 42501), and check that the same trigger in an administrator's session does run the program.
+- The administrator (`faultforge_admin`, a superuser) is now used for two things only: creating the roles, and locking the owner after the prestart. It never runs the project's SQL or touches a project table, and the helper no longer holds its password.
+- Each session still pins `search_path = pg_catalog, public`.
+
+**Row-level security.** A superuser is never subject to a row-security policy. A member of the table's owner is, when the policy is forced (`ALTER TABLE ... FORCE ROW LEVEL SECURITY`). So moving off the superuser opened a new way to hide rows from the check: a migration forces a policy, and the pinned `COUNT(*)` reads fewer rows than the table holds, with no error. To close it, **every hooks session and every host read sets `row_security = off`**. Postgres then refuses a query that a policy would filter, instead of filtering it. The helper answers 503, the host's read fails, and the state check is `unavailable` (`state_unavailable`), which fails the gate; a reset that a policy would affect fails the run. It is never a forged match. The tests force a policy and check all three, and that without the setting the same role reads 1 row where the table holds 3. A policy that isn't forced doesn't apply to the owner or its members, so nothing is hidden and nothing fails.
+
+**The helper image must be this FaultForge's.** An image built before this change would run the pinned SQL without `row_security = off`. So the first container of every stack run is a check: sealed like the helper, with no network, it compares the sha256 of `/opt/stack_hooks.py` in the image with FaultForge's own copy and removes itself. It runs before postgres, and so before the prestart or any project code. The run is refused (`image_missing`) if the file differs, and the detail says which: another version, a file that can't be read, or a check that couldn't run. Rebuild with `scripts/build_images.sh` after updating FaultForge.
+
+**What the hooks role can still do,** all of it inside the throwaway database: whatever the tables' owner can, and change its own password and its own session defaults. A trigger that did either would lock the helper out or be overridden by the settings each session pins, so the run fails closed. It can't unlock or raise the owner, change another role's password, or create a role. A table that some other role owns (an app role that a migration let create tables, say) is one it can't truncate and may not be able to read: the reset or the state read then fails, and the run fails rather than passes.
+
+### The review flag: database objects a fix added
+
+A migration in the fix scope can add a trigger, a rule, a view, a function, a row-security policy or a child table that makes the state check read the right numbers while the bug remains. No gate row can tell a careful one from an honest one. So FaultForge records what is there and says when a fix changed it. **It flags; it never fails:** `verified` is what the gate rows decide, with or without the flag.
+
+**The inventory.** One `SELECT` over `pg_catalog`, as the hooks role, in a read-only transaction with a 5 s limit. It reads catalog tables and the server's own deparse functions only, so no project code runs. It lists:
+
+| Kind | What |
+|---|---|
+| `trigger` | every trigger in the app's schemas that isn't internal (a foreign key's own triggers are internal and left out) |
+| `rule` | every rule except the `_RETURN` rule each view has |
+| `view`, `materialized_view` | every one |
+| `policy` | every row-security policy |
+| `row_security`, `row_security_forced` | every table with row security enabled, or forced |
+| `function`, `procedure`, `aggregate`, `security_definer_function` | **every** one in the app's schemas, whoever's rights it runs with, so a helper whose body changes is seen too |
+| `operator`, `cast` | every one made after initdb (OID 16384 or above), in any schema |
+| `generated_column` | every generated column |
+| `partitioned_table`, `foreign_table`, `child_table` | every partitioned or foreign table, and every partition or inheritance child, with its parent |
+| `event_trigger` | every one (only a superuser can make one, so a project can't) |
+
+"The app's schemas" are all but `pg_catalog`, `information_schema` and the server's other `pg_` schemas. Each object is one line, `kind name on schema.table #digest`, sorted, for example `rule audit_log_muted on public.audit_log #f586351012cb`. The digest is 12 hex characters over the object's definition as the server prints it: a view's query, a rule's or trigger's definition and whether it is enabled, a function's body, language, owner, settings and whether it is `SECURITY DEFINER`, a policy's command, roles and conditions, a generated column's expression, a partition's bounds. No OID goes into it, so the same migrations give the same lines in every run. Names are the project's text: made one line of printable ASCII and cut to 80 characters a part.
+
+**The query can't be captured from the app's schema.** `pg_catalog` first on the `search_path` only wins for the same argument types: an aggregate `public.json_agg(json)`, or a function with closer argument types than the built-in's, is chosen over the built-in, and could return an empty list. So the inventory's session has `search_path = pg_catalog` and nothing else, and names every function it calls there. No operator of the app's is visible on that path. The tests plant the overloads and check the list is whole, and that the same query with `public` on its path reads as an empty catalog. The host's state read calls `pg_catalog.json_build_object` by name for the same reason; a planted `public.json_build_object(text, bigint)` forged the count before.
+
+**When it is read.** At the end of every run, straight after the state read. A stack with a prestart is also read before the load: after the prestart has exited and the owner is locked, before the helper and the app start. Both reads matter there. The first is before any project code has run as the hooks role. But a check constraint, a default or a trigger can call a function during the first reset, as the hooks role, and that function can make a view or a trigger. Only the second read sees it. What is stored is both reads together, and the lines only the second had are stored apart as `schema_objects_during`. Without a prestart there is one read, at the end: the app makes its own schema as it starts and only the runner knows when it has.
+
+The list is stored with the run (`schema_objects` and `schema_objects_during` in `run.json` and `sandbox.json`), for the baseline as for any run, and a run's notes say how many were recorded. `faultforge_get_run(run_id, section="schema_objects")` pages it, 40 lines at a time.
+
+**The comparison.** `faultforge_verify_fix` compares the inventory of every run it makes (the main scenario and each regression scenario) with the baseline's:
+
+- **added**: a line whose kind, name and table the baseline doesn't have;
+- **changed**: the same kind, name and table with another digest;
+- either one that wasn't there before the load says `(appeared during the run)`;
+- an object the fix dropped is not flagged: it can't stand between the check and the tables.
+
+Anything added or changed gives:
+
+```json
+"review_required": true,
+"review": "verified by the gate, but the fix added database objects that can change what the state check reads; read them before trusting the result.",
+"schema_objects": [
+  "[project] added: function public.audit_log_only_redeems()",
+  "[project] added: trigger audit_log_only_redeems on public.audit_log"
+],
+"review_files": "1 [project]: migrations/0001_one_redemption_per_code.sql"
+```
+
+`schema_objects` holds at most 3 lines. When there are more, the last is the `faultforge_get_run(..., section="schema_objects")` call that pages every one of them from the stored verify run. `review_files` names the changed files in the fix scope that are migrations by name (a `.sql` file, or a path containing `migrat`). When the gate rejected the fix, `review` begins "not verified, and" instead. The verify run's stored summary says `review required` on its `fix_gate` line. With nothing added or changed the result has `"review_required": false` and none of the other fields. The fix brief tells Claude this will happen.
+
+**It fails toward the flag.** If the catalog couldn't be recorded, for the baseline or for any run of the verify, `review_required` is true and `review` gives the cause:
+
+- `"review_reason": "couldn't read the catalog"`: a timeout, a failed `psql`, output of the wrong shape, either of a prestart stack's two reads missing, or a baseline stored before inventories were recorded (make a new one);
+- `"review_reason": "too many database objects to record"`: more than 1000 objects, or lines adding up to more than 80,000 characters, in one read or in both together. Nothing is recorded in part.
+
+**What it doesn't see.** It lists the kinds above and nothing else. A column default, a check constraint and an index expression aren't lines of their own; the functions they call are, when they are the app's. A check or default written with built-in functions only is not listed. Types, domains and their constraints, collations, sequences, publications, grants and settings on a role or the database are not listed. Without a prestart the app owns its schema, so it could add an object and drop it again before the read at the end of the run; with one, project code running as the hooks role could do the same between the two reads. A legitimate unique index or constraint adds none of the listed objects, so the demo's `reference_fix_schema` comes back with no flag; its `flagged_fix` (the same constraint plus a trigger and its function) is verified and flagged, and `false_fixes/migration_mutes_audit` is rejected by the gate and flagged too.
+
+**Postgres 16 or newer.** Before 16 a role could grant membership in itself, so a migration running as the owner could `GRANT owner TO app` and the app would own the schema after all. A project's `postgres_image` must be named by a version of 16 or above (`postgres:16-alpine`; `postgres:latest` and `postgres:15` are refused as `config_invalid`). The tag is what is checked, not the server inside the image.
+
 **What a verified stack fix still doesn't prove.**
 
-- The app owns its own database and schema. It can replace a table with a view, and it can attach a trigger, a rule or a view over a function to a table the pinned SQL reads or resets. That code then runs **with the admin role's rights** when the helper or the host touches the object. So an app written to cheat can make the admin session do things, inside the sealed postgres container only, which has no network and is thrown away.
-- Admin sessions pin `search_path = pg_catalog, public`, so the app can't shadow a built-in such as `count` from its schema. That closes name shadowing, not the route above. `validate_scenario` warns when a `reset_sql` or `state_sql` statement names a table without a schema.
+- **Without a prestart, the app owns its own database and schema.** It can replace a table with a view, and it can attach a trigger, a rule or a view over a function to a table the pinned SQL reads or resets. That code then runs when the helper or the host touches the object, **with the hooks role's rights, which are the app role's own** and no superuser's. So an app written to cheat can change what the check reads, and gains nothing else by it.
+- **With a prestart, the migrations own it instead.** The app role can't create or alter anything itself. Once the prestart has exited, the owner is set to `NOLOGIN` and any session it left open is ended, so a migration that changed the owner's password, or a second connection it kept, gives the running app nothing. What stays open is what the owner built for the app on purpose: a `SECURITY DEFINER` function a migration created runs with the owner's rights when the app calls it. The prestart's script must sit outside `fix_scope` and the build output and come right after `node`, with no node options; code it imports from the scope (JADE's `tools/db/migrate.ts` imports `src/lib/server/db/`) is the candidate's. The route is open to whatever the prestart runs, which is project code holding the owner's login, and with `migrations/` in `fix_scope` that includes a candidate's migrations. Stated plainly:
+  - **The owner can do anything inside the sandbox database.** It can create, alter and drop every object, rewrite or delete any row, and grant the app role anything it has itself. The database is thrown away after each run, in a container with no network.
+  - **The owner is not a superuser, and can't become one.** It has `NOSUPERUSER NOCREATEDB NOCREATEROLE` and is a member of no role, so `COPY ... PROGRAM`, server-side file reads, `CREATE ROLE`, `ALTER SYSTEM`, untrusted languages and extensions that need a superuser are all refused; the tests run each and check the refusal. It can't log in as the administrator, or change the administrator's or the app's password.
+  - **A hostile migration can still make the hooks lie.** It can replace a table the pinned `state_sql` reads with a view that returns what it likes, add a trigger or a rule to a table `reset_sql` writes (the demo's `migration_mutes_audit` false fix does this, clumsily enough to be caught), or attach a function to either. When the helper or the host then touches that object, the function runs **as the hooks role**, with the owner's rights: it can't run a program, read a server file or change another role (see "The hooks role"). But the numbers the gate reads can be forged this way, and no gate row detects a careful forgery. This is the same class as the trigger and view route above: project code that owns the schema.
+  - So a verified fix that includes a migration is strong evidence against an honest mistake, and no evidence against a migration written to fool the check. **Read a candidate's migrations before trusting the result.** `changed_files` names them, and a result with `review_required: true` names the triggers, rules, views, policies, functions and other listed objects the fix added or changed (see "The review flag"). The flag is a prompt to read, not a judgement: only a reader can tell a harmless object from a forgery, and a forgery through something the inventory doesn't list isn't flagged.
+- The helper's and the host's sessions pin `search_path = pg_catalog, public`, so the app can't shadow a built-in such as `count(*)` with one of the same name and argument types, and set `row_security = off`, so a forced policy fails the read instead of hiding rows. That closes shadowing by an identical signature and policy filtering, not the route above. **An overload with closer argument types is still chosen over a built-in**, whatever the path: a project's `state_sql` that calls `SUM(x)` on a type the app has defined its own `sum` for would run the app's. FaultForge's own statements name `pg_catalog`; the pinned `state_sql` and `reset_sql` are the project's, and should too where it matters. A function added that way is a line in the inventory. `validate_scenario` warns when a `reset_sql` or `state_sql` statement names a table without a schema.
 - Postgres asks for a password on every TCP login (`--auth-host=scram-sha-256`), so the app can't log in as the administrator over the loopback it shares. The host reads through the unix socket inside the postgres container.
 - **The hooks token stops accidents, not hostile code.** The helper answers only a caller that holds a per-run token, which the runner has and the app doesn't. An app that calls a `/__ff/` path gets a 403 rather than a reset. It is not a security boundary against an app that owns its schema.
 - The app can keep state in memory. Client counts are measured by the runner regardless, so the capacity and liveness invariants don't depend on any of this.
@@ -262,7 +378,7 @@ target:
 - **SQLite only, at one path.** The verifier opens the file at the sandbox's database path (`/tmp/ticket.db`, passed to the target as `FF_DB_PATH`) read-only with `query_only` on. A target that keeps its state anywhere else gets `unavailable`, so its fixes can't be verified; a stack target reads Postgres instead.
 - `demo/ticket-api/faultforge.yaml` declares the same four queries as `TICKET_API_STATE_VERIFIER`, the constant the web app trusts. A test keeps the two in step.
 - The field isn't part of a scenario's config fingerprint, so adding queries doesn't make an old run `NOT_COMPARABLE`. A stack target ignores it and uses `stack.yaml`'s `state_sql`.
-- The runner image parses `faultforge.yaml` too. Rebuild it with `scripts/build_images.sh` after updating FaultForge, or it refuses the new field.
+- The runner image parses `faultforge.yaml` too. Rebuild it with `scripts/build_images.sh` after updating FaultForge, or it refuses the new field. The same script rebuilds the stack hooks helper, which a stack run refuses when it isn't this FaultForge's.
 
 ## Limits and safety
 
@@ -277,9 +393,10 @@ target:
   - The run uses the snapshot's `faultforge.yaml` (and `stack.yaml`), never the live repo's.
 - **The sandbox.** The sandbox policy is the same as the CLI's and the web app's (docs/PLAN.md V3.3): no network, a read-only root, non-root, all capabilities dropped and hard limits. Only containers and networks labelled `faultforge.sandbox` are touched, and only cache volumes labelled `faultforge.depcache`, each by a name or ID FaultForge computed. The server never prunes anything.
 - **A project's `stack.yaml` is untrusted here.**
-  - The trusted services must be stock `postgres:<tag>` and, if named, `redis:<tag>` images.
+  - The trusted services must be stock `postgres:<tag>` (version 16 or newer) and, if named, `redis:<tag>` images.
   - `target.hooks_origin` must be the hooks helper's own port, so the runner's token never goes to the app.
   - The `build:` section takes versions, plain names and a `node` command only: no image name and no build command.
+  - The `prestart:` section takes a `node` command of plain tokens, a plain role name, a variable name the sandbox doesn't set itself, and a limit of at most 60 s.
   - The app may not run as root.
   - Writable paths must be plain paths.
 - **One run at a time.** A per-process lock and an `flock` on `<state>/run.lock` are both held for a run and for a `verify_fix`, so a second call, in this server or in another server process sharing the state directory, gets `busy`, while `status` (which reports `busy`), `get_run` and a client-mode `propose_fix` still answer. A client-mode `propose_fix` takes no lock: it sends no load and only reads a stored run, whose files are complete before its `run_id` is returned. A vultr fix holds both locks like a run, so `auto` returns `busy` when it would have picked `vultr` during a run. The kernel releases the file lock when the server exits, however it exits.
@@ -290,7 +407,8 @@ target:
 ### Known limits, left as they are
 
 - **Typed arguments over stdio.** An argument of the wrong type (a number for `project_dir`, say) is rejected by the MCP SDK's pydantic validation before the tool runs, so that one failure arrives as a protocol error rather than a `{status: "error"}` result. Every argument that reaches a tool is checked by the tool itself.
-- **Superuser SQL inside the sealed postgres container.** The stack's state queries run as the database owner inside a throwaway container with no network, a read-only root and hard limits. They can read anything in that container's database, and nothing outside it.
+- **The stack's pinned SQL runs with the table owner's rights.** The state queries and the reset run as `faultforge_hooks`, an ordinary role that is a member of the role owning the tables, inside a throwaway container with no network, a read-only root and hard limits. They can read and change anything that owner can in that container's database, and nothing outside it. The superuser sets up the roles and never runs project SQL.
+- **The review flag lists some kinds of object, not every way to change a read.** See "What it doesn't see" under "The review flag".
 - **The baseline is whichever run the caller names.** Pinning stops a fix from changing the rules and the hooks' files of the run it is judged against. It doesn't stop someone from making a new baseline from a tree whose config or package is already weak, and verifying against that. The verify result names the `baseline_run_id` and the pinned config's sha256, so check them against the run that proved the bug.
 - **The state directory is trusted.** The pinned copies and their hash live side by side in `<state>/runs/`, which is private to the user. The hash catches a damaged copy, not someone who can write there.
 - **The per-call cap bounds what is sent, not what a provider reports.** A call is refused unless its worst case is within $0.10, and the ledger records what the reply's usage says. A provider that reported more output than the limit it was given would be charged to the ledger in full, and the next decision would see it. The owner accepted this: the $10 buffer is what it's for.
@@ -307,4 +425,5 @@ target:
 - Applying a vultr diff: FaultForge never does it.
 - The `vultr` fix mode for anything but a `ticket_support` project, and so for every stack, and the `remote` runtime (M12).
 - Install scripts, pnpmfiles, workspaces and any registry but `registry.npmjs.org` for a stack built from source.
-- A `prestart` step, a second database role and build-time env values for a stack: recorded for JADE in docs/PLAN.md.
+- A shell, an image or a user of its own for the `prestart` step: it is a `node` command in the app's image, as the app's user.
+- Build-time env values for a stack: recorded for JADE in docs/PLAN.md.

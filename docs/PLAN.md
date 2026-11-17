@@ -100,7 +100,8 @@ The owner approved these before the build; the reviewed plan had them as D1 to D
 - **`vultr` fixes for a stack** are `mode_unavailable`; `auto` picks `client`.
 - **Postgres** uses `--auth-host=scram-sha-256` for every stack, SportsDeck included (V3.3).
 - **Retention.** 5 install-cache volumes, least recently used first out. Built images are removed after each call. Pinned source is kept with its run.
-- **Deferred to the JADE bead:** a `prestart` step (migrations run as a separate owner role before the app); the redeem rate limit, which 20 requests from one address would trip; a `build_env` map of fixed test values if a later phase imports `$env/static/*` (none does today); and `postgres:16.16-bookworm`, because `stack.py` assumes the alpine image's uid 70.
+- **Built after M11 (2026-11-16):** the `prestart` step. Migrations run once in the app image as a separate owner role before the hooks helper and the app, sealed as the app is; the app logs in as a lesser role. See docs/MCP.md, "The prestart step".
+- **Deferred to the JADE bead:** the redeem rate limit, which 20 requests from one address would trip; a `build_env` map of fixed test values if a later phase imports `$env/static/*` (none does today); and `postgres:16.16-bookworm`, because `stack.py` assumes the alpine image's uid 70.
 
 What the build found, and what changed because of it, is in `docs/VERIFIED.md` under M11.
 
@@ -157,7 +158,8 @@ Applied to both containers:
 | Code freshness | `PYTHONDONTWRITEBYTECODE=1` and a fresh code directory with no `__pycache__`, so a retest can't run stale bytecode (`docs/VERIFIED.md`) |
 | Lifetime | Wall-clock kill at the §4.6 budget; always removed afterwards |
 | Leftovers | Containers are labelled; a reaper removes strays at startup and on a timer |
-| Stack database (M11) | Postgres starts with `POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256`, so every TCP login needs a password and the app can't log in as the administrator over the loopback it shares. The host reads through the unix socket inside the postgres container. Admin sessions pin `search_path = pg_catalog, public`. The hooks helper answers only the holder of a per-run token |
+| Stack prestart | A stack with a `prestart:` section runs that one `node` command in the app image before the hooks helper and the app, under every control above and the app's own limits, in postgres's namespace only. It holds the owner role's login and never the hooks token or the administrator's password. The owner and the app role are ordinary roles: neither is a superuser or can create a role. A non-zero exit or a timeout fails the run; the container is removed before the app starts |
+| Stack database (M11) | Postgres starts with `POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256`, so every TCP login needs a password and the app can't log in as the administrator over the loopback it shares. The host reads through the unix socket inside the postgres container. The pinned reset and state SQL run as `faultforge_hooks`, an ordinary role that is a member of the tables' owner, never as the superuser; its sessions pin `search_path = pg_catalog, public` and set `row_security = off`, so a forced row-security policy fails the state read instead of hiding rows. The hooks helper answers only the holder of a per-run token |
 
 **Should have:** gVisor (`--runtime=runsc`) if it installs cleanly on the VM. Without it, containers share the VM's kernel, and the README says so.
 
