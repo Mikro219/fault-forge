@@ -83,6 +83,16 @@ SECTIONS: tuple[str, ...] = ("summary", "violations", "hypotheses", "performance
 OUTCOMES = ("accepted", "rejected", "unexpected", "transport_error")
 
 
+GATE_TRUST_LOCAL = "local"
+GATE_TRUST_REMOTE = "remote-reported"
+
+
+def gate_trust(runtime: str) -> str:
+    """local: every row from this machine's sandbox. remote-reported: app_policy and code_changed are
+    checked here, the verdict, the database check and the regression runs are what the VM reported."""
+    return GATE_TRUST_LOCAL if runtime == "local" else GATE_TRUST_REMOTE
+
+
 class RunMeta(Contract):
     """What the server recorded about a run, apart from the report itself."""
 
@@ -91,7 +101,7 @@ class RunMeta(Contract):
     scenario_id: str
     kind: Literal["python", "stack"]
     source: dict[str, object]
-    runtime: Literal["local"] = "local"
+    runtime: Literal["local", "remote"] = "local"
     compare_to: str | None = None
     deployed_code_sha256: str | None = None
     containers_left: int | None = None
@@ -597,6 +607,7 @@ def summary(state: Path, run_id: str) -> dict[str, object]:
         "project_dir": meta.project_dir,
         "kind": meta.kind,
         "runtime": meta.runtime,
+        "gate_trust": gate_trust(meta.runtime),
         "source": meta.source,
         "completeness": completeness_line(report),
         "proven": proven_lines(report),

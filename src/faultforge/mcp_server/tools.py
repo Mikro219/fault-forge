@@ -72,7 +72,7 @@ from faultforge import config as config_module, expressions, fix_agent, k6_runne
 from faultforge.errors import FaultForgeError
 from faultforge.lifecycle import RunOptions
 from faultforge.limits import LIMITS
-from faultforge.mcp_server import credit as credit_module, snapshot as snapshot_module, store
+from faultforge.mcp_server import credit as credit_module, remote as remote_module, snapshot as snapshot_module, store
 from faultforge.mcp_server.credit import CreditGuard, CreditView, Decision
 from faultforge.mcp_server.settings import McpSettings, load_settings, private_dir, require_image_allowed, resolve_project
 from faultforge.models import ProjectConfig, Report, ScenarioConfig
@@ -95,9 +95,17 @@ ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 WRITABLE_PATH = re.compile(r"/[A-Za-z0-9._/-]{1,128}")
 RESERVED_PORTS = (5432, 6379)
 STATUS_POLICY = dataclasses.replace(sandbox.DEFAULT_POLICY, docker_timeout_s=5.0)
-REMOTE_UNAVAILABLE = "not built yet (M12)"
+RUNTIMES = ("auto", "local", "remote")
+# Where the gate's evidence came from (docs/MCP.md, "What the gate trusts"). On the remote runtime only
+# app_policy and code_changed are checked here; the rest is what the VM's sandbox reported.
+GATE_TRUST_LOCAL = store.GATE_TRUST_LOCAL
+GATE_TRUST_REMOTE = store.GATE_TRUST_REMOTE
 FIX_MODES = ("auto", "client", "vultr")
-RUNTIME_AUTO = f"auto -> local: the remote runtime is {REMOTE_UNAVAILABLE}"
+REMOTE_IMAGE_ONLY = "a prebuilt app image is on this machine only; the remote runtime runs a stack built from source"
+VULTR_LOCAL = "a vultr fix runs its candidates on this machine: the remote runtime isn't offered for vultr fixes in M12"
+# What one call of each tool may do on the VM, for the worst case of its cost (docs/PLAN.md V4.3).
+PYTHON_RUN_OPS = {"run_python": 1}
+STACK_RUN_OPS = {"build_stack": 1, "run_stack": 1, "remove_images": 1}
 VULTR_PACKAGE_ONLY = "not a ticket_support project: the vultr fix loop's code policy is written for that package only"
 VULTR_STACK = "a stack fix can span several files, and the vultr fix loop writes one app.py"
 STACK_SOURCES = "worktree | commit:<sha>"
@@ -130,7 +138,7 @@ DURING_RUN = "appeared during the run"
 # hand the owner role to the app.
 MIN_POSTGRES_MAJOR = stack_module.MIN_POSTGRES_MAJOR
 # Lines of a result, the "more" line included: a flagged result must stay within the 60-line cap.
-MAX_REVIEW_OBJECTS = 3
+MAX_REVIEW_OBJECTS = 2
 MAX_BUILD_LOG_LINES = 12
 MAX_CHANGED_FILES = 400
 # After FROM, JOIN, INTO, UPDATE or TRUNCATE: a name with no schema in front of it. A hint only.
@@ -147,8 +155,8 @@ MAX_BRIEF_RULES = 12
 MAX_BRIEF_FILES = 6
 MAX_BRIEF_REGRESSION = 5
 MAX_GATE_NAMES = 4
-MAX_VERIFY_REGRESSION_LINES = 5
-MAX_VERIFY_PROVEN = 2
+MAX_VERIFY_REGRESSION_LINES = 4
+MAX_VERIFY_PROVEN = 1
 MAX_FIX_NEXT_REGRESSION = 1
 MAX_FILE_NAME = 60
 MAX_LINE = 240
@@ -448,6 +456,8 @@ class Tools:
         fix_loop: Callable[..., fix_agent.LoopResult] = fix_agent.run_fix_loop,
         build_stack: Callable[..., node_build.StackBuild] = node_build.build_stack_image,
         remove_images: Callable[[list[str]], None] = node_build.remove_images,
+        remote_transport: remote_module.Transport | None = None,
+        remote_check: Callable[..., remote_module.Check] = remote_module.static_check,
     ):
         self._settings = settings
         self._run_sandboxed = run_sandboxed
@@ -458,7 +468,113 @@ class Tools:
         self._fix_loop = fix_loop
         self._build_stack = build_stack
         self._remove_images = remove_images
+        self._remote_transport = remote_transport or remote_module.SshTransport()
+        self._remote_check = remote_check
+        self._call_rt: LocalRuntime | remote_module.RemoteRuntime | None = None
         self._lock = threading.Lock()
+
+    # Runtimes
+
+    def _local(self) -> "LocalRuntime":
+        return LocalRuntime(self._run_sandboxed, self._run_stack, self._build_stack, self._remove_images)
+
+    def _remote_blocker(
+        self, settings: McpSettings, ops: Mapping[str, int], *, auto: bool, needs: tuple[str, ...] = (),
+    ) -> tuple["remote_module.RemoteRuntime | None", FaultForgeError | None, str]:
+        """Every condition for the remote runtime, cheapest first, so nothing reaches the network for
+        a call that can't use it: the config, the deploy record matching this machine's code and
+        images, auto's preference, the credit floor for this call's worst case (which may read the
+        account), then one SSH call that asks the VM for its own code hash and image IDs.
+        Returns the runtime, or why not, and the credit line."""
+        config = settings.remote
+        check = self._remote_check(config, settings.remote_problem, settings.state_dir, self._remote_transport, needs=needs)
+        if check.runtime is None or config is None:
+            return None, FaultForgeError("runtime_unavailable", check.reason or "the remote runtime isn't configured", check.hint), ""
+        if auto and config.auto != "remote":
+            return None, FaultForgeError("runtime_unavailable", '[remote] auto is "local"'), ""
+        worst, wall = remote_module.worst_case_usd(config, ops)
+        decision = self._credit.decide(settings.state_dir, worst)
+        if not decision.allowed:
+            return None, FaultForgeError(
+                "credit_floor", f"remote: {decision.reason}",
+                "Nothing was sent. Use runtime \"local\" or \"auto\". faultforge_status shows the credit.",
+            ), ""
+        check = remote_module.ping_check(check)
+        if check.runtime is None:
+            return None, FaultForgeError("runtime_unavailable", check.reason or "the runner VM didn't answer", check.hint), ""
+        return check.runtime, None, (
+            f"{decision.reason}; this call's wall limit is {wall:.0f} s, so its worst case is ${worst} at ${config.hourly_usd}/h"
+        )
+
+    def _runtime(
+        self, settings: McpSettings, requested: str, ops: Mapping[str, int], unsupported: str | None = None, needs: tuple[str, ...] = (),
+        why: str | None = None,
+    ) -> tuple["LocalRuntime | remote_module.RemoteRuntime", dict[str, Any]]:
+        """local, remote, or auto: remote only when every condition holds, local otherwise, and the
+        result says which and why. An explicit remote that can't be used is an error, never local.
+        why replaces "requested" when the caller chose for the user (verify_fix follows its baseline)."""
+        if requested == "local":
+            self._call_rt = self._local()
+            return self._call_rt, {"runtime": "local", "runtime_reason": why or "requested", "source_left_this_machine": False}
+        if unsupported is not None:
+            blocker: FaultForgeError | None = FaultForgeError("runtime_unavailable", unsupported, "Use runtime \"local\" or \"auto\".")
+            runtime, line = None, ""
+        else:
+            runtime, blocker, line = self._remote_blocker(settings, ops, auto=requested == "auto", needs=needs)
+        if blocker is not None or runtime is None:
+            assert blocker is not None
+            if requested == "remote":
+                raise blocker
+            self._call_rt = self._local()
+            return self._call_rt, {"runtime": "local", "runtime_reason": f"auto resolves to local: {blocker.message}", "source_left_this_machine": False}
+        assert settings.remote is not None
+        self._call_rt = runtime
+        label = why or ("requested" if requested == "remote" else "auto resolves to remote")
+        return runtime, {
+            "runtime": "remote",
+            "runtime_reason": f"{label}: {line}",
+            "source_left_this_machine": True,
+            "remote": remote_module.LEFT_THIS_MACHINE.format(host=settings.remote.host),
+        }
+
+    def _trusted(self, call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        """Adds where the gate's evidence came from, and whether the source left this machine, to
+        every answer of a call that chose a runtime, an error from a remote step included. A project
+        snapshot counts as having left once any step's request was sent, even if it then failed."""
+        self._call_rt = None
+        try:
+            answer = call()
+        except FaultForgeError as error:
+            error.extra.update(self._trust_fields())
+            raise
+        except Exception as error:
+            wrapped = FaultForgeError("engine_failed", f"unexpected {type(error).__name__}", "This is a FaultForge bug; the run state is unchanged.")
+            wrapped.extra.update(self._trust_fields())
+            raise wrapped from None
+        return {**answer, **self._trust_fields()}
+
+    def _trust_fields(self) -> dict[str, Any]:
+        rt = self._call_rt
+        if rt is None:
+            return {"source_left_this_machine": False}
+        remote = isinstance(rt, remote_module.RemoteRuntime)
+        return {"gate_trust": GATE_TRUST_REMOTE if remote else GATE_TRUST_LOCAL, "source_left_this_machine": remote and rt.sent}
+
+    def _remote_status(self, settings: McpSettings) -> tuple[dict[str, Any], str]:
+        config = settings.remote
+        runtime, blocker, line = self._remote_blocker(settings, PYTHON_RUN_OPS, auto=False)
+        info: dict[str, Any] = {"available": runtime is not None, "reason": blocker.message if blocker else line}
+        if config is not None:
+            record = remote_module.read_record(settings.state_dir)
+            info |= {
+                "host": config.host, "hourly_usd": config.hourly_usd, "auto": config.auto,
+                "deployed": f"{record.name[:12]} at {record.deployed_at}" if record else None,
+                "what_leaves": "the project's snapshot and the pinned config, over SSH; never a key",
+            }
+        if runtime is not None and config is not None and config.auto == "remote":
+            return info, f"auto -> remote: {line}"
+        reason = blocker.message if blocker else '[remote] auto is "local"'
+        return info, f"auto -> local: {reason}"
 
     # faultforge_status
 
@@ -485,6 +601,7 @@ class Tools:
         _, no_inference = credit_module.inference_key()
         vultr_reason = None if decision.allowed and no_inference is None else (no_inference if decision.allowed else decision.reason)
         fix_auto = "client" if vultr_reason else "vultr"
+        remote_info, runtime_auto = self._remote_status(settings)
         return {
             "status": "ok",
             "docker": docker,
@@ -492,7 +609,7 @@ class Tools:
             "k6": k6,
             "runtimes": {
                 "local": {"available": local_ready, "reason": None if local_ready else "Docker or the sandbox images are missing"},
-                "remote": {"available": False, "reason": REMOTE_UNAVAILABLE},
+                "remote": remote_info,
             },
             "fix_modes": {
                 "client": {"available": True, "reason": None},
@@ -511,7 +628,7 @@ class Tools:
             "ledger": _ledger_line(decision.view),
             "effective_modes": {
                 "fix": f"auto -> {fix_auto}: {vultr_reason or decision.reason}",
-                "runtime": RUNTIME_AUTO,
+                "runtime": runtime_auto,
             },
         }
 
@@ -685,9 +802,7 @@ class Tools:
         if not isinstance(scenario_id, str) or not SCENARIO_ID.fullmatch(scenario_id):
             raise FaultForgeError("invalid_argument", "scenario_id must be a scenario id such as last-ticket-rush")
         kind, sha = snapshot_module.parse_source(source)
-        if runtime == "remote":
-            raise FaultForgeError("runtime_unavailable", f"the remote runtime is {REMOTE_UNAVAILABLE}", "Use runtime \"local\" or \"auto\".")
-        if runtime not in ("auto", "local"):
+        if runtime not in RUNTIMES:
             raise FaultForgeError("invalid_argument", "runtime must be auto, local or remote")
         if compare_to is not None:
             if not isinstance(compare_to, str):
@@ -700,12 +815,13 @@ class Tools:
         try:
             # The in-process lock first, then the cross-process one; both are released on every path.
             with run_lock(settings.state_dir):
-                return self._run(settings, project, scenario_id, kind, sha, compare_to)
+                return self._trusted(lambda: self._run(settings, project, scenario_id, kind, sha, compare_to, runtime))
         finally:
             self._lock.release()
 
     def _run(
         self, settings: McpSettings, project: Path, scenario_id: str, kind: str, sha: str | None, compare_to: str | None,
+        requested: str = "local",
     ) -> dict[str, Any]:
         state = private_dir(settings.state_dir)
         store.sweep_stale(state, time.time())
@@ -722,6 +838,14 @@ class Tools:
         if target_kind == "stack" and kind != "image" and _load_stack(project / STACK_NAME).build is None:
             # Before any snapshot. The snapshot's own stack.yaml is checked again below.
             raise _no_build_section()
+        # Chosen before the snapshot, so an explicit remote that can't be used snapshots nothing.
+        rt, where = self._runtime(
+            settings, requested, PYTHON_RUN_OPS if target_kind == "python" else STACK_RUN_OPS,
+            REMOTE_IMAGE_ONLY if target_kind == "stack" and kind == "image" else None,
+            _stack_images(_load_stack(project / STACK_NAME)) if target_kind == "stack" and kind != "image" else (),
+        )
+        if where["source_left_this_machine"]:
+            notes.append(where["remote"])
         if target_kind == "stack" and kind == "image":
             snap = snapshot_module.copy_files(project, state, [config_module.CONFIG_NAME, STACK_NAME], "image")
         elif kind == "image":
@@ -755,7 +879,7 @@ class Tools:
                 else:
                     if stack.build is None:
                         raise _no_build_section()
-                    built = self._build_stack(snap.root, stack.build, state, allow_fetch=settings.allow_network_install)
+                    built = rt.build_stack(snap.root, stack.build, state, allow_fetch=settings.allow_network_install)
                     if built.image_id is None:
                         raise _build_error(built, settings)
                     images.append(built.image_id)
@@ -771,7 +895,7 @@ class Tools:
                         notes.append(f"Fetched this lockfile's packages once through the registry-only proxy ({'; '.join(built.proxy[:3])}).")
                     if snap.dropped_secrets:
                         notes.append(f"Left {len(snap.dropped_secrets)} secret-looking files out of the snapshot.")
-                run = lambda: self._run_stack(stack_spec, work, scenario_id, RunOptions(compare_to=compare_to))  # noqa: E731
+                run = lambda: rt.run_stack(stack_spec, work, scenario_id, RunOptions(compare_to=compare_to))  # noqa: E731
             else:
                 if _regular(snap.root / STACK_NAME):
                     raise FaultForgeError("unsupported_build", f"the snapshot has a {STACK_NAME} the working tree doesn't", "Run the stack with source \"image\".")
@@ -779,7 +903,7 @@ class Tools:
                 package = snap.root / support if support else None
                 scope = _scope(snap.root, package)
                 spec = _python_spec(snap.root, package, config_path, config)
-                run = lambda: self._run_sandboxed(spec, work, scenario_id, RunOptions(compare_to=compare_to))  # noqa: E731
+                run = lambda: rt.run_sandboxed(spec, work, scenario_id, RunOptions(compare_to=compare_to))  # noqa: E731
                 source = snap.describe()
                 if snap.dropped_secrets:
                     notes.append(f"Left {len(snap.dropped_secrets)} secret-looking files out of the snapshot.")
@@ -799,6 +923,7 @@ class Tools:
             meta = _meta(
                 result, project_dir=str(project), scenario_id=scenario_id, kind=target_kind, source=source,
                 compare_to=compare_to, notes=notes, pinned_config_sha256=store.file_sha256(config_path), scope=scope,
+                runtime=rt.name,
             )
             if built is not None:
                 meta = meta.model_copy(update={"toolchain": dict(built.toolchain), "image_id": built.image_id, "build": built.line()})
@@ -808,10 +933,10 @@ class Tools:
                 stack_from=snap.root / STACK_NAME if target_kind == "stack" else None,
                 source_from=snap.root if built is not None else None,
             )
-            return {**store.summary(state, result.report.run_id), "mutates_data": "only the sandbox's own throwaway data"}
+            return {**store.summary(state, result.report.run_id), "mutates_data": "only the sandbox's own throwaway data", **where}
         finally:
             if images:
-                self._remove_images(images)
+                rt.remove_images(images)
             snap.remove()
             if work is not None:
                 store.remove_tree(work)
@@ -951,6 +1076,7 @@ class Tools:
             "run_id": meta.run_id,
             "mode": "client",
             "mode_reason": reason,
+            "gate_trust": store.gate_trust(meta.runtime),
             "writes_to_repo": False,
             **_credit_fields(view),
             "brief": brief,
@@ -1026,6 +1152,9 @@ class Tools:
             "mode": "vultr",
             "mode_reason": "requested" if mode == "vultr" else f"auto resolves to vultr: {decision.reason}",
             "model": AGENT_MODEL,
+            "runtime": "local",
+            "runtime_reason": VULTR_LOCAL,
+            "gate_trust": GATE_TRUST_LOCAL,
             "writes_to_repo": False,
             "verified": loop.success,
             "stop_reason": store.clean(loop.stop_reason, 60),
@@ -1095,11 +1224,13 @@ class Tools:
     # faultforge_verify_fix
 
     @structured
-    def verify_fix(self, run_id: str, source: str = "worktree") -> dict[str, Any]:
+    def verify_fix(self, run_id: str, source: str = "worktree", runtime: str = "auto") -> dict[str, Any]:
         if isinstance(source, str) and source.startswith("candidate:"):
             kind, sha = "candidate", store.parse_candidate(source)
         else:
             kind, sha = snapshot_module.parse_source(source)
+        if runtime not in RUNTIMES:
+            raise FaultForgeError("invalid_argument", "runtime must be auto, local or remote")
         settings = self._settings()
         meta, _, project = self._fixable(settings, run_id)
         if kind == "image":
@@ -1108,18 +1239,31 @@ class Tools:
             )
         if kind == "candidate" and meta.kind == "stack":
             raise FaultForgeError("invalid_argument", "a stack baseline has no stored candidates", "Use \"worktree\" or \"commit:<sha>\".")
+        # The owner's rule: a fix is judged on the runtime its baseline ran on, so both sides of the
+        # comparison come from the same machine. auto is the baseline's; anything else is refused.
+        effective = meta.runtime if runtime == "auto" else runtime
+        if effective != meta.runtime:
+            raise FaultForgeError(
+                "not_comparable", f"{meta.run_id} ran on the {meta.runtime} runtime, and a fix is judged on the same runtime as its baseline",
+                f'Call faultforge_verify_fix with runtime "auto" or "{meta.runtime}", or make a new baseline with runtime "{runtime}".',
+            )
+        why = f"the baseline {meta.run_id} ran {meta.runtime}" if runtime == "auto" else None
         if not self._lock.acquire(blocking=False):
             raise _busy()
         try:
             # The same two locks as a run, in the same order; both are released on every path.
             with run_lock(settings.state_dir):
-                if meta.kind == "stack":
-                    return self._verify_stack(settings, project, meta, kind, sha)
-                return self._verify(settings, project, meta, kind, sha)
+                return self._trusted(lambda: (
+                    self._verify_stack(settings, project, meta, kind, sha, effective, why) if meta.kind == "stack"
+                    else self._verify(settings, project, meta, kind, sha, effective, why)
+                ))
         finally:
             self._lock.release()
 
-    def _verify(self, settings: McpSettings, project: Path, baseline: store.RunMeta, kind: str, sha: str | None) -> dict[str, Any]:
+    def _verify(
+        self, settings: McpSettings, project: Path, baseline: store.RunMeta, kind: str, sha: str | None, requested: str = "local",
+        why: str | None = None,
+    ) -> dict[str, Any]:
         state = private_dir(settings.state_dir)
         store.sweep_stale(state, time.time())
         scenario_id = baseline.scenario_id
@@ -1210,27 +1354,33 @@ class Tools:
                 notes.append(pinning)
             if snap is not None and snap.dropped_secrets:
                 notes.append(f"Left {len(snap.dropped_secrets)} secret-looking files out of the snapshot.")
+            rt, where = self._runtime(settings, requested, {"run_python": 1 + len(regression_ids)}, why=why)
+            if where["source_left_this_machine"]:
+                notes.append(where["remote"])
             work = private_dir(state / "work") / secrets.token_hex(8)
             work.mkdir(mode=0o700)
             store.stage_baseline(state, work, baseline.run_id)
             results: dict[str, SandboxResult] = {}
 
             def run(target: TargetSpec, project_dir: Path, scenario: str, options: RunOptions) -> SandboxResult:
-                results[scenario] = self._run_sandboxed(target, project_dir, scenario, options)
+                results[scenario] = rt.run_sandboxed(target, project_dir, scenario, options)
                 return results[scenario]
 
             result, failure, _ = fix_agent.run_candidate(
                 spec, work, scenario_id, RunOptions(compare_to=baseline.run_id), run, baseline.deployed_code_sha256,
             )
+            _raise_remote(rt)
             if result is None:
                 raise FaultForgeError("engine_failed", f"the sandbox didn't run ({failure})", "This is a FaultForge bug; nothing was verified.")
             if result.status != "completed" or result.report is None:
-                return {**_failure(result), "verified": False}
+                return {**_failure(result), "verified": False, "runtime": _runtime_line(where)}
             # The regression scenarios always run once the main one has a report, so one call shows
             # everything the candidate broke. Each fails closed inside fix_agent.
             regression = fix_agent.run_regression(
                 spec, work, regression_ids, RunOptions(), run, result.deployed_code_sha256, pinned,
             )
+            # A remote step that failed is an error for the whole call: nothing of it is stored.
+            _raise_remote(rt)
             # A field an invariant reads but no query covers is never compared with the database, so a
             # `matched` there proves nothing about it. That fails the state gate, here and in regression.
             queries = spec.state_verifier
@@ -1262,12 +1412,12 @@ class Tools:
                 store.store_run(state, work, other.report, _meta(
                     other, project_dir=str(project), scenario_id=item.scenario_id, kind="python", source=described,
                     compare_to=None, notes=[f"A regression run of faultforge_verify_fix for {baseline.run_id} (main run {report.run_id})."],
-                    pinned_config_sha256=baseline.pinned_config_sha256, scope=scope, role="regression",
+                    pinned_config_sha256=baseline.pinned_config_sha256, scope=scope, role="regression", runtime=rt.name,
                 ), other, pin_from=pinned.parent, package_from=package)
             meta = _meta(
                 result, project_dir=str(project), scenario_id=scenario_id, kind="python", source=described,
                 compare_to=baseline.run_id, notes=notes, pinned_config_sha256=baseline.pinned_config_sha256, scope=scope,
-                role="verify",
+                role="verify", runtime=rt.name,
                 fix_gate={"verified": verified, "baseline_run_id": baseline.run_id, "failed": failed, "regression": regression_lines},
             )
             store.store_run(state, work, report, meta, result, pin_from=pinned.parent, package_from=package)
@@ -1279,7 +1429,8 @@ class Tools:
                 "baseline_run_id": baseline.run_id,
                 "baseline_source": origin,
                 "scenario_id": scenario_id,
-                "source": origin_text,
+                # Where it ran shares the source's line, so the worst result stays within 60 lines.
+                "source": f"{origin_text}; runtime {_runtime_line(where)}",
                 "verdict": report.verdict,
                 "gate": rows,
                 "regression": regression_lines,
@@ -1303,7 +1454,10 @@ class Tools:
             if work is not None:
                 store.remove_tree(work)
 
-    def _verify_stack(self, settings: McpSettings, project: Path, baseline: store.RunMeta, kind: str, sha: str | None) -> dict[str, Any]:
+    def _verify_stack(
+        self, settings: McpSettings, project: Path, baseline: store.RunMeta, kind: str, sha: str | None, requested: str = "local",
+        why: str | None = None,
+    ) -> dict[str, Any]:
         """A stack fix. Everything that defines the test, and everything outside the fix scope, comes
         from the baseline's pinned copies: the config, stack.yaml (the hooks' SQL, the images, the
         build section and the scope itself) and the source. Only the candidate's files inside the
@@ -1337,6 +1491,7 @@ class Tools:
             snap = snapshot_module.snapshot_worktree(project, state, settings.allowed_roots)
         work: Path | None = None
         images: list[str] = []
+        rt: LocalRuntime | remote_module.RemoteRuntime = self._local()
         try:
             work = private_dir(state / "work") / secrets.token_hex(8)
             work.mkdir(mode=0o700)
@@ -1383,7 +1538,13 @@ class Tools:
                         f"The source inside the fix scope ({scope_text}) is the same as the failing run's, so nothing was built. Put the fix there.",
                     ],
                 }
-            built = self._build_stack(assembled, build, state, allow_fetch=False)
+            rt, where = self._runtime(
+                settings, requested, {"build_stack": 1, "run_stack": 1 + len(regression_ids), "remove_images": 1},
+                needs=_stack_images(stack), why=why,
+            )
+            if where["source_left_this_machine"]:
+                notes.append(where["remote"])
+            built = rt.build_stack(assembled, build, state, allow_fetch=False)
             if built.image_id is None:
                 if built.failure_reason == "install_cache_missing":
                     raise FaultForgeError(
@@ -1414,19 +1575,21 @@ class Tools:
             results: dict[str, SandboxResult] = {}
 
             def run(target: StackSpec, project_dir: Path, scenario: str, options: RunOptions) -> SandboxResult:
-                results[scenario] = self._run_stack(target, project_dir, scenario, options)
+                results[scenario] = rt.run_stack(target, project_dir, scenario, options)
                 return results[scenario]
 
             result, failure, _ = fix_agent.run_candidate(
                 spec, work, scenario_id, RunOptions(compare_to=baseline.run_id), run, baseline.deployed_code_sha256,  # type: ignore[arg-type]
             )
+            _raise_remote(rt)
             if result is None:
                 raise FaultForgeError("engine_failed", f"the sandbox didn't run ({failure})", "This is a FaultForge bug; nothing was verified.")
             if result.status != "completed" or result.report is None:
-                return {**_failure(result), "verified": False}
+                return {**_failure(result), "verified": False, "runtime": _runtime_line(where)}
             regression = fix_agent.run_regression(
                 spec, work, regression_ids, RunOptions(), run, result.deployed_code_sha256, pinned,  # type: ignore[arg-type]
             )
+            _raise_remote(rt)
             # The host's direct read uses the pinned state_sql. A field an invariant reads that it
             # doesn't cover fails the state gate, as for a Python target.
             queries = stack.state_sql
@@ -1461,11 +1624,12 @@ class Tools:
                 store.store_run(state, work, other.report, _meta(
                     other, project_dir=str(project), scenario_id=item.scenario_id, kind="stack", source=described,
                     compare_to=None, notes=[f"A regression run of faultforge_verify_fix for {baseline.run_id} (main run {report.run_id})."],
-                    pinned_config_sha256=baseline.pinned_config_sha256, role="regression", **facts,
+                    pinned_config_sha256=baseline.pinned_config_sha256, role="regression", runtime=rt.name, **facts,
                 ), other, pin_from=pinned.parent, stack_from=pinned.parent / STACK_NAME)
             meta = _meta(
                 result, project_dir=str(project), scenario_id=scenario_id, kind="stack", source=described,
                 compare_to=baseline.run_id, notes=notes, pinned_config_sha256=baseline.pinned_config_sha256, role="verify",
+                runtime=rt.name,
                 fix_gate={
                     "verified": verified, "baseline_run_id": baseline.run_id, "failed": failed, "regression": regression_lines,
                     "review_required": review["review_required"], "schema_changes": schema_changes,
@@ -1476,6 +1640,7 @@ class Tools:
             left = [item.containment.containers_left for item in results.values()]
             answer: dict[str, Any] = {
                 **shared,
+                "source": f"{origin_text}; runtime {_runtime_line(where)}",
                 "verified": verified,
                 "run_id": report.run_id,
                 "verdict": report.verdict,
@@ -1499,7 +1664,7 @@ class Tools:
             return answer
         finally:
             if images:
-                self._remove_images(images)
+                rt.remove_images(images)
             snap.remove()
             if work is not None:
                 store.remove_tree(work)
@@ -1542,6 +1707,38 @@ class Tools:
                 raise FaultForgeError("invalid_argument", "candidate must be a candidate id")
             return store.diff(state, run_id, store.parse_candidate(candidate) if candidate is not None else None, offset, limit)
         return store.evidence(state, run_id, offset, limit, trial, outcome)
+
+
+@dataclasses.dataclass(frozen=True)
+class LocalRuntime:
+    """The four sandboxed steps on this machine's Docker, as they always ran."""
+
+    run_sandboxed: Callable[..., SandboxResult]
+    run_stack: Callable[..., SandboxResult]
+    build_stack: Callable[..., node_build.StackBuild]
+    remove_images: Callable[[list[str]], None]
+    name: str = "local"
+
+
+def _stack_images(stack: StackConfig) -> tuple[str, ...]:
+    """The images a stack built from source uses, which a remote deploy must carry exactly."""
+    names = [stack.postgres_image, *([stack.redis_image] if stack.redis_image else [])]
+    if stack.build is not None:
+        names += [stack.build.build_image, stack.build.run_image]
+    return tuple(names)
+
+
+def _runtime_line(where: Mapping[str, Any]) -> str:
+    """One line, so a verify result stays within its 60: where it ran, why, and whether the source left."""
+    left = "the snapshot left this machine for the runner VM over SSH and was removed there" if where["source_left_this_machine"] else "nothing left this machine"
+    return f"{where['runtime']} ({where['runtime_reason']}; {left})"
+
+
+def _raise_remote(rt: "LocalRuntime | remote_module.RemoteRuntime") -> None:
+    """fix_agent turns a step's exception into a failed row. For a remote step that's a transport
+    failure, not a verdict, so the whole call is an error instead, and nothing of it is stored."""
+    if isinstance(rt, remote_module.RemoteRuntime) and rt.failure is not None:
+        raise rt.failure
 
 
 # A build that failed because of the candidate's own source, as opposed to a missing image or Docker.

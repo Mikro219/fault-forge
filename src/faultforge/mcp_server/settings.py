@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from faultforge.errors import FaultForgeError
+from faultforge.mcp_server.remote import RemoteConfig, parse_remote
 
 CONFIG_ENV = "FF_MCP_CONFIG"
 STATE_ENV = "FF_MCP_STATE_DIR"
@@ -18,7 +19,8 @@ MAX_ROOTS = 64
 MAX_PATH_CHARS = 4096
 MAX_IMAGES = 64
 MAX_IMAGE_CHARS = 256
-CONFIG_KEYS = {"allowed_roots", "allowed_images", "allow_network_install"}
+CONFIG_KEYS = {"allowed_roots", "allowed_images", "allow_network_install", "remote"}
+NO_REMOTE = "no [remote] section in mcp.toml"
 
 
 def config_path() -> Path:
@@ -43,6 +45,19 @@ class McpSettings:
     # Whether faultforge_run_scenario may fetch a new lockfile's packages from registry.npmjs.org
     # (docs/PLAN.md M11). Off unless the file says true; faultforge_verify_fix never fetches.
     allow_network_install: bool = False
+    # The runner VM (docs/PLAN.md M12). None without a usable [remote] section, with the reason. A
+    # bad [remote] section disables the remote runtime only; the rest of the file still applies.
+    remote: RemoteConfig | None = None
+    remote_problem: str | None = NO_REMOTE
+
+
+def _remote(data: dict) -> tuple[RemoteConfig | None, str | None]:
+    if "remote" not in data:
+        return None, NO_REMOTE
+    try:
+        return parse_remote(data["remote"]), None
+    except ValueError as error:
+        return None, f"[remote] in mcp.toml is invalid: {error}"
 
 
 def _string_list(data: dict, key: str, limit: int) -> list[str]:
@@ -54,7 +69,7 @@ def _string_list(data: dict, key: str, limit: int) -> list[str]:
     return raw
 
 
-def _parse_config(text: str) -> tuple[tuple[Path, ...], tuple[str, ...], list[str], bool]:
+def _parse_config(text: str) -> tuple[tuple[Path, ...], tuple[str, ...], list[str], bool, tuple[RemoteConfig | None, str | None]]:
     data = tomllib.loads(text)
     unknown = set(data) - CONFIG_KEYS
     if unknown:
@@ -79,7 +94,7 @@ def _parse_config(text: str) -> tuple[tuple[Path, ...], tuple[str, ...], list[st
             problems.append(f"ignored {item!r}: not a directory")
         else:
             roots.append(resolved)
-    return tuple(dict.fromkeys(roots)), tuple(dict.fromkeys(images)), problems, network_install
+    return tuple(dict.fromkeys(roots)), tuple(dict.fromkeys(images)), problems, network_install, _remote(data)
 
 
 def load_settings() -> McpSettings:
@@ -87,12 +102,12 @@ def load_settings() -> McpSettings:
     try:
         if path.stat().st_size > MAX_CONFIG_BYTES:
             raise ValueError(f"larger than {MAX_CONFIG_BYTES} bytes")
-        roots, images, problems, network_install = _parse_config(path.read_text(encoding="utf-8"))
+        roots, images, problems, network_install, (remote, remote_problem) = _parse_config(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return McpSettings(path, state, (), (f"{path} doesn't exist, so no project is allowed",))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, ValueError) as error:
         return McpSettings(path, state, (), (f"{path} is invalid, so no project is allowed: {error}",))
-    return McpSettings(path, state, roots, tuple(problems), images, network_install)
+    return McpSettings(path, state, roots, tuple(problems), images, network_install, remote, remote_problem)
 
 
 def require_image_allowed(image: str | None, settings: McpSettings) -> None:

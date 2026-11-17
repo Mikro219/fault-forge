@@ -188,7 +188,7 @@ def fix_worst_case_usd(attempts: int = FIX_ATTEMPTS) -> Decimal:
 
 def remote_run_worst_case_usd(hourly_rate_usd: float, wall_seconds: float) -> Decimal:
     """For the remote runtime (M12): the VM's hourly rate for the run's wall limit, rounded up to
-    whole hours and never less than one. Not used yet."""
+    whole hours and never less than one. Used by the remote runtime (mcp_server/remote.py)."""
     if not (math.isfinite(hourly_rate_usd) and hourly_rate_usd > 0 and math.isfinite(wall_seconds) and wall_seconds >= 0):
         raise ValueError("the hourly rate must be positive and the wall limit non-negative")
     return usd(hourly_rate_usd) * max(1, math.ceil(wall_seconds / 3600))

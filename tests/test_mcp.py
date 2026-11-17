@@ -648,6 +648,7 @@ def test_errors_are_structured_never_raised(monkeypatch, tmp_path, project) -> N
     assert result == {
         "status": "error", "error_class": "engine_failed", "message": "unexpected RuntimeError",
         "fix_hint": "This is a FaultForge bug; the run state is unchanged.",
+        "gate_trust": "local", "source_left_this_machine": False,
     }
     tools = Tools(run_sandboxed=explode)
     assert tools.run_scenario(str(project), SCENARIO, "worktree", runtime="remote")["error_class"] == "runtime_unavailable"
@@ -1561,7 +1562,7 @@ def test_the_worst_verify_result_stays_short_and_hides_no_failure(monkeypatch, t
     assert result["verified"] is False and rows(result) == dict.fromkeys(GATES, False)
     assert len(fake.calls) == 16 and lines_of(result) <= 60, lines_of(result)
     assert all(": FAILED, " in line for line in result["regression"][:-1])
-    assert result["regression"][-1] == "... 11 more scenarios, 11 of them failed"
+    assert result["regression"][-1] == "... 12 more scenarios, 12 of them failed"
     assert result["changed_files"].startswith("10 [project]: ")
     assert lines_of(Tools().get_run(result["run_id"])) <= 60
 
@@ -2068,7 +2069,7 @@ def test_status_shows_the_credit_and_only_status_reads_it(monkeypatch, tmp_path,
     assert status["ledger"] == "today $0.00 of $2.00, total $0.00 of $15.00"
     assert status["fix_modes"]["vultr"] == {"available": True, "reason": tools_module.VULTR_PER_RUN} and status["fix_modes"]["auto"] == "vultr"
     assert status["effective_modes"]["fix"].startswith("auto -> vultr: credit $191.96")
-    assert status["effective_modes"]["runtime"] == "auto -> local: the remote runtime is not built yet (M12)"
+    assert status["effective_modes"]["runtime"] == "auto -> local: no [remote] section in mcp.toml"
     assert status["runtimes"]["remote"]["available"] is False and len(account.requests) == 1
     clock.now += 60
     assert tools.status()["credit_age_s"] == 60 and len(account.requests) == 1
@@ -2519,7 +2520,7 @@ def test_the_credit_floor_over_stdio(monkeypatch, tmp_path, project) -> None:
                 assert status["credit_usd"] is None and status["floor_usd"] == 10 and status["credit_reason"] == "no billing key"
                 assert status["fix_modes"]["vultr"] == {"available": False, "reason": "no billing key"}
                 assert status["effective_modes"] == {
-                    "fix": "auto -> client: no billing key", "runtime": "auto -> local: the remote runtime is not built yet (M12)",
+                    "fix": "auto -> client: no billing key", "runtime": "auto -> local: no [remote] section in mcp.toml",
                 }
                 assert status["ledger"] == "today $0.00 of $2.00, total $0.00 of $15.00"
                 refused = await _call(session, "faultforge_propose_fix", {"run_id": run["run_id"], "mode": "vultr"})
@@ -3191,8 +3192,8 @@ def test_a_flagged_result_stays_short_and_names_are_data(monkeypatch, tmp_path, 
     result = stack_tools(FakeBuild(), fake).verify_fix(run["run_id"])
     assert result["verified"] is False and result["review_required"] is True and lines_of(result) <= 60, lines_of(result)
     listed = result["schema_objects"]
-    assert len(listed) == 3 and listed[-1] == f'... 39 more: faultforge_get_run("{result["run_id"]}", section="schema_objects")'
-    assert all(line.startswith("[project] added: trigger t00") for line in listed[:2])
+    assert len(listed) == 2 and listed[-1] == f'... 40 more: faultforge_get_run("{result["run_id"]}", section="schema_objects")'
+    assert listed[0].startswith("[project] added: trigger t00")
     # That call is true to its word: every added object, a page at a time, each marked as the project's text.
     tools = Tools()
     page = tools.get_run(result["run_id"], "schema_objects")

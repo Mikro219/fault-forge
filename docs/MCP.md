@@ -1,6 +1,6 @@
 # FaultForge MCP server
 
-A stdio MCP server that Claude Code starts. It proves business-rule bugs under real concurrent load in a sealed local sandbox, and returns the verdict with its evidence. It then judges a fix through a gate that no model decides. Milestones M8 to M10 of `docs/PLAN.md` v4.
+A stdio MCP server that Claude Code starts. It proves business-rule bugs under real concurrent load in a sealed sandbox, on this machine or on a dedicated runner VM, and returns the verdict with its evidence. It then judges a fix through a gate that no model decides. Milestones M8 to M12 of `docs/PLAN.md` v4.
 
 **Network and money.** Runs, briefs and verifying a fix cost nothing and make no network call. Since M10 the server can make two kinds of call, and only these:
 
@@ -8,6 +8,8 @@ A stdio MCP server that Claude Code starts. It proves business-rule bugs under r
 - a model call to Vultr Serverless Inference (`api.vultrinference.com`), only for a `vultr` fix that the credit floor allowed, and only when the inference key file exists.
 
 With neither key file, the server makes no network call at all, `auto` is `client`, and nothing can be spent. See "The credit floor" below.
+
+Since M12 there is a third: **SSH to the runner VM** named in `[remote]`, only in remote mode (and one ping from `faultforge_status` and from `auto` when every other condition holds). In remote mode the project's snapshot leaves this machine; no key ever does. See "The remote runtime".
 
 ## Install
 
@@ -47,13 +49,13 @@ allow_network_install = false   # the default; see "Building a stack from source
 
 | Tool | What it does |
 |---|---|
-| `faultforge_status` | Docker, the sandbox images, runtimes (`local` only; `remote` arrives in M12), fix modes, allowed roots. Also `credit_usd` (whole dollars, rounded down, or `null`), `floor_usd: 10`, `credit_age_s`, `credit_reason`, the `ledger` line (FaultForge's own inference spend today and in total) and `effective_modes`: what `auto` resolves to for fixes, with the reason, and for the runtime (`local`). |
+| `faultforge_status` | Docker, the sandbox images, runtimes (`local` and `remote`, with availability and the reason), fix modes, allowed roots. Also `credit_usd` (whole dollars, rounded down, or `null`), `floor_usd: 10`, `credit_age_s`, `credit_reason`, the `ledger` line (FaultForge's own inference spend today and in total) and `effective_modes`: what `auto` resolves to for fixes, with the reason, and for the runtime (`auto -> remote` or `auto -> local`, with the reason). |
 | `faultforge_list_scenarios(project_dir, offset?)` | Reads `faultforge.yaml`, and `stack.yaml` if there is one, six scenarios at a time; `more` and `next_offset` say how to page. Contacts no target. |
 | `faultforge_validate_scenario(project_dir, scenario_id?)` | Checks the schema, safety rules and expressions. For a stack, it checks that `state_sql` covers every `before.`/`after.` variable. It sends no load and never calls reset. |
-| `faultforge_run_scenario(project_dir, scenario_id, source, runtime="auto", compare_to?)` | Snapshots the source, runs the scenario in the sandbox and stores the run. Returns the verdict, Proven and Suspected lines, completeness and a `run_id`. |
+| `faultforge_run_scenario(project_dir, scenario_id, source, runtime="auto", compare_to?)` | Snapshots the source, runs the scenario in the sandbox and stores the run. Returns the verdict, Proven and Suspected lines, completeness, a `run_id`, and `runtime`, `runtime_reason` and `source_left_this_machine` (see "The remote runtime"). |
 | `faultforge_get_run(run_id, section, offset?, limit?, trial?, outcome?, candidate?)` | `summary`, `violations`, `hypotheses`, `performance`, `evidence`, `diff` or `schema_objects`. `evidence` pages through every request, at most 100 per page. `diff` pages a stored candidate's diff against the baseline's `app.py`. `schema_objects` pages a stack run's database objects: for a verify run, what the fix added or changed. |
 | `faultforge_propose_fix(run_id, mode="auto")` | For a FAIL run of a Python target. `client` returns a fix brief of at most 60 lines. `vultr` has a model write `app.py`, judges it with the full gate and returns a diff. `auto` is `vultr` when every condition for it holds, otherwise `client`, and `mode_reason` says why. No mode writes to the repo. |
-| `faultforge_verify_fix(run_id, source="worktree")` | Takes the candidate (`worktree`, `commit:<sha>` or `candidate:<id>`), reruns the failing scenario against the baseline `run_id`, then every other scenario, and applies the full gate. Returns `verified`, the gate rows with evidence, the regression results, the new `run_id` and, when it fails, `fix_next`. For a stack it also returns `review_required` (see "The review flag"). |
+| `faultforge_verify_fix(run_id, source="worktree", runtime="auto")` | Takes the candidate (`worktree`, `commit:<sha>` or `candidate:<id>`), reruns the failing scenario against the baseline `run_id`, then every other scenario, and applies the full gate. Returns `verified`, the gate rows with evidence, the regression results, the new `run_id` and, when it fails, `fix_next`. `runtime` defaults to the baseline's; `gate_trust` says whether the rows came from this machine. For a stack it also returns `review_required` (see "The review flag"). |
 
 Every failure is `{status: "error", error_class, message, fix_hint}`, never an exception.
 
@@ -319,7 +321,7 @@ A paid operation is allowed only if `credit - worst_case_cost >= $10.00`.
 
   The ledger's $2 a day and $15 total caps are the outer bound on FaultForge's spend.
 - **The planned worst case of a vultr fix is $0.30.** Each model call is capped at $0.10: before a call is sent, its worst case (the prompt's upper bound in tokens plus all 8000 output tokens, at $0.75 and $3.00 per million) must be within the cap, or it isn't sent. There are at most 3 attempts. A fix verified on the first attempt is expected to cost about $0.01 to $0.03 (an estimate from the prompt size, not yet measured).
-- **The worst case of a remote run** (M12) will be the VM's hourly rate for the run's wall limit, rounded up to whole hours. The function exists and isn't used yet.
+- **The worst case of a remote run** (M12) is the VM's hourly rate for the call's wall limit, rounded up to whole hours: $0.066 for one run on the runner VM. See "The remote runtime".
 - **The reading is cached** in memory with its time, and read again only when `faultforge_status` or a paid decision finds it missing or older than 10 minutes. No other tool reads it: their results carry the last reading if it is still fresh, or `null`.
 
 **It fails closed.** Each of these counts as below the floor, with a short fixed reason and `credit_usd: null`:
@@ -380,6 +382,119 @@ target:
 - The field isn't part of a scenario's config fingerprint, so adding queries doesn't make an old run `NOT_COMPARABLE`. A stack target ignores it and uses `stack.yaml`'s `state_sql`.
 - The runner image parses `faultforge.yaml` too. Rebuild it with `scripts/build_images.sh` after updating FaultForge, or it refuses the new field. The same script rebuilds the stack hooks helper, which a stack run refuses when it isn't this FaultForge's.
 
+## The remote runtime
+
+Since M12 a run can go to a dedicated runner VM instead of this machine's Docker. The snapshot (the allowlist, the secret-looking files dropped, the pinning), the stored runs, every model call and the gate's arithmetic stay here. The sandboxed steps move: a Python run, a stack run, a source build and removing a built image are each **one SSH call** to the VM's one entry point, `faultforge.remote_run`. **On the remote runtime most of the gate's evidence is what the VM reported**: see "What the gate trusts" below.
+
+**What leaves this machine, and only with `runtime: "remote"`** (or `auto` resolving to it): the snapshot of the project (the same files a local run would mount, secrets already dropped), the pinned `faultforge.yaml` and, for a stack, its pinned `stack.yaml` settings, a baseline's `report.json` for a comparison (earlier runs of the same call stay here, and only the step's own run comes back), and fixed request fields. The VM keeps an image built from the source until the end of the call (swept within two hours if removing it fails) and the stack install cache. Never a key: the inference and Vultr keys stay here, no request carries one, and `ssh` gets a minimal environment with no agent socket. The result says so: `runtime: "remote"`, `source_left_this_machine: true` and a plain `remote` line; a stored run's summary shows `runtime` and the same line in its notes. `faultforge_verify_fix` has the same `source_left_this_machine` and `gate_trust` fields and puts the runtime and its reason on its `source` line; to stay within 60 lines its worst result now shows one proven line, four regression lines and two review-object lines (the rest page through `faultforge_get_run`). A local run says `source_left_this_machine: false`.
+
+### What the gate trusts
+
+Every result of `faultforge_run_scenario`, `faultforge_verify_fix` and `faultforge_propose_fix`, and every `faultforge_get_run` summary, carries `gate_trust`:
+
+- `"local"`: every row came from this machine's sandbox.
+- `"remote-reported"`: the run was made on the runner VM. Of the gate's rows, **two are verified on this machine**: `app_policy` (the candidate's `app.py` is read here before anything is sent) and `code_changed` (the host recomputes the hash of the code it sent, or of the source a build must report, and refuses an answer that differs). **The rest are what the VM's sandbox reported**: the verdict and its evidence (`comparison_fix_verified`), the direct database read (`state_verification`) and every regression run (`regression_suite`), and the containment facts. The host checks their shape (a valid `SandboxResult`, a report whose verdict its evidence supports, only the files a run writes) but not that the load really ran as reported. **A sandbox escape on the VM**, or anyone else with `runner` on it, **could forge those rows.**
+
+The owner chose to trust remote verdicts, labelled and hardened, without a local confirmation run (2026-11-16). So a `verified: true` with `gate_trust: "remote-reported"` means "verified on the runner VM". To have it judged here, make the baseline locally and verify locally.
+
+**A fix is judged on its baseline's runtime.** `faultforge_verify_fix(runtime="auto")` uses the runtime the baseline ran on, and an explicit other runtime is `not_comparable`, so both sides of a comparison come from the same machine. A remote baseline therefore needs a usable remote runtime to be verified (or a new local baseline).
+
+`source_left_this_machine` is on every result of a call that chose a runtime, errors included: `true` as soon as any step's request (so the snapshot) was handed to ssh, even if the step then failed, and `false` when nothing was sent.
+
+### Configure
+
+Add this to `~/.config/faultforge/mcp.toml` (`user`, the two paths and `hourly_usd` are the defaults shown):
+
+```toml
+[remote]
+host = "137.220.54.116"
+user = "runner"
+key_path = "~/.ssh/faultforge_vultr"
+known_hosts_path = "~/.config/faultforge/runner_known_hosts"
+hourly_usd = 0.066
+# auto = "local"   # keep runtime "auto" on this machine; "remote" (the default) prefers the VM when allowed
+```
+
+Without the section the remote runtime is unavailable with the reason `no [remote] section in mcp.toml`. A bad section (an unknown key, `user = "root"`, a relative or odd path, a rate outside (0, 10]) disables the remote runtime only, with the reason; the rest of the file still applies.
+
+### Deploy
+
+```bash
+scripts/deploy_runner.sh HEAD          # a commit
+scripts/deploy_runner.sh --worktree    # uncommitted work, as a git tree from a temporary index: no commit, no ref
+```
+
+The owner (or an orchestrating agent) runs it; the server never does, and never deploys on its own. It reads the host, user and known_hosts from `[remote]`, logs in with the deploy key (`FF_RUNNER_DEPLOY_KEY`, default `~/.ssh/faultforge_vultr`) and uses the pinned host key only. In order:
+
+0. Every path the tree would hold is checked with `snapshot.is_secret`, the rule a project snapshot uses (any path component: `.env*`, `*.pem`, `*.key`, `id_rsa*`, `.npmrc`, ...), and the deploy refuses before git writes anything. `--worktree` lists tracked and untracked, non-ignored files first; a commit lists its tree.
+1. `git archive` of the tree, unpacked to `/home/runner/faultforge/app/<commit or tree id>`.
+2. FaultForge's wheel, built **on this machine** from the same tree (`uv build --wheel`) and uploaded, so no build backend (hatchling) or sdist is ever fetched on the VM.
+3. uv **0.12.18**, from the release tarball pinned in `uv-release.lock` (its sha256 matches the one published beside the release and is checked on the VM before unpacking); then `uv sync --frozen --no-dev --no-install-project --no-build` with the VM's own `/usr/bin/python3` (`UV_PYTHON_DOWNLOADS=never`): the dependencies (httpx, pydantic, PyYAML and theirs) as wheels only, from PyPI, each checked against the hash in `uv.lock`; then the wheel with `uv pip install --no-deps --no-index --no-build`, offline. The VM's code hash is computed over the installed package; a local check showed the wheel's files hash the same as `src/faultforge`.
+4. `bin/ff-entry`, the forced command for a restricted server key (below), and a cron line for `runner` that every 15 minutes removes request directories older than two hours, by the fixed path and the 16-hex-character names only (`find /home/runner/faultforge/snapshots -mindepth 1 -maxdepth 1 -type d -regex '.*/[0-9a-f]{16}' -mmin +120`).
+5. The images (`faultforge-target`, `-runner`, `-stack-hooks`, `-egress-proxy`, every local `faultforge-node-build`/`-run` toolchain, and `postgres:16-alpine` and `redis:7-alpine` if present; `FF_RUNNER_STOCK_IMAGES` changes the last two) by `docker save | gzip | ssh docker load`, only those whose ID differs, then every ID compared. Nothing is built or pulled on the VM.
+6. The deploy record, `<state>/remote/deployed.json` (mode 0600), from what the VM itself reports: its code hash and image IDs.
+7. Older app directories on the VM are removed.
+
+Run `scripts/build_images.sh` first: the runner image holds FaultForge's source, so any change under `src/` changes its ID and needs a new deploy. Measured: the first deploy took 79 s (55 s for the images); see docs/VERIFIED.md.
+
+### When remote is used
+
+`runtime` is a parameter of `faultforge_run_scenario` and `faultforge_verify_fix`, default `auto`.
+
+- `local` always runs here.
+- `remote` requires every one of these, checked cheapest first, and fails closed with the first that doesn't hold: the `[remote]` section; a deploy record for that host and user that holds the four sandbox images; this machine's FaultForge code hash (every file of the package but bytecode) and image IDs equal to the record's; the key and known_hosts files; the credit floor for this call's worst case (`credit_floor`, see below); and one SSH call in which the VM reports its own code hash and image IDs, which must equal this machine's. Otherwise the error is `runtime_unavailable`, with `scripts/deploy_runner.sh` as the hint for a mismatch. Nothing is snapshotted or sent before these pass.
+- `auto` uses remote only when all of them hold and `[remote] auto` isn't `"local"`, and local otherwise; `runtime_reason` says which and why (`auto resolves to local: remote: no billing key`, `... the deployed FaultForge (37d3087a40e2) isn't the code on this machine`, ...). The owner's default, with the section added, is to prefer the VM whenever it is allowed: that is the owner's stated choice (docs/PLAN.md V4.2), and `auto = "local"` turns it off.
+- A stack run of a prebuilt `image` always runs here: the app image is on this machine only. Explicit `remote` gives `runtime_unavailable`.
+- **`vultr` fixes run their candidates here.** The model call and the inference key must stay on this machine, and the vultr loop runs up to 3 candidates, each with its regression suite, through one callback; M12 keeps it local rather than add a second paid resource to the loop's worst case. The result says `runtime: "local"` and why.
+- `faultforge_status` shows `runtimes.remote`: `available`, `reason` (the first failing condition, or the credit line), `host`, `hourly_usd`, `auto`, `deployed` and `what_leaves`, and `effective_modes.runtime` says what `auto` resolves to. It makes the same SSH ping, with a 25 s limit.
+
+**The worst case** (docs/PLAN.md V4.3) is `hourly_usd` times the call's wall limit, rounded up to whole hours. The wall limit is the sum of every step the call can make, each at its hard deadline, plus a ping: a Python run is 645 s (one hour, $0.066); a stack run from source, build included, 3 015 s (one hour); a Python `verify_fix` with 3 regression scenarios 2 505 s (one hour); a stack `verify_fix` with 3, 5 025 s (two hours, $0.132); a Python `verify_fix` with 20, 13 045 s (four hours, $0.264). `CreditGuard.decide` judges it against the $10 floor exactly as a vultr fix, with the ledger's caps asked first. The VM bills by the hour whether it is used or not; the floor is what keeps FaultForge from choosing to rely on it below $10.
+
+- `faultforge_verify_fix`: `auto` is the baseline's runtime; see "What the gate trusts".
+
+### SSH and the VM
+
+- Every call is `ssh -F /dev/null` with `BatchMode=yes`, `StrictHostKeyChecking=yes`, `UserKnownHostsFile=<known_hosts_path>`, no global known hosts, `IdentitiesOnly=yes`, `IdentityAgent=none`, no forwarding, no TTY, `ConnectTimeout=10` and keepalives, as `runner`, never root. `ssh` itself is resolved against the fixed system PATH (`/usr/local/bin:/usr/bin:/bin`), never the caller's, and must be an absolute path.
+- The remote command is always `/home/runner/faultforge/app/<id>/.venv/bin/python -I -m faultforge.remote_run`, where `<id>` is the record's hex commit or tree id, checked against a strict pattern. A stack call also needs its own toolchain, postgres and redis images in the record, so they are compared too; otherwise `auto` stays local. No argument follows. The request is one JSON line on stdin, then a tar of the step's inputs; the answer is one JSON line on stdout, then a tar of the run directory. No project text is on any command line.
+- Paths on the VM are fixed: each request gets a new random directory under `/home/runner/faultforge/snapshots/`, which is removed in a `finally` before the answer is written, whatever happened, and the answer says so (`snapshot_removed`); the host refuses an answer that doesn't. The install cache for stacks lives on the VM (`/home/runner/faultforge/state`, Docker volumes `ff-deps-*`), filled through the VM's own egress proxy under the same `allow_network_install` setting.
+- Each request carries the code hash and image IDs the host expects, and the VM refuses (`deploy_mismatch`) before it unpacks anything if its own differ.
+- **Deadlines.** The VM gives each step its local hard limit (a Python run 500 s, the sandbox's wall limit plus its removal margin, so its containers' expiry labels have passed by then) and the host's `ssh` gets that plus 120 s for the transfer, after which its process group is killed. Output above 48 MB plus the run directory's cap kills it too.
+- **What comes back is checked like a build's output.** Only the directory of the run the answer names comes back (`.faultforge/runs/<report.run_id>/`), and inside it only the names a run writes (`report.json`, `report.md`, `requests.jsonl`, `trials/<n>/` with `k6-summary.json`, `k6.log`, `state-before.json`, `state-after.json`). Anything else (a planted `pinned/`, `run.json`, a second run, a link of either kind, a device or FIFO, an absolute path or `..`) refuses the whole archive before any of it reaches the run directory, so no orphan run is stored. At most 96 MB and 20 000 members, each checked from its header. The result must be a valid `SandboxResult`, so a report whose verdict its evidence doesn't support is refused as it is locally. A Python run must report the code hash of the files sent and a build the hash of the source sent. Any failure is `sandbox_failed` (`the remote runtime failed: ...`) and nothing from that call is stored; in `verify_fix` a failed remote step fails the whole call rather than one row. Each step sends only the baseline's `report.json`, not the call's earlier runs.
+- **The reaper.** At the start of every request, pings included, the VM removes request directories older than two hours (only names it makes); requests that act also remove FaultForge's labelled containers and networks past their expiry. The cron line removes the same directories every 15 minutes, so a session dropped mid-run (its process killed before its `finally`) leaves nothing for long. Built images with the candidate label older than two hours are swept by the build step, as locally, so a long `verify_fix` never loses the image it built. It never prunes.
+
+### Restricting the server's key (prepared, not applied)
+
+Today the server's `key_path` is `~/.ssh/faultforge_vultr`, the key `scripts/provision_runner.sh` copied from root to `runner`: **one key logs in as root and as an unrestricted runner** (the owner's choice at provisioning). The prepared change gives the server a key of its own that can run nothing but the entry point:
+
+1. `ssh-keygen -t ed25519 -N "" -C faultforge-mcp -f ~/.ssh/faultforge_runner_mcp`
+2. `scripts/restrict_runner_key.sh ~/.ssh/faultforge_runner_mcp.pub` prints the line; with `--apply` it appends it, as runner over the deploy key, to `/home/runner/.ssh/authorized_keys`, after checking that `bin/ff-entry` is installed. Nothing else on the VM changes:
+
+   ```
+   restrict,command="/home/runner/faultforge/bin/ff-entry" ssh-ed25519 <the new public key> faultforge-mcp
+   ```
+3. Set `key_path = "~/.ssh/faultforge_runner_mcp"` in `[remote]`. `deploy_runner.sh` keeps using the deploy key (`FF_RUNNER_DEPLOY_KEY`), so the deploy needs no fixed verbs of its own.
+
+`restrict` turns off forwarding, the agent, X11 and the TTY. `ff-entry` (`scripts/runner_entry.sh`) matches `SSH_ORIGINAL_COMMAND` whole against `^/home/runner/faultforge/app/<hex id>/.venv/bin/python -I -m faultforge.remote_run$`, never hands it to a shell, and execs only that; anything else gets a refusal in the entry point's answer format. The deploy record helper only pings through the entry point, so it works with the restricted key. What it doesn't do: a process that already runs as `runner` (a sandbox escape) can edit `authorized_keys` and `ff-entry`; the restriction limits a stolen server key, not a compromised VM. Removing root's use of the shared key is a separate owner decision.
+
+### Rebuilding the runner VM
+
+The VM holds no secrets, but every remote verdict is only as good as its integrity. Rebuild it from scratch (reinstall the OS on the same instance in the Vultr console, or replace the instance; either needs the owner, and a new instance needs its price shown first), then:
+
+1. pin the new host key in `~/.config/faultforge/runner_known_hosts` (`ssh-keyscan` once, compared with the console's fingerprint);
+2. `scripts/provision_runner.sh <ip>`;
+3. `scripts/build_images.sh`, then `scripts/deploy_runner.sh HEAD`;
+4. re-apply the key restriction if it was in use.
+
+**When:** monthly as routine; at once after any sign of tampering (an answer refused for a hash or deploy mismatch the owner didn't cause, an unexpected file or process under `/home/runner`, a `remote-reported` verdict that a local run contradicts); after a Docker or kernel advisory affecting container isolation; and before relying on a remote verdict for something that matters (or verify that one locally instead).
+
+### Limits, left as they are
+
+- **Remote rows are reported, not proven.** The host checks the shape of everything, the hashes of what it sent and which files come back, and writes the stored `report.json` and `report.md` from the validated answer, never the archive's copy. It can't check that the load ran as reported: see "What the gate trusts". It is FaultForge's own VM, keys-only SSH, with SSH as the only open port.
+- A killed `ssh` doesn't always stop the VM's process at once; the VM's own deadline and the reaper do. If that deadline lands during a container removal, the removal stops and the containers wait for the reaper's expiry rule.
+- `faultforge_status` pings the VM and reads the credit whenever `[remote]` is present, even with `auto = "local"` (up to 25 s for the ping).
+- The ledger's caps are asked for a remote run's worst case but nothing is recorded in it: the VM's cost is its hourly bill, not FaultForge's spend.
+- One VM, no queue: two servers with different state directories can use it at once, each in its own request directories.
+
 ## Limits and safety
 
 - **Snapshots.**
@@ -423,7 +538,8 @@ target:
 - Arbitrary URLs, arbitrary scripts, load overrides and cancel.
 - Any write to the user's repo.
 - Applying a vultr diff: FaultForge never does it.
-- The `vultr` fix mode for anything but a `ticket_support` project, and so for every stack, and the `remote` runtime (M12).
+- The `vultr` fix mode for anything but a `ticket_support` project, and so for every stack, and a `vultr` fix's candidates on the remote runtime.
+- Deploying from the server: only `scripts/deploy_runner.sh` deploys, run by hand.
 - Install scripts, pnpmfiles, workspaces and any registry but `registry.npmjs.org` for a stack built from source.
 - A shell, an image or a user of its own for the `prestart` step: it is a `node` command in the app's image, as the app's user.
 - Build-time env values for a stack: recorded for JADE in docs/PLAN.md.

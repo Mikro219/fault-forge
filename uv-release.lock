@@ -1,0 +1,4 @@
+# The uv release deploy_runner.sh installs on the runner VM. Its sha256 is checked on the VM before it is
+# unpacked; it matches the .sha256 file published beside the release.
+version=0.12.18
+sha256=89eadd7c76fc063887959510d5ba0ab1264dfd5f1143b925ddb73021a40acf16

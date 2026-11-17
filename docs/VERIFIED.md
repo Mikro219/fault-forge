@@ -277,6 +277,41 @@ From a container in the stack's namespace with the app's user and limits:
 - No independent review of this diff was run (the `strict` profile asks for one for sandbox-policy changes).
 - Nothing ran on the VM.
 
+## M12: the remote runtime on the runner VM (2026-11-16)
+
+The runner VM `faultforge-runner` (137.220.54.116, Ubuntu 24.04, 4 vCPU, 7.9 GB, Docker 29.10.0), provisioned by `scripts/provision_runner.sh`, used as `runner` over SSH with the pinned host key. No Vultr API call was made and nothing was created or destroyed; the VM bills about $0.066/h either way.
+
+### The deploy (`scripts/deploy_runner.sh --worktree`, from a scratch `mcp.toml` holding the `[remote]` block)
+
+- The working tree as git tree `37d3087a40e2` (no commit made), unpacked to `/home/runner/faultforge/app/<tree>`.
+- uv 0.12.18 from the pinned tarball, sha256 `89eadd7c...` checked on the VM (it equals the `.sha256` published beside the release); `uv sync --frozen --no-dev` with the VM's Python 3.12.3.
+- 8 images by `docker save | gzip -1 | ssh docker load` in 55 s: target, runner, stack-hooks, egress-proxy, node-build 24.22.3/pnpm 12.21.0, node-run 24.22.3, `postgres:16-alpine`, `redis:7-alpine`. Every ID matched after the load.
+- The record was written from the VM's own report; its code hash matched this machine's. 79 s in all.
+
+### The opt-in end-to-end tests (`FF_TEST_REMOTE=1`)
+
+- **Ticket API, Python target.** `faultforge_run_scenario(runtime="remote")`: FAIL, database check `matched`, limits applied, 0 containers left, in **7.3 s** end to end (the ping, the upload, the run on the VM and the download). `faultforge_verify_fix(runtime="remote")` with the reference fix: **verified**, every gate row passed, in **20.2 s** (3 sandboxed runs on the VM). Afterwards the VM had 0 request directories and 0 labelled containers.
+- **redeem-code, a stack built from source on the VM.** The VM's install cache was cold, so the build fetched the lockfile once through the VM's own egress proxy (`allow_network_install = true` in the test's config): `install fetched, lint 0.5 s, fetch 4.4 s, link 0.9 s, build 6.8 s, copy 0.5 s, image 1.8 s, build peak 454 MiB`. The race: FAIL, database `matched`, 0 containers left, **35.6 s** end to end. `verify_fix` with the `src/` reference fix: **verified**, all 3 regression scenarios `passed, PASS, database matched`, **69.6 s** (one build, warm cache, and 4 stack runs). For comparison, the same steps locally took 48 s and 113 s (M11, above). Afterwards 0 request directories and 0 labelled containers on the VM.
+
+### After the independent review
+
+A fresh reviewer agent read the diff (no high findings). Fixed: each step now sends only the baseline's report, not the call's earlier runs (transfers no longer grow per regression run); the per-request reaper no longer sweeps built images, so a long stack verify keeps its image; a stack's toolchain, postgres and redis images must be in the deploy record; a disk error putting the run back is a remote failure, not a failed gate row; `--worktree` refuses secret-looking files; the disclosure line is exact about what stays on the VM. Redeployed (tree `0fa091c1b6fc`, only the runner image resent, 9 s; 31 s in all) and both tests run again: Ticket API run **7.6 s**, verify **19.6 s**, verified; redeem-code run **28.8 s** (warm cache on the VM), verify **72.1 s**, verified; 0 request directories and 0 labelled containers left.
+
+### After the security review and the owner's decisions
+
+- **The gate's trust is labelled.** `gate_trust` (`local` or `remote-reported`) is on every run, verify, propose and summary result; on the remote runtime only `app_policy` and `code_changed` are verified on this machine (docs/MCP.md, "What the gate trusts"). The owner chose to trust remote verdicts, labelled and hardened, with no local confirmation.
+- **A fix is judged on its baseline's runtime:** `auto` follows the baseline, and another runtime is `not_comparable`.
+- **Hardened:** the stored `report.json` and `report.md` are written from the validated answer (the reviewer's `verdict_reason` tamper no longer reaches the store); only the named run's directory and the names a run writes come back, so a planted `pinned/` or `run.json` refuses the archive before anything is written; `source_left_this_machine` is on every result, errors after upload included; a ping reaps old request directories too, and a cron line for `runner` does every 15 minutes; `--worktree` and commit deploys check every path with `snapshot.is_secret` before git writes a blob; a `.` tar member is handled; `ssh` is resolved against the fixed system PATH.
+- **No build backend on the VM.** The wheel is built here and installed offline; the dependencies come as hash-checked wheels with `--no-build`. On the VM, `faultforge` imports from `site-packages`, no `hatchling` is in the venv, and the VM's code hash equals this machine's (`81310e2fd70b`).
+- **The forced command is prepared, not applied.** `bin/ff-entry` is installed; run directly on the VM it refused `id; cat /etc/passwd` with the entry point's refusal answer and passed a ping through. `authorized_keys` is unchanged.
+- Redeployed (tree `110d88600d16`, only the runner image resent, 8 s) and all of `tests/test_remote.py` run with `FF_TEST_REMOTE=1`: 72 passed. Ticket API run **7.2 s**, verify **17.9 s**, verified, `remote-reported`; redeem-code run **27.3 s**, verify **64.7 s**, verified; 0 request directories and 0 labelled containers left on the VM.
+
+### Not done
+
+- The VM's labelled containers were checked through the entry point's ping (`docker ps --filter label=faultforge.sandbox`), not by logging in separately.
+- No real network fault (a dropped connection mid-run) was injected on the VM; the transport's timeout and overflow kill and every malformed answer were tested with a local process and a fake VM.
+- `vultr` fixes on the remote runtime: not offered in M12 (see docs/MCP.md).
+
 ## Not tested
 
 - The bridge-gateway egress test and the rest of `tests/test_sandbox.py` ran on the dev machine, not the VM.

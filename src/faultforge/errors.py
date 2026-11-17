@@ -42,6 +42,8 @@ class FaultForgeError(Exception):
         self.message = message
         self.fix_hint = fix_hint
         self.suggested_plan = suggested_plan
+        # Fixed facts a caller adds on the way out, such as whether a project's source left the machine.
+        self.extra: dict[str, object] = {}
 
     def to_dict(self) -> dict[str, object]:
         result: dict[str, object] = {
@@ -52,4 +54,5 @@ class FaultForgeError(Exception):
         }
         if self.suggested_plan is not None:
             result["suggested_plan"] = self.suggested_plan
+        result.update(self.extra)
         return result
